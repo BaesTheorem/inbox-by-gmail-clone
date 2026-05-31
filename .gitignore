@@ -1,0 +1,11 @@
+# Secrets & personal data — never commit
+credentials/*
+!credentials/README.md
+token.json
+*.json
+snooze.db
+__pycache__/
+*.pyc
+server.log
+desktop.log
+.venv/
