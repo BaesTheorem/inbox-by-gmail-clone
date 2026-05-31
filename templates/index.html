@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inbox</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+<link rel="icon" type="image/png" sizes="512x512" href="/static/favicon.png">
+<link rel="apple-touch-icon" href="/static/favicon.png">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css?v=26">
+</head>
+<body>
+<header class="appbar">
+  <button class="icon-btn" id="menuBtn" title="Menu"><i class="material-icons">menu</i></button>
+  <span class="wordmark">Inbox</span>
+  <div class="search">
+    <i class="material-icons">search</i>
+    <input id="searchInput" placeholder="Search">
+  </div>
+  <label class="pinned-toggle" title="Pinned only">
+    <span class="switch">
+      <input type="checkbox" id="pinnedOnly">
+      <span class="track"></span>
+      <span class="knob"><i class="material-icons">push_pin</i></span>
+    </span>
+  </label>
+  <button class="icon-btn" id="refreshBtn" title="Refresh"><i class="material-icons">refresh</i></button>
+</header>
+
+<!-- Bulk-action bar (shown when ≥1 email is selected) -->
+<div class="selection-bar" id="selectionBar" hidden>
+  <button class="icon-btn" id="selClear" title="Clear selection"><i class="material-icons">close</i></button>
+  <span class="sel-count" id="selCount">0 selected</span>
+  <span class="spacer"></span>
+  <button class="icon-btn" id="selPin" title="Pin"><i class="material-icons">push_pin</i></button>
+  <button class="icon-btn" id="selSnooze" title="Snooze"><i class="material-icons">schedule</i></button>
+  <button class="icon-btn" id="selDone" title="Done"><i class="material-icons">check_circle</i></button>
+  <button class="icon-btn" id="selThings" title="Send to Things 3"><i class="material-icons">playlist_add_check</i></button>
+</div>
+
+<div class="layout">
+  <nav class="drawer" id="drawer">
+    <div class="drawer-acct" id="acctEmail">…</div>
+    <a class="nav-item active" data-view="inbox"><i class="material-icons">inbox</i> Inbox<span class="nav-count" id="inboxCount"></span></a>
+    <a class="nav-item" data-view="snoozed"><i class="material-icons">schedule</i> Snoozed</a>
+    <a class="nav-item" data-view="done"><i class="material-icons">done</i> Done</a>
+    <a class="nav-item" data-view="drafts"><i class="material-icons">drafts</i> Drafts</a>
+    <div class="nav-sep">Bundles</div>
+    <div id="navBundles"></div>
+  </nav>
+
+  <main class="content" id="content">
+    <div class="loading" id="loading">Loading…</div>
+    <div id="list"></div>
+    <div class="empty" id="empty" hidden>
+      <i class="material-icons">wb_sunny</i>
+      <p>You're all done.</p>
+    </div>
+  </main>
+</div>
+
+<!-- Floating action button + speed dial -->
+<div class="fab-wrap" id="fabWrap">
+  <div class="fab-mini" id="fabReminder" title="Reminder"><i class="material-icons">notifications</i></div>
+  <div class="fab-mini" id="fabCompose" title="Compose"><i class="material-icons">edit</i></div>
+  <button class="fab" id="fab"><i class="material-icons">add</i></button>
+</div>
+
+<!-- Thread reader -->
+<div class="reader-overlay" id="reader" hidden>
+  <div class="reader-bar">
+    <button class="icon-btn" id="readerBack"><i class="material-icons">arrow_back</i></button>
+    <span class="reader-subject" id="readerSubject"></span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="readerPin" title="Pin"><i class="material-icons">push_pin</i></button>
+    <button class="icon-btn" id="readerSnooze" title="Snooze"><i class="material-icons">schedule</i></button>
+    <button class="icon-btn" id="readerLabel" title="Move to bundle"><i class="material-icons">label</i></button>
+    <button class="icon-btn" id="readerDone" title="Done"><i class="material-icons">check_circle</i></button>
+    <button class="icon-btn" id="readerThings" title="Send to Things 3"><i class="material-icons">playlist_add_check</i></button>
+  </div>
+  <div class="reader-body" id="readerBody"></div>
+  <div class="reader-reply">
+    <div class="reply-editor">
+      <div class="compose-toolbar reply-toolbar">
+        <button type="button" class="tb-btn" data-cmd="bold" title="Bold"><i class="material-icons">format_bold</i></button>
+        <button type="button" class="tb-btn" data-cmd="italic" title="Italic"><i class="material-icons">format_italic</i></button>
+        <button type="button" class="tb-btn" data-cmd="underline" title="Underline"><i class="material-icons">format_underlined</i></button>
+        <button type="button" class="tb-btn tb-link" title="Insert link"><i class="material-icons">link</i></button>
+        <span class="tb-sep"></span>
+        <button type="button" class="tb-btn" id="rAttach" title="Attach files"><i class="material-icons">attach_file</i></button>
+      </div>
+      <div id="replyBox" class="reply-body" contenteditable="true" data-placeholder="Reply…"></div>
+      <div id="rAttachments" class="attach-list"></div>
+      <input type="file" id="rFiles" multiple hidden>
+    </div>
+    <button class="send-btn" id="replySend"><i class="material-icons">send</i></button>
+  </div>
+</div>
+
+<!-- Compose modal -->
+<div class="modal-overlay" id="composeOverlay" hidden>
+  <div class="compose-card">
+    <div class="compose-head">New message <button class="icon-btn" id="composeClose"><i class="material-icons">close</i></button></div>
+    <input id="cTo" placeholder="To">
+    <input id="cSubject" placeholder="Subject">
+    <div class="compose-toolbar">
+      <button type="button" class="tb-btn" data-cmd="bold" title="Bold"><i class="material-icons">format_bold</i></button>
+      <button type="button" class="tb-btn" data-cmd="italic" title="Italic"><i class="material-icons">format_italic</i></button>
+      <button type="button" class="tb-btn" data-cmd="underline" title="Underline"><i class="material-icons">format_underlined</i></button>
+      <button type="button" class="tb-btn tb-link" id="cLink" title="Insert link"><i class="material-icons">link</i></button>
+      <span class="tb-sep"></span>
+      <button type="button" class="tb-btn" id="cAttach" title="Attach files"><i class="material-icons">attach_file</i></button>
+    </div>
+    <div id="cBody" class="compose-body" contenteditable="true" data-placeholder="Compose email…"></div>
+    <div id="cAttachments" class="attach-list"></div>
+    <input type="file" id="cFiles" multiple hidden>
+    <div class="compose-foot"><button class="send-btn wide" id="composeSend"><i class="material-icons">send</i> Send</button><button class="discard-btn" id="composeDiscard" style="display:none"><i class="material-icons">delete</i> Discard</button></div>
+  </div>
+</div>
+
+<!-- Snooze menu -->
+<div class="snooze-menu" id="snoozeMenu" hidden>
+  <div class="snooze-title">Snooze until…</div>
+  <a data-preset="later_today"><i class="material-icons">wb_twilight</i> Later today</a>
+  <a data-preset="tomorrow"><i class="material-icons">today</i> Tomorrow</a>
+  <a data-preset="this_weekend"><i class="material-icons">weekend</i> This weekend</a>
+  <a data-preset="next_week"><i class="material-icons">event</i> Next week</a>
+  <a data-preset="someday"><i class="material-icons">all_inclusive</i> Someday</a>
+  <a data-preset="pick"><i class="material-icons">edit_calendar</i> Pick date &amp; time</a>
+  <input type="datetime-local" id="snoozeDT" style="position:absolute;opacity:0;pointer-events:none;width:0;height:0">
+</div>
+
+<!-- Re-label / move-to-bundle menu -->
+<div class="snooze-menu relabel-menu" id="relabelMenu" hidden>
+  <div class="snooze-title">Move to bundle</div>
+  <div id="relabelOptions"></div>
+  <label class="relabel-future"><input type="checkbox" id="relabelFuture"> <span id="relabelFutureLabel">Apply to future from sender</span></label>
+</div>
+
+<!-- Undo snackbar -->
+<div class="snackbar" id="snackbar" hidden><span id="snackText"></span><button id="snackUndo">UNDO</button></div>
+
+<script>window.OPEN_THREAD = "{{ open_thread }}";</script>
+<script src="/static/app.js?v=26"></script>
+</body>
+</html>
