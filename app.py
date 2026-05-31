@@ -347,19 +347,26 @@ def _decode_body(payload):
     return text, html
 
 
-def thread_summary(msg):
-    """Build a list-row summary from a metadata message resource."""
+def thread_summary(msg, outgoing=False):
+    """Build a list-row summary from a metadata message resource.
+    outgoing=True (Sent) shows the recipient ('To: …') instead of the sender."""
     headers = msg.get("payload", {}).get("headers", [])
-    sender_name, sender_email = _parse_addr(_header(headers, "From"))
     subject = _header(headers, "Subject") or "(no subject)"
     labels = msg.get("labelIds", [])
     snippet = msg.get("snippet", "")
-    bundle = _bundle_for(labels, subject, sender_name, snippet)
+    if outgoing:
+        name, addr = _parse_addr(_header(headers, "To"))
+        sender = "To: " + (name or "(no recipient)")
+        bundle = None
+    else:
+        name, addr = _parse_addr(_header(headers, "From"))
+        sender = name
+        bundle = _bundle_for(labels, subject, name, snippet)
     return {
         "id": msg.get("threadId"),
         "messageId": msg.get("id"),
-        "sender": sender_name,
-        "senderEmail": sender_email,
+        "sender": sender,
+        "senderEmail": addr,
         "subject": subject,
         "snippet": snippet,
         "time": _fmt_time(_header(headers, "Date")),
@@ -367,8 +374,8 @@ def thread_summary(msg):
         "unread": "UNREAD" in labels,
         "pinned": "STARRED" in labels,
         "bundle": bundle,
-        "highlights": compute_highlights(subject, snippet, bundle),
-        "unsub": parse_unsubscribe(headers),
+        "highlights": [] if outgoing else compute_highlights(subject, snippet, bundle),
+        "unsub": None if outgoing else parse_unsubscribe(headers),
         "permalink": gmail_permalink(msg.get("threadId")),
     }
 
@@ -430,11 +437,13 @@ def _get_meta(mid, headers):
         return None  # message vanished (deleted/moved) — drop it
 
 
-def summarize_ids(ids):
+def summarize_ids(ids, outgoing=False):
     if not ids:
         return []
-    load_bundle_labels()
-    headers = ["From", "Subject", "Date", "List-Unsubscribe", "List-Unsubscribe-Post"]
+    if not outgoing:
+        load_bundle_labels()
+    headers = (["To", "Subject", "Date"] if outgoing
+               else ["From", "Subject", "Date", "List-Unsubscribe", "List-Unsubscribe-Post"])
     # Concurrent metadata fetches (requests/urllib3 is thread-safe). gget retries
     # rate-limits internally; a small worker cap keeps us under the per-second quota.
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -449,7 +458,7 @@ def summarize_ids(ids):
         prev = by_thread.get(tid)
         if not prev or int(msg.get("internalDate", 0)) > int(prev.get("internalDate", 0)):
             by_thread[tid] = msg
-    summaries = [thread_summary(m) for m in by_thread.values()]
+    summaries = [thread_summary(m, outgoing=outgoing) for m in by_thread.values()]
     summaries.sort(key=lambda r: int(r["ts"]), reverse=True)
     return summaries
 
@@ -782,6 +791,20 @@ def api_done_list():
         ids, next_token = list_ids(q="-in:inbox -in:sent -in:draft -in:trash -in:spam -in:chats",
                                    max_results=limit, page_token=token, return_token=True)
         rows = summarize_ids(ids)
+        return jsonify({"items": rows, "email": _user_email, "limit": limit,
+                        "fetched": len(ids), "nextPageToken": next_token})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sent")
+def api_sent():
+    limit = _limit_arg()
+    token = request.args.get("pageToken")
+    try:
+        ids, next_token = list_ids(label_ids=["SENT"], max_results=limit,
+                                   page_token=token, return_token=True)
+        rows = summarize_ids(ids, outgoing=True)
         return jsonify({"items": rows, "email": _user_email, "limit": limit,
                         "fetched": len(ids), "nextPageToken": next_token})
     except Exception as e:

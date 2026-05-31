@@ -670,6 +670,9 @@ async function load() {
   } else if (v === "drafts") {
     d = await api("/api/drafts?" + lim);
     STATE.token = d.nextPageToken || null;
+  } else if (v === "sent") {
+    d = await api("/api/sent?" + lim);
+    STATE.token = d.nextPageToken || null;
   } else if (v === "search") {
     d = await api("/api/search?q=" + encodeURIComponent(STATE.query || "") + "&" + lim);
     STATE.token = d.nextPageToken || null;
@@ -736,6 +739,7 @@ async function loadMore() {
     let url;
     if (v === "snoozed") url = "/api/snoozed?" + lim + tok;
     else if (v === "done") url = "/api/done_list?" + lim + tok;
+    else if (v === "sent") url = "/api/sent?" + lim + tok;
     else if (v === "search") url = "/api/search?q=" + encodeURIComponent(STATE.query || "") + "&" + lim + tok;
     else return;
     const p = await api(url);
