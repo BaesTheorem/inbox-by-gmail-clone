@@ -9,7 +9,7 @@
 <link rel="apple-touch-icon" href="/static/favicon.png">
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css?v=26">
+<link rel="stylesheet" href="/static/style.css?v=27">
 </head>
 <body>
 <header class="appbar">
@@ -47,6 +47,7 @@
     <a class="nav-item" data-view="snoozed"><i class="material-icons">schedule</i> Snoozed</a>
     <a class="nav-item" data-view="done"><i class="material-icons">done</i> Done</a>
     <a class="nav-item" data-view="drafts"><i class="material-icons">drafts</i> Drafts</a>
+    <a class="nav-item" data-view="sent"><i class="material-icons">send</i> Sent</a>
     <div class="nav-sep">Bundles</div>
     <div id="navBundles"></div>
   </nav>
@@ -143,6 +144,6 @@
 <div class="snackbar" id="snackbar" hidden><span id="snackText"></span><button id="snackUndo">UNDO</button></div>
 
 <script>window.OPEN_THREAD = "{{ open_thread }}";</script>
-<script src="/static/app.js?v=26"></script>
+<script src="/static/app.js?v=27"></script>
 </body>
 </html>
