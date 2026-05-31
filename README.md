@@ -4,7 +4,13 @@ A local, single-user email client that recreates the look and triage model of th
 deprecated **Inbox by Gmail**, with one-tap **Send to Things 3** that backlinks
 straight to the email.
 
-Built from the design spec at `Exobrain/Research/Google Inbox UX Design Document.md`.
+![Inbox clone — screenshot](docs/screenshot.png)
+
+> *Screenshot uses mock data; the app runs against your own Gmail.*
+
+Reverse-engineered from a detailed UX spec of the original product — see
+**[docs/DESIGN.md](docs/DESIGN.md)** for the full design document (colors, typography,
+components, interactions, and history).
 
 ## Architecture
 - **Backend:** `app.py` — Flask + Gmail API (`uv run --script`, deps inline via PEP 723).

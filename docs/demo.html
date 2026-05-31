@@ -1,0 +1,107 @@
+<!doctype html>
+<!-- Static mock used only to generate docs/screenshot.png. Fake data, real CSS. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+<link rel="stylesheet" href="../static/style.css">
+<style>body{height:auto}</style>
+</head>
+<body>
+<header class="appbar">
+  <button class="icon-btn"><i class="material-icons">menu</i></button>
+  <span class="wordmark">Inbox</span>
+  <div class="search"><i class="material-icons">search</i><input placeholder="Search"></div>
+  <label class="pinned-toggle"><span class="switch"><input type="checkbox"><span class="track"></span><span class="knob"><i class="material-icons">push_pin</i></span></span></label>
+  <button class="icon-btn"><i class="material-icons">refresh</i></button>
+</header>
+
+<div class="layout">
+  <nav class="drawer">
+    <div class="drawer-acct">you@example.com</div>
+    <a class="nav-item active"><i class="material-icons">inbox</i> Inbox<span class="nav-count">50</span></a>
+    <a class="nav-item"><i class="material-icons">schedule</i> Snoozed</a>
+    <a class="nav-item"><i class="material-icons">done</i> Done</a>
+    <a class="nav-item"><i class="material-icons">drafts</i> Drafts</a>
+    <div class="nav-sep">Bundles</div>
+    <a class="nav-item"><i class="material-icons" style="color:#9C27B0">flight</i> Travel <span style="margin-left:auto;color:#9aa0a6;font-weight:400">2</span></a>
+    <a class="nav-item"><i class="material-icons" style="color:#00BCD4">loyalty</i> Promos <span style="margin-left:auto;color:#9aa0a6;font-weight:400">12</span></a>
+    <a class="nav-item"><i class="material-icons" style="color:#FF6839">notifications</i> Updates <span style="margin-left:auto;color:#9aa0a6;font-weight:400">23</span></a>
+  </nav>
+
+  <main class="content">
+    <div id="list">
+      <div class="section-label">Pinned</div>
+      <div class="card">
+        <div class="select"><div class="avatar">MK</div></div>
+        <div class="body">
+          <div class="row1"><span class="sender">Mom <i class="material-icons pin-dot">push_pin</i></span><span class="time">8:42 AM</span></div>
+          <div class="subject">Re: Thanksgiving plans</div>
+          <div class="snippet">Sounds good — see you at 4. Want me to bring the pie or are you handling dessert?</div>
+        </div>
+      </div>
+
+      <div class="section-label">Mail</div>
+
+      <div class="card unread">
+        <div class="select"><div class="avatar">GH</div></div>
+        <div class="body">
+          <div class="row1"><span class="sender">GitHub</span><span class="time">9:14 AM</span></div>
+          <div class="subject">[GitHub] A new sign-in to your account</div>
+          <div class="snippet">We noticed a new sign-in to your account from a recognized device. If this was you, no action is needed.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="select"><div class="avatar">DA</div></div>
+        <div class="body">
+          <div class="row1"><span class="sender">Delta Air Lines</span><span class="time">8:30 AM</span></div>
+          <div class="subject">Your trip to Austin is confirmed</div>
+          <div class="snippet">Flight DL1234 · Departs SFO 10:05 AM · Gate C12 · Confirmation #JXR8QK</div>
+          <div class="chips"><span class="chip"><i class="material-icons">flight</i>Travel</span></div>
+        </div>
+      </div>
+
+      <div class="card unread">
+        <div class="select"><div class="avatar">AM</div></div>
+        <div class="body">
+          <div class="row1"><span class="sender">Amazon.com <button class="unsub-link">Unsubscribe</button></span><span class="time">Yesterday</span></div>
+          <div class="subject">Your package is out for delivery</div>
+          <div class="snippet">Arriving today by 9 PM. "USB-C Cable (2-pack)" and 1 other item.</div>
+          <div class="chips"><span class="chip"><i class="material-icons">local_shipping</i>Out For Delivery</span><span class="chip"><i class="material-icons">payments</i>$24.99</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="select"><div class="avatar">NO</div></div>
+        <div class="body">
+          <div class="row1"><span class="sender">Notion</span><span class="time">Yesterday</span></div>
+          <div class="subject">Aisha shared "Q3 Roadmap" with you</div>
+          <div class="snippet">You now have edit access. Open in Notion to start collaborating.</div>
+        </div>
+      </div>
+
+      <div class="bundle">
+        <div class="bundle-head">
+          <span class="bicon" style="background:#00BCD4"><i class="material-icons" style="font-size:20px">loyalty</i></span>
+          <span class="bname">Promos</span><span class="bcount">12</span>
+          <button class="icon-btn bsweep"><i class="material-icons" style="color:var(--done-green)">done_all</i></button>
+        </div>
+      </div>
+      <div class="bundle">
+        <div class="bundle-head">
+          <span class="bicon" style="background:#FF6839"><i class="material-icons" style="font-size:20px">notifications</i></span>
+          <span class="bname">Updates</span><span class="bcount">23</span>
+          <button class="icon-btn bsweep"><i class="material-icons" style="color:var(--done-green)">done_all</i></button>
+        </div>
+      </div>
+
+      <div class="list-footer"><button class="load-more">Load more</button><div class="view-count">50 in view</div></div>
+    </div>
+  </main>
+</div>
+
+<div class="fab-wrap"><div class="fab-mini" style="display:flex"><i class="material-icons">notifications</i></div><div class="fab-mini" style="display:flex"><i class="material-icons">edit</i></div><button class="fab"><i class="material-icons" style="transform:rotate(45deg)">add</i></button></div>
+</body>
+</html>
