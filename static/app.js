@@ -623,6 +623,7 @@ document.querySelectorAll(".nav-item").forEach((n) => {
 });
 $("#refreshBtn").onclick = load;
 $("#pinnedOnly").onchange = render;
+$("#menuBtn").onclick = () => document.querySelector(".layout").classList.toggle("nav-collapsed");
 $("#searchInput").addEventListener("keydown", (e) => {
   if (e.key !== "Enter") return;
   const q = e.target.value.trim();
