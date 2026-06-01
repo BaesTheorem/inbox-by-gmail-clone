@@ -347,30 +347,43 @@ def _decode_body(payload):
     return text, html
 
 
-def _part_disposition(part):
+def _is_inline_part(part):
+    inline, has_cid = False, False
     for h in part.get("headers", []) or []:
-        if h.get("name", "").lower() == "content-disposition":
-            return h.get("value", "").lower()
-    return ""
+        n = h.get("name", "").lower()
+        if n == "content-disposition":
+            inline = h.get("value", "").lower().startswith("inline")
+        elif n == "content-id":
+            has_cid = True
+    return inline or has_cid
 
 
-def _collect_attachments(payload):
-    """Walk the MIME tree and return real attachments (named, non-inline parts)."""
+# Inline images smaller than this are treated as decoration (logos/signatures/spacers).
+_INLINE_IMG_MAX = 30000
+
+
+def _collect_attachments(payload, hide_inline_images=False):
+    """Walk the MIME tree for real attachments. Hides embedded decoration (small inline
+    images, or any inline image in bulk/promo mail) but keeps photos and documents."""
     out = []
+    seen = set()
 
     def walk(part):
         fn = part.get("filename") or ""
         body = part.get("body", {})
-        # Skip inline parts (e.g. logos/signature images embedded in the body).
-        if fn and body.get("attachmentId") and not _part_disposition(part).startswith("inline"):
+        if fn and body.get("attachmentId"):
             mime = part.get("mimeType", "application/octet-stream")
-            out.append({
-                "filename": fn,
-                "mimeType": mime,
-                "size": body.get("size", 0),
-                "attachmentId": body["attachmentId"],
-                "drive": mime.startswith("application/vnd.google-apps"),  # open in Drive, not downloadable
-            })
+            inline_img = mime.startswith("image/") and _is_inline_part(part)
+            decoration = inline_img and (hide_inline_images or (body.get("size") or 0) < _INLINE_IMG_MAX)
+            if not decoration and fn not in seen:
+                seen.add(fn)
+                out.append({
+                    "filename": fn,
+                    "mimeType": mime,
+                    "size": body.get("size", 0),
+                    "attachmentId": body["attachmentId"],
+                    "drive": mime.startswith("application/vnd.google-apps"),
+                })
         for sub in part.get("parts", []) or []:
             walk(sub)
 
@@ -385,6 +398,8 @@ def thread_summary(msg, outgoing=False):
     subject = _header(headers, "Subject") or "(no subject)"
     labels = msg.get("labelIds", [])
     snippet = msg.get("snippet", "")
+    unsub = None
+    bulk = False
     if outgoing:
         name, addr = _parse_addr(_header(headers, "To"))
         sender = "To: " + (name or "(no recipient)")
@@ -393,6 +408,11 @@ def thread_summary(msg, outgoing=False):
         name, addr = _parse_addr(_header(headers, "From"))
         sender = name
         bundle = _bundle_for(labels, subject, name, snippet)
+        unsub = parse_unsubscribe(headers)
+        # Bulk/promo mail: treat inline images as decoration (hide them as attachments)
+        bulk = bool(unsub) or any(l in CATEGORY_BUNDLES for l in labels)
+    atts = [dict(a, messageId=msg.get("id"))
+            for a in _collect_attachments(msg.get("payload", {}), hide_inline_images=bulk)]
     return {
         "id": msg.get("threadId"),
         "messageId": msg.get("id"),
@@ -406,8 +426,8 @@ def thread_summary(msg, outgoing=False):
         "pinned": "STARRED" in labels,
         "bundle": bundle,
         "highlights": [] if outgoing else compute_highlights(subject, snippet, bundle),
-        "unsub": None if outgoing else parse_unsubscribe(headers),
-        "attachments": [dict(a, messageId=msg.get("id")) for a in _collect_attachments(msg.get("payload", {}))],
+        "unsub": unsub,
+        "attachments": atts,
         "permalink": gmail_permalink(msg.get("threadId")),
     }
 
