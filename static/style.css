@@ -158,6 +158,9 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .msg .mfrom{color:var(--text-primary);font-weight:500}
 .msg .mbody{font-size:14px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}
 .msg .mbody iframe{width:100%;border:0}
+.msg-attachments{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--divider)}
+.msg-attachments .attach-chip{cursor:pointer}
+.msg-attachments .attach-chip small{color:#80868b;margin-left:2px}
 .reader-reply{display:flex;gap:8px;padding:12px;background:#fff;border-top:1px solid var(--divider);align-items:flex-end}
 .reply-editor{flex:1;border:1px solid var(--divider);border-radius:8px;overflow:hidden;display:flex;flex-direction:column}
 .reply-toolbar{padding:2px 4px}

@@ -182,6 +182,12 @@ function render() {
 }
 function label(t) { const e = document.createElement("div"); e.className = "section-label"; e.textContent = t; return e; }
 function esc(s) { return (s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function fmtBytes(n) {
+  n = +n || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(0) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
+}
 
 // ---------- Actions ----------
 async function doDone(row) {
@@ -468,6 +474,19 @@ async function openThread(tid) {
       f.srcdoc = m.html;
     } else {
       mb.textContent = m.text || "(no content)";
+    }
+    if (m.attachments && m.attachments.length) {
+      const wrap = document.createElement("div");
+      wrap.className = "msg-attachments";
+      m.attachments.forEach((a) => {
+        const url = `/api/attachment/${m.id}/${a.attachmentId}?name=${encodeURIComponent(a.filename)}&mime=${encodeURIComponent(a.mimeType)}`;
+        const chip = document.createElement("button");
+        chip.className = "attach-chip";
+        chip.innerHTML = `<i class="material-icons" style="font-size:16px;color:#5f6368">attach_file</i><span>${esc(a.filename)}</span><small>${fmtBytes(a.size)}</small>`;
+        chip.onclick = () => openExternal(location.origin + url);
+        wrap.appendChild(chip);
+      });
+      d.appendChild(wrap);
     }
     body.appendChild(d);
   });
