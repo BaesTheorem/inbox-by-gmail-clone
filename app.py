@@ -347,6 +347,27 @@ def _decode_body(payload):
     return text, html
 
 
+def _collect_attachments(payload):
+    """Walk the MIME tree and return real attachments (named parts with an attachmentId)."""
+    out = []
+
+    def walk(part):
+        fn = part.get("filename") or ""
+        body = part.get("body", {})
+        if fn and body.get("attachmentId"):
+            out.append({
+                "filename": fn,
+                "mimeType": part.get("mimeType", "application/octet-stream"),
+                "size": body.get("size", 0),
+                "attachmentId": body["attachmentId"],
+            })
+        for sub in part.get("parts", []) or []:
+            walk(sub)
+
+    walk(payload)
+    return out
+
+
 def thread_summary(msg, outgoing=False):
     """Build a list-row summary from a metadata message resource.
     outgoing=True (Sent) shows the recipient ('To: …') instead of the sender."""
@@ -491,6 +512,7 @@ def fetch_thread(thread_id):
             "date": _fmt_time(_header(headers, "Date")),
             "text": text,
             "html": html,
+            "attachments": _collect_attachments(m.get("payload", {})),
             "unread": "UNREAD" in m.get("labelIds", []),
         })
     return {
@@ -889,6 +911,22 @@ def api_thread(thread_id):
         data = fetch_thread(thread_id)
         mark_read(thread_id)
         return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/attachment/<message_id>/<attachment_id>")
+def api_attachment(message_id, attachment_id):
+    """Stream a Gmail attachment (decoded from base64url) so the browser can open/save it."""
+    try:
+        data = gget(f"/messages/{message_id}/attachments/{attachment_id}")
+        content = base64.urlsafe_b64decode(data.get("data", ""))
+        name = (request.args.get("name") or "attachment").replace('"', "")
+        mime = request.args.get("mime") or "application/octet-stream"
+        # Preview images/PDFs in the browser; download everything else.
+        disp = "inline" if (mime.startswith("image/") or mime == "application/pdf") else "attachment"
+        return Response(content, mimetype=mime,
+                        headers={"Content-Disposition": f'{disp}; filename="{name}"'})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
