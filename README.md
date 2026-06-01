@@ -12,6 +12,8 @@ Reverse-engineered from a detailed UX spec of the original product — see
 **[docs/DESIGN.md](docs/DESIGN.md)** for the full design document (colors, typography,
 components, interactions, and history).
 
+> 📌 **Planned:** a standalone iPhone PWA (Mac-independent). See **[docs/ROADMAP.md](docs/ROADMAP.md)**.
+
 ## Architecture
 - **Backend:** `app.py` — Flask + Gmail API (`uv run --script`, deps inline via PEP 723).
 - **Frontend:** `templates/index.html` + `static/{style.css,app.js}` — vanilla SPA styled to the Inbox spec.
