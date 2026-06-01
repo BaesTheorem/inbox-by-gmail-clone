@@ -12,6 +12,12 @@ function openExternal(url) {
   if (window.pywebview && window.pywebview.api && window.pywebview.api.open_external) window.pywebview.api.open_external(url);
   else window.open(url, "_blank", "noopener");
 }
+// Open/download an attachment: Google Docs → Drive; everything else → download endpoint.
+function openAttachment(a) {
+  if (a.drive) { openExternal("https://drive.google.com/"); return; }
+  const url = `/api/attachment/${a.messageId}/${a.attachmentId}?name=${encodeURIComponent(a.filename)}&mime=${encodeURIComponent(a.mimeType)}`;
+  openExternal(location.origin + url);
+}
 
 const PAGE = 50;
 let STATE = { view: "inbox", data: null, threadCache: {}, inboxCache: null, query: "", openBundles: new Set(), token: null, selected: new Set(), snoozeMulti: false };
@@ -49,6 +55,9 @@ function cardEl(row) {
     ? `<div class="chips">${row.highlights.map((h) => `<span class="chip"><i class="material-icons">${h.icon}</i>${esc(h.text)}</span>`).join("")}</div>`
     : "";
   const wakeHtml = row.wake ? `<div class="wake"><i class="material-icons">schedule</i>${esc(row.wake)}</div>` : "";
+  const attHtml = (row.attachments || []).length
+    ? `<div class="chips">${row.attachments.map((a, i) => `<span class="chip att-chip" data-ai="${i}" title="${esc(a.filename)}"><i class="material-icons">${a.drive ? "description" : "attach_file"}</i>${esc(a.filename)}</span>`).join("")}</div>`
+    : "";
   el.innerHTML = `
     <div class="select">
       <div class="avatar">${initials(row.sender)}</div>
@@ -61,7 +70,7 @@ function cardEl(row) {
       </div>
       <div class="subject">${esc(row.subject)}</div>
       <div class="snippet">${esc(row.snippet)}</div>
-      ${chipsHtml}${wakeHtml}
+      ${chipsHtml}${attHtml}${wakeHtml}
     </div>
     <div class="actions">
       <button class="icon-btn act-pin" title="Pin"><i class="material-icons">push_pin</i></button>
@@ -71,8 +80,11 @@ function cardEl(row) {
       <button class="icon-btn act-things" title="Send to Things 3"><i class="material-icons">playlist_add_check</i></button>
     </div>`;
   el.addEventListener("click", (e) => {
-    if (e.target.closest(".actions") || e.target.closest(".unsub-link") || e.target.closest(".select")) return;
+    if (e.target.closest(".actions") || e.target.closest(".unsub-link") || e.target.closest(".select") || e.target.closest(".att-chip")) return;
     openThread(row.id);
+  });
+  el.querySelectorAll(".att-chip").forEach((c) => {
+    c.onclick = (e) => { e.stopPropagation(); openAttachment(row.attachments[+c.dataset.ai]); };
   });
   el.querySelector(".select").onclick = (e) => { e.stopPropagation(); toggleSelect(row.id, el); };
   el.querySelector(".act-done").onclick = (e) => { e.stopPropagation(); doDone(row); };
@@ -398,7 +410,7 @@ document.addEventListener("click", (e) => {
 function enableSwipe(el, row) {
   let startX = 0, dx = 0, dragging = false;
   el.addEventListener("pointerdown", (e) => {
-    if (e.target.closest(".actions") || e.target.closest(".unsub-link") || e.target.closest(".select")) return;
+    if (e.target.closest(".actions") || e.target.closest(".unsub-link") || e.target.closest(".select") || e.target.closest(".att-chip")) return;
     startX = e.clientX; dragging = true; el.classList.add("swiping"); el.setPointerCapture(e.pointerId);
   });
   el.addEventListener("pointermove", (e) => {
@@ -479,11 +491,11 @@ async function openThread(tid) {
       const wrap = document.createElement("div");
       wrap.className = "msg-attachments";
       m.attachments.forEach((a) => {
-        const url = `/api/attachment/${m.id}/${a.attachmentId}?name=${encodeURIComponent(a.filename)}&mime=${encodeURIComponent(a.mimeType)}`;
+        const att = { ...a, messageId: a.messageId || m.id };
         const chip = document.createElement("button");
         chip.className = "attach-chip";
-        chip.innerHTML = `<i class="material-icons" style="font-size:16px;color:#5f6368">attach_file</i><span>${esc(a.filename)}</span><small>${fmtBytes(a.size)}</small>`;
-        chip.onclick = () => openExternal(location.origin + url);
+        chip.innerHTML = `<i class="material-icons" style="font-size:16px;color:#5f6368">${a.drive ? "description" : "attach_file"}</i><span>${esc(a.filename)}</span><small>${a.drive ? "Drive" : fmtBytes(a.size)}</small>`;
+        chip.onclick = () => openAttachment(att);
         wrap.appendChild(chip);
       });
       d.appendChild(wrap);
