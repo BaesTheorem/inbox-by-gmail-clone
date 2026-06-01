@@ -9,7 +9,7 @@
 <link rel="apple-touch-icon" href="/static/favicon.png">
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css?v=29">
+<link rel="stylesheet" href="/static/style.css?v=30">
 </head>
 <body>
 <header class="appbar">
@@ -62,11 +62,9 @@
   </main>
 </div>
 
-<!-- Floating action button + speed dial -->
+<!-- Floating action button — compose -->
 <div class="fab-wrap" id="fabWrap">
-  <div class="fab-mini" id="fabReminder" title="Reminder"><i class="material-icons">notifications</i></div>
-  <div class="fab-mini" id="fabCompose" title="Compose"><i class="material-icons">edit</i></div>
-  <button class="fab" id="fab"><i class="material-icons">add</i></button>
+  <button class="fab" id="fab" title="Compose"><i class="material-icons">add</i></button>
 </div>
 
 <!-- Thread reader -->
@@ -144,6 +142,6 @@
 <div class="snackbar" id="snackbar" hidden><span id="snackText"></span><button id="snackUndo">UNDO</button></div>
 
 <script>window.OPEN_THREAD = "{{ open_thread }}";</script>
-<script src="/static/app.js?v=29"></script>
+<script src="/static/app.js?v=30"></script>
 </body>
 </html>

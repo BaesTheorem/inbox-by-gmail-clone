@@ -524,9 +524,7 @@ function openCompose(opts = {}) {
 }
 function closeCompose() { $("#composeOverlay").hidden = true; STATE.composeDraftId = null; STATE.attachments = []; }
 function clearCompose() { $("#cTo").value = $("#cSubject").value = ""; $("#cBody").innerHTML = ""; STATE.attachments = []; renderAttachChips(); }
-$("#fab").onclick = () => $("#fabWrap").classList.toggle("open");
-$("#fabCompose").onclick = () => { $("#fabWrap").classList.remove("open"); openCompose(); };
-$("#fabReminder").onclick = () => { $("#fabWrap").classList.remove("open"); openCompose({ subject: "Reminder" }); };
+$("#fab").onclick = () => openCompose();
 $("#composeClose").onclick = closeCompose;
 // Click the dimmed backdrop to dismiss compose
 $("#composeOverlay").addEventListener("click", (e) => { if (e.target.id === "composeOverlay") closeCompose(); });
