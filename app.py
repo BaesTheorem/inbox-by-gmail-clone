@@ -347,19 +347,29 @@ def _decode_body(payload):
     return text, html
 
 
+def _part_disposition(part):
+    for h in part.get("headers", []) or []:
+        if h.get("name", "").lower() == "content-disposition":
+            return h.get("value", "").lower()
+    return ""
+
+
 def _collect_attachments(payload):
-    """Walk the MIME tree and return real attachments (named parts with an attachmentId)."""
+    """Walk the MIME tree and return real attachments (named, non-inline parts)."""
     out = []
 
     def walk(part):
         fn = part.get("filename") or ""
         body = part.get("body", {})
-        if fn and body.get("attachmentId"):
+        # Skip inline parts (e.g. logos/signature images embedded in the body).
+        if fn and body.get("attachmentId") and not _part_disposition(part).startswith("inline"):
+            mime = part.get("mimeType", "application/octet-stream")
             out.append({
                 "filename": fn,
-                "mimeType": part.get("mimeType", "application/octet-stream"),
+                "mimeType": mime,
                 "size": body.get("size", 0),
                 "attachmentId": body["attachmentId"],
+                "drive": mime.startswith("application/vnd.google-apps"),  # open in Drive, not downloadable
             })
         for sub in part.get("parts", []) or []:
             walk(sub)
@@ -397,6 +407,7 @@ def thread_summary(msg, outgoing=False):
         "bundle": bundle,
         "highlights": [] if outgoing else compute_highlights(subject, snippet, bundle),
         "unsub": None if outgoing else parse_unsubscribe(headers),
+        "attachments": [dict(a, messageId=msg.get("id")) for a in _collect_attachments(msg.get("payload", {}))],
         "permalink": gmail_permalink(msg.get("threadId")),
     }
 
@@ -451,9 +462,16 @@ def ensure_filter(sender, label_id):
     return True
 
 
-def _get_meta(mid, headers):
+# format=full but a fields mask that returns headers + the attachment part tree
+# WITHOUT the body bytes — so list rows get attachments cheaply (no big body download).
+_PART = "partId,mimeType,filename,headers,body/attachmentId,body/size"
+_LIST_FIELDS = ("id,threadId,internalDate,labelIds,snippet,"
+                f"payload(mimeType,headers,parts({_PART},parts({_PART},parts({_PART}))))")
+
+
+def _get_meta(mid):
     try:
-        return gget(f"/messages/{mid}", format="metadata", metadataHeaders=headers)
+        return gget(f"/messages/{mid}", format="full", fields=_LIST_FIELDS)
     except Exception:
         return None  # message vanished (deleted/moved) — drop it
 
@@ -463,12 +481,10 @@ def summarize_ids(ids, outgoing=False):
         return []
     if not outgoing:
         load_bundle_labels()
-    headers = (["To", "Subject", "Date"] if outgoing
-               else ["From", "Subject", "Date", "List-Unsubscribe", "List-Unsubscribe-Post"])
-    # Concurrent metadata fetches (requests/urllib3 is thread-safe). gget retries
-    # rate-limits internally; a small worker cap keeps us under the per-second quota.
+    # Concurrent fetches (requests/urllib3 is thread-safe). gget retries rate-limits
+    # internally; a small worker cap keeps us under the per-second quota.
     with ThreadPoolExecutor(max_workers=8) as ex:
-        msgs = list(ex.map(lambda m: _get_meta(m, headers), ids))
+        msgs = list(ex.map(_get_meta, ids))
 
     # newest message per thread
     by_thread = {}
@@ -861,7 +877,7 @@ def api_drafts():
                 mid_to_did[mid] = dr["id"]
                 ids.append(mid)
         with ThreadPoolExecutor(max_workers=8) as ex:
-            fetched = list(ex.map(lambda m: _get_meta(m, ["To", "Subject", "Date"]), ids))
+            fetched = list(ex.map(_get_meta, ids))
         items = []
         for mid, msg in zip(ids, fetched):
             if not msg:
