@@ -9,3 +9,5 @@ __pycache__/
 server.log
 desktop.log
 .venv/
+.DS_Store
+**/.DS_Store
