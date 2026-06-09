@@ -23,9 +23,14 @@ that reopens the exact thread in this app (inboxclone://thread/<id>), with a
 Gmail web permalink as the fallback.
 """
 import base64
+import html as _htmlmod
+import ipaddress
 import json
+import logging
 import os
 import re
+import secrets
+import socket
 import sqlite3
 import subprocess
 import threading
@@ -33,10 +38,13 @@ import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import random
 from concurrent.futures import ThreadPoolExecutor
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("inbox")
 
 import requests
 from flask import Flask, Response, jsonify, redirect, render_template, request
@@ -84,6 +92,7 @@ VALID_BUNDLES = set(BUNDLE_ORDER) | {"Primary"}
 BUNDLE_LABEL_PREFIX = "Bundle/"
 _bundle_label_by_id = {}      # Gmail labelId -> bundle name
 _bundle_labels_loaded = False
+_bundle_lock = threading.Lock()  # guards the _bundle_label_by_id dict across threads
 
 # Light keyword classifiers for the Inbox-only bundles Gmail has no native label for
 TRAVEL_RE = re.compile(r"\b(flight|itinerary|boarding|reservation|hotel|booking|check-?in|airline|trip|departure|gate)\b", re.I)
@@ -162,9 +171,13 @@ def _load_or_consent_creds():
         else:
             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET, SCOPES)
             creds = flow.run_local_server(port=0, prompt="consent")
-        with open(TOKEN_PATH, "w") as f:
+        # Atomic 0600 write: create with restrictive perms from the start (no
+        # world-readable window between open() and chmod), then rename into place.
+        tmp = TOKEN_PATH + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(creds.to_json())
-        os.chmod(TOKEN_PATH, 0o600)
+        os.replace(tmp, TOKEN_PATH)
     return creds
 
 
@@ -226,6 +239,10 @@ def gpost(path, json=None):
     return _request("POST", path, json=json).json()
 
 
+def gput(path, json=None):
+    return _request("PUT", path, json=json).json()
+
+
 def gdelete(path):
     _request("DELETE", path)
     return {}
@@ -233,6 +250,25 @@ def gdelete(path):
 
 def gmail_permalink(thread_id):
     return f"https://mail.google.com/mail/u/0/#all/{thread_id}"
+
+
+def _is_safe_public_url(url):
+    """SSRF guard for sender-supplied URLs (one-click unsubscribe). Requires https
+    and a hostname that resolves only to public, non-loopback addresses."""
+    try:
+        p = urlparse(url)
+        if p.scheme != "https" or not p.hostname:
+            return False
+        # Resolve every A/AAAA record and reject if any is private/loopback/link-local.
+        infos = socket.getaddrinfo(p.hostname, p.port or 443, proto=socket.IPPROTO_TCP)
+        for *_, sockaddr in infos:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                return False
+        return bool(infos)
+    except Exception:
+        return False
 
 
 # ----------------------------------------------------------------------------
@@ -347,6 +383,69 @@ def _decode_body(payload):
     return text, html
 
 
+def drive_link_from_html(html_body, filename=None):
+    """Pull the Google Docs/Drive URL for an attached file out of the message HTML.
+
+    A Drive file rides in the body as a chip whose <a href> points at the real
+    document; the MIME attachment part carries no URL, so the body is the source.
+    With several attachments, prefer the anchor whose visible text matches the
+    filename; otherwise return the first Drive link found."""
+    if not html_body:
+        return None
+    drive = []
+    for _q, href, inner in re.findall(r'<a\b[^>]*?href=(["\'])(.*?)\1[^>]*?>(.*?)</a>',
+                                      html_body, re.I | re.S):
+        href = _htmlmod.unescape(href)
+        if re.match(r'https://(?:docs|drive)\.google\.com/', href):
+            text = _htmlmod.unescape(re.sub(r'<[^>]+>', '', inner)).strip()
+            drive.append((href, text))
+    if not drive:
+        bare = re.findall(r'https://(?:docs|drive)\.google\.com/[^\s"\'<>\\]+', html_body)
+        return _htmlmod.unescape(bare[0]) if bare else None
+    if filename:
+        stem = filename.rsplit('.', 1)[0].strip().lower()
+        if stem:
+            for href, text in drive:
+                if stem in text.lower() or stem in href.lower():
+                    return href
+    return drive[0][0]
+
+
+_DOC_KIND_BY_PATH = [
+    ("/spreadsheets/", "sheet"), ("/presentation/", "slides"),
+    ("/forms/", "form"), ("/document/", "doc"),
+    ("/drive/folders/", "folder"), ("drive.google.com/file/", "file"),
+]
+_DOC_GENERIC_TITLE = {"doc": "Google Doc", "sheet": "Google Sheet", "slides": "Google Slides",
+                      "form": "Google Form", "folder": "Drive folder", "file": "Drive file"}
+
+
+def extract_doc_links(html_body):
+    """Pull shared Google Docs/Drive links out of an email body so the reader can
+    surface them as real cards (Gmail-style chips are client-side, so the raw email
+    only carries plain <a> links). Deduped by URL; utility links are skipped."""
+    if not html_body:
+        return []
+    out, seen = [], set()
+    for _q, href, inner in re.findall(r'<a\b[^>]*?href=(["\'])(.*?)\1[^>]*?>(.*?)</a>',
+                                      html_body, re.I | re.S):
+        href = _htmlmod.unescape(href)
+        if not re.match(r'https://(?:docs|drive)\.google\.com/', href):
+            continue
+        if "/drive/blockuser" in href or "accounts.google.com" in href:
+            continue
+        key = href.split("?")[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        kind = next((k for frag, k in _DOC_KIND_BY_PATH if frag in href), "file")
+        text = _htmlmod.unescape(re.sub(r'<[^>]+>', '', inner)).strip()
+        if not text or text.lower().startswith("http"):
+            text = _DOC_GENERIC_TITLE.get(kind, "Google Drive")
+        out.append({"url": href, "title": text[:120], "kind": kind})
+    return out
+
+
 def _is_inline_part(part):
     inline, has_cid = False, False
     for h in part.get("headers", []) or []:
@@ -424,6 +523,7 @@ def thread_summary(msg, outgoing=False):
         "ts": msg.get("internalDate", "0"),
         "unread": "UNREAD" in labels,
         "pinned": "STARRED" in labels,
+        "important": "IMPORTANT" in labels,
         "bundle": bundle,
         "highlights": [] if outgoing else compute_highlights(subject, snippet, bundle),
         "unsub": unsub,
@@ -456,16 +556,18 @@ def load_bundle_labels(force=False):
     if _bundle_labels_loaded and not force:
         return
     labels = gget("/labels").get("labels", [])
-    _bundle_label_by_id.clear()
-    for l in labels:
-        if l["name"].startswith(BUNDLE_LABEL_PREFIX):
-            _bundle_label_by_id[l["id"]] = l["name"][len(BUNDLE_LABEL_PREFIX):]
-    _bundle_labels_loaded = True
+    with _bundle_lock:
+        _bundle_label_by_id.clear()
+        for l in labels:
+            if l["name"].startswith(BUNDLE_LABEL_PREFIX):
+                _bundle_label_by_id[l["id"]] = l["name"][len(BUNDLE_LABEL_PREFIX):]
+        _bundle_labels_loaded = True
 
 
 def ensure_bundle_label(bundle):
     lid = ensure_label(BUNDLE_LABEL_PREFIX + bundle)
-    _bundle_label_by_id[lid] = bundle
+    with _bundle_lock:
+        _bundle_label_by_id[lid] = bundle
     return lid
 
 
@@ -528,15 +630,27 @@ def fetch_thread(thread_id):
     thread = gget(f"/threads/{thread_id}", format="full")
     messages = []
     last_rfc_id = ""
+    all_rfc_ids = []
     subject = ""
     unsub = None
     unsub_mid = None
+    muted = False
+    draft_msg = None  # (message_id, html) of an unsent reply draft living in this thread
     for m in thread.get("messages", []):
+        # An autosaved reply rides in the thread as a DRAFT message — don't render it as
+        # a sent bubble; capture it so the reader can restore it into the reply box.
+        if "DRAFT" in m.get("labelIds", []):
+            _, dhtml = _decode_body(m.get("payload", {}))
+            draft_msg = (m.get("id"), dhtml)
+            continue
         headers = m.get("payload", {}).get("headers", [])
         name, email_addr = _parse_addr(_header(headers, "From"))
         subject = subject or _header(headers, "Subject")
         text, html = _decode_body(m.get("payload", {}))
-        last_rfc_id = _header(headers, "Message-ID") or last_rfc_id
+        rfc_id = _header(headers, "Message-ID")
+        if rfc_id:
+            last_rfc_id = rfc_id
+            all_rfc_ids.append(rfc_id)
         u = parse_unsubscribe(headers)
         if u:
             unsub, unsub_mid = u, m.get("id")  # prefer the most recent message's list-unsubscribe
@@ -545,21 +659,37 @@ def fetch_thread(thread_id):
             "sender": name,
             "senderEmail": email_addr,
             "to": _header(headers, "To"),
+            "cc": _header(headers, "Cc"),   # needed for reply-all
             "date": _fmt_time(_header(headers, "Date")),
             "text": text,
             "html": html,
             "attachments": _collect_attachments(m.get("payload", {})),
+            "docLinks": extract_doc_links(html),
             "unread": "UNREAD" in m.get("labelIds", []),
         })
+    reply_draft = None
+    if draft_msg:
+        try:
+            for dr in gget("/drafts", maxResults=50).get("drafts", []):
+                if dr.get("message", {}).get("id") == draft_msg[0]:
+                    reply_draft = {"draftId": dr["id"], "html": draft_msg[1]}
+                    break
+        except Exception:
+            pass
+    # Pinned reflects the newest NON-draft message (drafts don't carry STARRED state).
+    real = [m for m in thread.get("messages", []) if "DRAFT" not in m.get("labelIds", [])]
     return {
         "id": thread_id,
         "subject": subject or "(no subject)",
         "messages": messages,
         "rfcMessageId": last_rfc_id,
+        "allRfcIds": all_rfc_ids,           # full ancestry for the References header
         "permalink": gmail_permalink(thread_id),
-        "pinned": "STARRED" in (thread.get("messages", [{}])[-1].get("labelIds", [])),
+        "pinned": "STARRED" in ((real[-1] if real else {}).get("labelIds", [])),
+        "muted": muted,
         "unsub": unsub,
         "unsubMessageId": unsub_mid,
+        "replyDraft": reply_draft,
     }
 
 
@@ -589,16 +719,24 @@ def mark_read(thread_id):
         pass
 
 
-def send_message(to, subject, body, thread_id=None, in_reply_to=None,
-                 body_html=None, attachments=None):
+def _build_raw_message(to, subject, body, cc=None, bcc=None, in_reply_to=None,
+                       references=None, body_html=None, attachments=None):
+    """Build an RFC 2822 message and return its base64url-encoded form.
+    Shared by the immediate-send path and the Deferred Action Engine (send-later /
+    undo-send), so message content is captured at the moment the user hit Send."""
     msg = EmailMessage()
     msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
+    if bcc:
+        msg["Bcc"] = bcc            # Gmail strips Bcc from the delivered copy
     msg["Subject"] = subject
     if _user_email:
         msg["From"] = _user_email
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
-        msg["References"] = in_reply_to
+        # RFC 2822 wants the full ancestry; fall back to just the parent id.
+        msg["References"] = references or in_reply_to
     msg.set_content(body or "")          # plain-text part (fallback)
     if body_html:
         msg.add_alternative(body_html, subtype="html")  # -> multipart/alternative
@@ -606,49 +744,239 @@ def send_message(to, subject, body, thread_id=None, in_reply_to=None,
         maintype, _, subtype = (mime or "application/octet-stream").partition("/")
         msg.add_attachment(data, maintype=maintype, subtype=subtype or "octet-stream",
                            filename=fname or "attachment")  # -> multipart/mixed
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    return base64.urlsafe_b64encode(msg.as_bytes()).decode()
+
+
+def _send_raw(raw, thread_id=None):
     send_body = {"raw": raw}
     if thread_id:
         send_body["threadId"] = thread_id
     return gpost("/messages/send", json=send_body)
 
 
+def send_message(to, subject, body, thread_id=None, in_reply_to=None,
+                 references=None, cc=None, bcc=None, body_html=None, attachments=None):
+    raw = _build_raw_message(to, subject, body, cc=cc, bcc=bcc, in_reply_to=in_reply_to,
+                             references=references, body_html=body_html, attachments=attachments)
+    return _send_raw(raw, thread_id=thread_id)
+
+
 # ----------------------------------------------------------------------------
-# Snooze scheduler
+# Persistence: snooze.db (WAL mode). Holds the Deferred Action Engine queue and
+# the Settings Store. All writes are serialized through _DAE_LOCK; WAL lets reads
+# run concurrently with the single writer.
 # ----------------------------------------------------------------------------
+_DAE_LOCK = threading.Lock()
+DAE_TICK = 5            # seconds between scheduler ticks (catches the undo-send window)
+_dae_wake = threading.Event()   # set to make the scheduler tick immediately
+
+
 def db():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS snoozed (thread_id TEXT PRIMARY KEY, wake_at INTEGER)")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
-def snooze_thread(thread_id, wake_epoch):
-    ensure_label("Snoozed")
-    modify_thread(thread_id, add=[ensure_label("Snoozed")], remove=["INBOX"])
-    conn = db()
-    conn.execute("INSERT OR REPLACE INTO snoozed VALUES (?,?)", (thread_id, int(wake_epoch)))
+def migrate_db():
+    """Create the DAE + settings tables and migrate the legacy `snoozed` table.
+    Idempotent — safe to run on every startup and safe to re-run after a crash."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS deferred_actions (
+        id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+        thread_id TEXT, message_id TEXT,
+        payload TEXT NOT NULL DEFAULT '{}',
+        fire_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_da_fire ON deferred_actions (fire_at) WHERE status='pending'")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_da_thread ON deferred_actions (thread_id) WHERE status='pending'")
+    conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "snoozed" in tables:
+        now = int(time.time())
+        for tid, wake_at in conn.execute("SELECT thread_id, wake_at FROM snoozed").fetchall():
+            conn.execute(
+                "INSERT OR IGNORE INTO deferred_actions "
+                "(id, kind, thread_id, payload, fire_at, status, created_at, attempts) "
+                "VALUES (?,?,?,?,?,?,?,0)",
+                (secrets.token_hex(16), "snooze_wake", tid, "{}", int(wake_at),
+                 "pending" if wake_at > now else "fired", now))
+        conn.execute("DROP TABLE snoozed")
+        log.info("migrated %s legacy snooze rows into deferred_actions", "all")
     conn.commit()
     conn.close()
 
 
+# ---------- Settings Store ----------
+SETTINGS_DEFAULTS = {
+    "signature": "",
+    "undo_send_window": 10,        # seconds; 0 disables undo-send
+    "dark_mode": "auto",           # auto | light | dark
+    "default_snooze": "later_today",
+    "snippets": [],                # [{id, title, html}]
+    "image_block": False,          # show remote images by default (toggle in Settings to block)
+    "page_size": 50,
+    "followup_default_days": 3,
+}
+
+
+def _get_setting(key, default=None):
+    conn = db()
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    if row is None:
+        return SETTINGS_DEFAULTS.get(key, default)
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return row[0]
+
+
+def _set_setting(key, value):
+    with _DAE_LOCK:
+        conn = db()
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                     (key, json.dumps(value)))
+        conn.commit()
+        conn.close()
+
+
+# ---------- Deferred Action Engine ----------
+def _dae_enqueue(kind, fire_at, thread_id=None, message_id=None, payload=None):
+    action_id = secrets.token_hex(16)
+    with _DAE_LOCK:
+        conn = db()
+        conn.execute(
+            "INSERT INTO deferred_actions "
+            "(id, kind, thread_id, message_id, payload, fire_at, status, created_at, attempts) "
+            "VALUES (?,?,?,?,?,?,?,?,0)",
+            (action_id, kind, thread_id, message_id, json.dumps(payload or {}),
+             int(fire_at), "pending", int(time.time())))
+        conn.commit()
+        conn.close()
+    _dae_wake.set()
+    return action_id
+
+
+def _dae_cancel(action_id):
+    with _DAE_LOCK:
+        conn = db()
+        n = conn.execute("UPDATE deferred_actions SET status='cancelled' "
+                         "WHERE id=? AND status='pending'", (action_id,)).rowcount
+        conn.commit()
+        conn.close()
+    return bool(n)
+
+
+def _dae_cancel_kind_for_thread(kind, thread_id):
+    """Cancel any pending action of `kind` for a thread (e.g. re-snooze supersedes)."""
+    with _DAE_LOCK:
+        conn = db()
+        conn.execute("UPDATE deferred_actions SET status='cancelled' "
+                     "WHERE kind=? AND thread_id=? AND status='pending'", (kind, thread_id))
+        conn.commit()
+        conn.close()
+
+
+def _mark_action(action_id, status):
+    with _DAE_LOCK:
+        conn = db()
+        conn.execute("UPDATE deferred_actions SET status=? WHERE id=?", (status, action_id))
+        conn.commit()
+        conn.close()
+
+
+def _retry_or_fail(action_id, new_attempts, new_fire_at, max_attempts=5):
+    with _DAE_LOCK:
+        conn = db()
+        if new_attempts >= max_attempts:
+            conn.execute("UPDATE deferred_actions SET status='failed', attempts=? WHERE id=?",
+                         (new_attempts, action_id))
+        else:
+            conn.execute("UPDATE deferred_actions SET attempts=?, fire_at=? WHERE id=?",
+                         (new_attempts, new_fire_at, action_id))
+        conn.commit()
+        conn.close()
+
+
+def snooze_thread(thread_id, wake_epoch):
+    """Snooze a thread: archive it under the Snoozed label and queue a wake."""
+    sid = ensure_label("Snoozed")
+    modify_thread(thread_id, add=[sid], remove=["INBOX"])
+    _dae_cancel_kind_for_thread("snooze_wake", thread_id)  # re-snooze supersedes
+    _dae_enqueue("snooze_wake", wake_epoch, thread_id=thread_id)
+
+
+def _handle_snooze_wake(thread_id, message_id, payload):
+    sid = ensure_label("Snoozed")
+    modify_thread(thread_id, add=["INBOX"], remove=[sid])
+    SYNC["version"] += 1
+
+
+def _handle_send(thread_id, message_id, payload):
+    """Used for both send_scheduled and undo_send_commit — raw built at enqueue."""
+    _send_raw(payload["raw_b64"], thread_id=thread_id)
+    SYNC["version"] += 1
+
+
+def _handle_followup_nudge(thread_id, message_id, payload):
+    """Re-surface a sent thread to the inbox if no reply has arrived."""
+    thread = gget(f"/threads/{thread_id}", format="metadata", metadataHeaders=["From"])
+    sent_at = payload.get("sent_at_epoch", 0)
+    has_reply = any(
+        int(m.get("internalDate", 0)) / 1000 > sent_at
+        and (_user_email or "") not in (_header(m.get("payload", {}).get("headers", []), "From") or "")
+        for m in thread.get("messages", [])
+    )
+    if not has_reply:
+        modify_thread(thread_id, add=["INBOX"])
+        SYNC["version"] += 1
+
+
+_DAE_HANDLERS = {
+    "snooze_wake": _handle_snooze_wake,
+    "send_scheduled": _handle_send,
+    "undo_send_commit": _handle_send,
+    "followup_nudge": _handle_followup_nudge,
+}
+
+
+def _dae_tick():
+    now = int(time.time())
+    with _DAE_LOCK:
+        conn = db()
+        due = conn.execute(
+            "SELECT id, kind, thread_id, message_id, payload, attempts "
+            "FROM deferred_actions WHERE status='pending' AND fire_at <= ? "
+            "ORDER BY fire_at LIMIT 20", (now,)).fetchall()
+        conn.close()
+    for action_id, kind, thread_id, message_id, payload_json, attempts in due:
+        handler = _DAE_HANDLERS.get(kind)
+        if not handler:
+            log.warning("DAE: unknown kind %r (action %s)", kind, action_id)
+            _mark_action(action_id, "failed")
+            continue
+        try:
+            handler(thread_id, message_id, json.loads(payload_json or "{}"))
+            _mark_action(action_id, "fired")
+        except Exception as exc:
+            backoff = min(3600, 60 * (2 ** attempts))
+            log.exception("DAE: %s %s failed (attempt %d): %s", kind, action_id, attempts + 1, exc)
+            _retry_or_fail(action_id, attempts + 1, now + backoff)
+
+
 def _scheduler_loop():
+    """The Deferred Action Engine: poll due actions every DAE_TICK seconds."""
     while True:
         try:
-            now = int(time.time())
-            conn = db()
-            due = conn.execute("SELECT thread_id FROM snoozed WHERE wake_at <= ?", (now,)).fetchall()
-            for (tid,) in due:
-                try:
-                    snoozed_id = ensure_label("Snoozed")
-                    modify_thread(tid, add=["INBOX"], remove=[snoozed_id])
-                except Exception:
-                    pass
-                conn.execute("DELETE FROM snoozed WHERE thread_id=?", (tid,))
-            conn.commit()
-            conn.close()
+            _dae_tick()
         except Exception:
-            pass
-        time.sleep(60)
+            log.exception("DAE: tick crashed")
+        _dae_wake.wait(timeout=DAE_TICK)
+        _dae_wake.clear()
 
 
 # ----------------------------------------------------------------------------
@@ -679,7 +1007,7 @@ def _history_loop():
                     else:
                         raise
         except Exception:
-            pass
+            log.exception("history poll failed")
         time.sleep(POLL_INTERVAL)
 
 
@@ -777,9 +1105,13 @@ def _limit_arg(default=50):
 
 
 def inbox_totals():
-    """Authoritative inbox counts straight from Gmail's INBOX label (no message fetch)."""
+    """Authoritative inbox counts straight from Gmail's INBOX label (no message fetch).
+
+    Use the THREAD totals, not message totals: the list renders one row per
+    conversation, so a thread with replies must count once. messagesTotal counts
+    every message and inflates the sidebar past the number of visible rows."""
     info = gget("/labels/INBOX")
-    return info.get("messagesTotal"), info.get("messagesUnread")
+    return info.get("threadsTotal"), info.get("threadsUnread")
 
 
 @app.route("/api/inbox")
@@ -798,6 +1130,9 @@ def api_inbox():
         total, unread = None, None
     pinned = [r for r in rows if r["pinned"]]
     primary = [r for r in rows if not r["bundle"] and not r["pinned"]]
+    # Smart-sort: float Gmail-flagged IMPORTANT + unread mail to the top, preserving
+    # recency order within each group. A non-AI "priority inbox" honoring local/calm.
+    primary.sort(key=lambda r: 0 if (r.get("important") and r.get("unread")) else 1)
     bundles = {}
     for r in rows:
         if r["pinned"]:
@@ -829,7 +1164,9 @@ def api_snoozed():
                                    page_token=token, return_token=True)
         rows = summarize_ids(ids)
         conn = db()
-        waked = dict(conn.execute("SELECT thread_id, wake_at FROM snoozed").fetchall())
+        waked = dict(conn.execute(
+            "SELECT thread_id, fire_at FROM deferred_actions "
+            "WHERE kind='snooze_wake' AND status='pending'").fetchall())
         conn.close()
         for r in rows:
             w = waked.get(r["id"])
@@ -932,6 +1269,31 @@ def api_draft(draft_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/save_draft", methods=["POST"])
+def api_save_draft():
+    """Create or update a Gmail draft. Called repeatedly by the compose autosave, so
+    after the first save it reuses the returned draftId to update in place (no dupes)."""
+    d = request.json or {}
+    to, subject = d.get("to", ""), d.get("subject", "")
+    body_text, body_html = d.get("body", ""), d.get("html")
+    cc, bcc = d.get("cc"), d.get("bcc")
+    thread_id = d.get("threadId") or None
+    in_reply_to, references = d.get("inReplyTo") or None, d.get("references") or None
+    draft_id = d.get("draftId") or None
+    try:
+        raw = _build_raw_message(to, subject, body_text, cc=cc, bcc=bcc,
+                                 in_reply_to=in_reply_to, references=references,
+                                 body_html=body_html)
+        message = {"raw": raw}
+        if thread_id:
+            message["threadId"] = thread_id
+        body = {"message": message}
+        res = gput(f"/drafts/{draft_id}", json=body) if draft_id else gpost("/drafts", json=body)
+        return jsonify({"ok": True, "draftId": res.get("id")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/discard_draft", methods=["POST"])
 def api_discard_draft():
     try:
@@ -981,6 +1343,37 @@ def api_undo_done():
     return jsonify({"ok": True})
 
 
+def _bulk_modify(ids, add=None, remove=None):
+    """Apply the same label change to many threads concurrently (one HTTP round trip
+    from the client, parallel Gmail calls server-side). Used by category sweep."""
+    def _one(tid):
+        try:
+            modify_thread(tid, add=add, remove=remove)
+            return True
+        except Exception:
+            log.exception("bulk modify failed for %s", tid)
+            return False
+    if not ids:
+        return 0, 0
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(_one, ids))
+    return sum(results), results.count(False)
+
+
+@app.route("/api/bulk_done", methods=["POST"])
+def api_bulk_done():
+    ids = (request.json or {}).get("threadIds") or []
+    done, failed = _bulk_modify(ids, remove=["INBOX"])
+    return jsonify({"ok": True, "done": done, "failed": failed})
+
+
+@app.route("/api/bulk_undo_done", methods=["POST"])
+def api_bulk_undo_done():
+    ids = (request.json or {}).get("threadIds") or []
+    _bulk_modify(ids, add=["INBOX"])
+    return jsonify({"ok": True})
+
+
 @app.route("/api/pin", methods=["POST"])
 def api_pin():
     tid = request.json["threadId"]
@@ -998,6 +1391,15 @@ def api_snooze():
     wake = request.json.get("epoch") or resolve_snooze(preset)
     snooze_thread(tid, wake)
     return jsonify({"ok": True, "wake": wake})
+
+
+@app.route("/api/unsnooze", methods=["POST"])
+def api_unsnooze():
+    tid = request.json["threadId"]
+    _dae_cancel_kind_for_thread("snooze_wake", tid)
+    sid = ensure_label("Snoozed")
+    modify_thread(tid, add=["INBOX"], remove=[sid])
+    return jsonify({"ok": True})
 
 
 @app.route("/api/relabel", methods=["POST"])
@@ -1028,27 +1430,192 @@ def api_send():
     if ctype.startswith("multipart/form-data"):
         f = request.form
         to, subject = f.get("to", ""), f.get("subject", "")
+        cc, bcc = f.get("cc") or None, f.get("bcc") or None
         body_text, body_html = f.get("text", ""), (f.get("html") or None)
         thread_id, in_reply_to = f.get("threadId") or None, f.get("inReplyTo") or None
+        references = f.get("references") or None
         draft_id = f.get("draftId") or None
+        send_at = f.get("sendAt") or None
         attachments = [(fl.filename, fl.mimetype, fl.read()) for fl in request.files.getlist("attachments")]
     else:
         d = request.json or {}
         to, subject = d.get("to", ""), d.get("subject", "")
+        cc, bcc = d.get("cc"), d.get("bcc")
         body_text, body_html = d.get("body", ""), d.get("html")
         thread_id, in_reply_to = d.get("threadId"), d.get("inReplyTo")
+        references = d.get("references")
         draft_id, attachments = d.get("draftId"), []
+        send_at = d.get("sendAt")
     try:
-        send_message(to, subject, body_text, thread_id=thread_id, in_reply_to=in_reply_to,
-                     body_html=body_html, attachments=attachments)
-        if draft_id:
+        raw = _build_raw_message(to, subject, body_text, cc=cc, bcc=bcc,
+                                 in_reply_to=in_reply_to, references=references,
+                                 body_html=body_html, attachments=attachments)
+        payload = {"raw_b64": raw, "to": to, "subject": subject}
+        now = int(time.time())
+
+        def _drop_draft():
+            if draft_id:
+                try:
+                    gdelete(f"/drafts/{draft_id}")
+                except Exception:
+                    log.warning("could not delete draft %s", draft_id)
+
+        # 1. Scheduled send (explicit future time)
+        try:
+            send_at = int(send_at) if send_at else 0
+        except (TypeError, ValueError):
+            send_at = 0
+        if send_at and send_at > now + 5:
+            aid = _dae_enqueue("send_scheduled", send_at, thread_id=thread_id, payload=payload)
+            _drop_draft()
+            return jsonify({"ok": True, "scheduled": True, "actionId": aid, "sendAt": send_at})
+
+        # 2. Undo-send window (hold N seconds, then commit unless cancelled)
+        undo_window = int(_get_setting("undo_send_window", 10) or 0)
+        if undo_window > 0:
+            aid = _dae_enqueue("undo_send_commit", now + undo_window,
+                               thread_id=thread_id, payload=payload)
+            _drop_draft()
+            return jsonify({"ok": True, "actionId": aid, "undoWindow": undo_window})
+
+        # 3. Immediate send
+        _send_raw(raw, thread_id=thread_id)
+        _drop_draft()
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.exception("send failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cancel_send", methods=["POST"])
+def api_cancel_send():
+    action_id = (request.json or {}).get("actionId")
+    if not action_id:
+        return jsonify({"error": "missing actionId"}), 400
+    cancelled = _dae_cancel(action_id)
+    return jsonify({"ok": True, "cancelled": cancelled})
+
+
+@app.route("/api/settings", methods=["GET"])
+def api_settings_get():
+    conn = db()
+    rows = conn.execute("SELECT key, value FROM settings").fetchall()
+    conn.close()
+    out = dict(SETTINGS_DEFAULTS)
+    for k, v in rows:
+        try:
+            out[k] = json.loads(v)
+        except Exception:
+            out[k] = v
+    return jsonify(out)
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings_post():
+    for key, value in (request.json or {}).items():
+        if key in SETTINGS_DEFAULTS:
+            _set_setting(key, value)
+    return jsonify({"ok": True})
+
+
+# Contact autocomplete — mined from sent-mail headers (covered by gmail.modify; no
+# extra scope). Cached so typing doesn't refetch on every keystroke.
+_contacts_cache = {"at": 0, "list": []}
+_contacts_lock = threading.Lock()
+
+
+def _rebuild_contacts():
+    ids = list_ids(label_ids=["SENT"], max_results=200)
+    seen, contacts = set(), []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        msgs = list(ex.map(_get_meta, ids))
+    for m in msgs:
+        if not m:
+            continue
+        headers = m.get("payload", {}).get("headers", [])
+        for field in ("To", "Cc"):
+            for addr in (_header(headers, field) or "").split(","):
+                name, email_addr = _parse_addr(addr)
+                key = email_addr.lower()
+                if "@" in key and key not in seen:
+                    seen.add(key)
+                    contacts.append({"name": name, "email": email_addr})
+    return contacts
+
+
+@app.route("/api/contacts")
+def api_contacts():
+    q = (request.args.get("q") or "").strip().lower()
+    now = int(time.time())
+    with _contacts_lock:
+        if now - _contacts_cache["at"] > 900 or not _contacts_cache["list"]:
             try:
-                gdelete(f"/drafts/{draft_id}")
+                _contacts_cache["list"] = _rebuild_contacts()
+                _contacts_cache["at"] = now
             except Exception:
-                pass
+                log.exception("contact rebuild failed")
+        contacts = _contacts_cache["list"]
+    if q:
+        contacts = [c for c in contacts
+                    if q in c["email"].lower() or q in (c["name"] or "").lower()]
+    return jsonify({"contacts": contacts[:8]})
+
+
+@app.route("/api/mute", methods=["POST"])
+def api_mute():
+    d = request.json or {}
+    tid = d.get("threadId")
+    if not tid:
+        return jsonify({"error": "missing threadId"}), 400
+    try:
+        muted_id = ensure_label("Muted")
+        if d.get("muted", True):
+            modify_thread(tid, add=[muted_id], remove=["INBOX"])
+        else:
+            modify_thread(tid, remove=[muted_id])
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.exception("mute failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/mark", methods=["POST"])
+def api_mark():
+    d = request.json or {}
+    tid = d.get("threadId")
+    if not tid:
+        return jsonify({"error": "missing threadId"}), 400
+    try:
+        if d.get("read", True):
+            modify_thread(tid, remove=["UNREAD"])
+        else:
+            modify_thread(tid, add=["UNREAD"])
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/followup", methods=["POST"])
+def api_followup():
+    """Queue a 'remind me if no reply' nudge on a sent thread."""
+    d = request.json or {}
+    tid = d.get("threadId")
+    if not tid:
+        return jsonify({"error": "missing threadId"}), 400
+    days = int(d.get("days") or _get_setting("followup_default_days", 3))
+    # Dedup: one pending nudge per thread
+    conn = db()
+    existing = conn.execute(
+        "SELECT id FROM deferred_actions WHERE kind='followup_nudge' "
+        "AND thread_id=? AND status='pending'", (tid,)).fetchone()
+    conn.close()
+    if existing:
+        return jsonify({"ok": True, "actionId": existing[0], "deduped": True})
+    now = int(time.time())
+    aid = _dae_enqueue("followup_nudge", now + days * 86400, thread_id=tid,
+                       message_id=d.get("messageId"),
+                       payload={"sent_at_epoch": now})
+    return jsonify({"ok": True, "actionId": aid, "days": days})
 
 
 @app.route("/api/unsubscribe", methods=["POST"])
@@ -1072,6 +1639,10 @@ def api_unsubscribe():
             return jsonify({"error": "no List-Unsubscribe header"}), 400
 
         if info["method"] == "one-click":
+            if not _is_safe_public_url(info["httpsUrl"]):
+                # Refuse to POST to a private/loopback target; let the user finish in-browser.
+                return jsonify({"ok": False, "method": "one-click",
+                                "fallbackUrl": info["httpsUrl"], "error": "unsafe URL"})
             req = urllib.request.Request(
                 info["httpsUrl"], data=b"List-Unsubscribe=One-Click",
                 headers={"Content-Type": "application/x-www-form-urlencoded",
@@ -1113,8 +1684,86 @@ def api_to_things():
         return jsonify({"error": str(e), "url": things}), 500
 
 
+@app.route("/api/doc_links", methods=["POST"])
+def api_doc_links():
+    """Extract shared Google Docs/Drive links for a batch of messages so the inbox can
+    show them as preview chips on the card. Called lazily after the list renders (the
+    list fetch skips bodies for speed). fields=payload pulls the body tree only — no
+    attachment bytes, no headers."""
+    mids = (request.json or {}).get("messageIds") or []
+    mids = [m for m in mids if m][:80]
+    def one(mid):
+        try:
+            msg = gget(f"/messages/{mid}", format="full", fields="payload")
+            _, html = _decode_body(msg.get("payload", {}))
+            return mid, extract_doc_links(html)
+        except Exception:
+            return mid, []
+    out = {}
+    if mids:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for mid, links in ex.map(one, mids):
+                out[mid] = links
+    return jsonify(out)
+
+
+@app.route("/api/drive_link")
+def api_drive_link():
+    """Resolve a Drive/Docs attachment chip to its real document URL on demand.
+
+    The attachment metadata has no URL, so we fetch the message body and pull the
+    chip's link from it. Falls back to opening the Gmail message (so the user still
+    reaches the working chip) when no link can be found."""
+    mid = request.args.get("messageId")
+    if not mid:
+        return jsonify({"error": "missing messageId"}), 400
+    filename = request.args.get("filename")
+    tid = request.args.get("threadId")
+    url = None
+    try:
+        msg = gget(f"/messages/{mid}", format="full")
+        _, html_body = _decode_body(msg.get("payload", {}))
+        url = drive_link_from_html(html_body, filename)
+    except Exception as e:
+        logging.warning("drive_link resolve failed for %s: %s", mid, e)
+    if not url:
+        url = gmail_permalink(tid) if tid else "https://drive.google.com/"
+    return jsonify({"url": url})
+
+
+@app.route("/api/undo_things", methods=["POST"])
+def api_undo_things():
+    """Undo a 'Send to Things 3': trash the to-do(s) carrying this thread's backlink.
+
+    The created task's notes always contain the unique inboxclone://thread/<id>
+    backlink, so we match on that and delete via Things' AppleScript dictionary
+    (delete moves the item to Things' Trash, a clean undo)."""
+    tid = (request.json or {}).get("threadId", "")
+    if not tid:
+        return jsonify({"error": "missing threadId"}), 400
+    token = f"inboxclone://thread/{tid}"
+    script = (
+        'tell application "Things3"\n'
+        f'  set matches to to dos whose notes contains "{token}"\n'
+        '  set n to count of matches\n'
+        '  repeat with t in matches\n'
+        '    delete t\n'
+        '  end repeat\n'
+        '  return n\n'
+        'end tell'
+    )
+    try:
+        out = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+        if out.returncode != 0:
+            return jsonify({"error": (out.stderr or "osascript failed").strip()}), 500
+        return jsonify({"ok": True, "removed": (out.stdout or "").strip()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def start_background():
-    """Start the snooze scheduler, trigger auth, and start the history poller."""
+    """Migrate the DB, start the Deferred Action Engine, trigger auth, poll history."""
+    migrate_db()
     threading.Thread(target=_scheduler_loop, daemon=True).start()
     # Trigger auth before serving so the consent flow opens cleanly on first run
     try:

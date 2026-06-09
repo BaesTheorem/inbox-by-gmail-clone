@@ -13,15 +13,78 @@ function openExternal(url) {
   else window.open(url, "_blank", "noopener");
 }
 // Open/download an attachment: Google Docs → Drive; everything else → download endpoint.
-function openAttachment(a) {
-  if (a.drive) { openExternal("https://drive.google.com/"); return; }
+async function openAttachment(a) {
+  if (a.drive) {
+    // Drive/Docs files have no downloadable bytes — resolve the real document URL
+    // from the message body, then open it (Gmail message as a fallback).
+    let url = "https://drive.google.com/";
+    try {
+      const p = new URLSearchParams({ messageId: a.messageId || "", filename: a.filename || "" });
+      if (a.threadId) p.set("threadId", a.threadId);
+      const r = await api("/api/drive_link?" + p.toString());
+      if (r && r.url) url = r.url;
+    } catch (e) {}
+    openExternal(url);
+    return;
+  }
+  // Prefer opening the file natively (Preview foregrounds it). The browser fallback
+  // streams the same bytes from the local endpoint, but can land in a background tab.
+  const napi = window.pywebview && window.pywebview.api && window.pywebview.api.open_attachment;
+  if (napi) {
+    try {
+      const r = await window.pywebview.api.open_attachment(a.messageId, a.attachmentId, a.filename || "attachment", a.mimeType || "");
+      if (r && r.ok) return;
+    } catch (e) {}
+  }
   const url = `/api/attachment/${a.messageId}/${a.attachmentId}?name=${encodeURIComponent(a.filename)}&mime=${encodeURIComponent(a.mimeType)}`;
   openExternal(location.origin + url);
 }
 
-const PAGE = 50;
-let STATE = { view: "inbox", data: null, threadCache: {}, inboxCache: null, query: "", openBundles: new Set(), token: null, selected: new Set(), snoozeMulti: false };
+let PAGE = 50;
+let STATE = {
+  view: "inbox", data: null, threadCache: {}, inboxCache: null, query: "",
+  openBundles: new Set(), token: null, selected: new Set(), snoozeMulti: false,
+  // Normalized by-id index (same row objects as in data arrays) for optimistic UI.
+  threads: new Map(), pendingActions: new Map(),
+  settings: {}, undoSendWindow: 10, imageBlock: false,
+};
 let undoTimer = null;
+
+// Index every visible row by thread id. The map holds the SAME objects that live in
+// STATE.data's arrays, so a mutation through the map is visible to render().
+function indexThreads(d) {
+  STATE.threads.clear();
+  const all = [
+    ...(d.pinned || []), ...(d.primary || []), ...(d.items || []),
+    ...((d.bundles || []).flatMap((b) => b.items || [])),
+  ];
+  all.forEach((r) => { if (r && r.id) STATE.threads.set(r.id, r); });
+}
+
+// Optimistic mutation: apply locally, render, flush to server, roll back on failure.
+function optimistic(tid, mutation, serverCall) {
+  const row = STATE.threads.get(tid);
+  const snap = row ? { ...row } : null;
+  if (row && mutation) mutation(row);
+  render();
+  return serverCall().catch((err) => {
+    console.warn("[optimistic] rollback", tid, err);
+    const cur = STATE.threads.get(tid);
+    if (cur && snap) Object.assign(cur, snap);
+    render();
+    toast("Action failed");
+  });
+}
+
+function applySettings(s) {
+  s = s || {};
+  const mode = s.dark_mode || "auto";
+  const dark = mode === "dark" || (mode === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  STATE.imageBlock = s.image_block ?? false;
+  STATE.undoSendWindow = s.undo_send_window ?? 10;
+  if (s.page_size) PAGE = s.page_size;
+}
 
 function initials(name) {
   const parts = (name || "?").trim().split(/\s+/);
@@ -51,10 +114,26 @@ function cardEl(row) {
   const isSel = STATE.selected.has(row.id);
   el.className = "card" + (row.unread ? " unread" : "") + (isSel ? " selected" : "");
   el.dataset.tid = row.id;
+  el.dataset.ts = row.ts == null ? "" : row.ts; // lets incremental backfill continue date grouping
   const chipsHtml = (row.highlights || []).length
     ? `<div class="chips">${row.highlights.map((h) => `<span class="chip"><i class="material-icons">${h.icon}</i>${esc(h.text)}</span>`).join("")}</div>`
     : "";
   const wakeHtml = row.wake ? `<div class="wake"><i class="material-icons">schedule</i>${esc(row.wake)}</div>` : "";
+  // In the Done view the triage actions (pin/snooze/label/done) don't apply; show a
+  // persistent "Move back to Inbox" instead, alongside Send to Things 3.
+  const inDone = STATE.view === "done";
+  const actionsHtml = inDone
+    ? `<div class="actions">
+      <button class="icon-btn act-restore" title="Move back to Inbox"><i class="material-icons">move_to_inbox</i></button>
+      <button class="icon-btn act-things" title="Send to Things 3"><img class="things-icon" src="/static/things-icon.png?v=37" alt="Send to Things 3"></button>
+    </div>`
+    : `<div class="actions">
+      <button class="icon-btn act-pin" title="Pin"><i class="material-icons">push_pin</i></button>
+      <button class="icon-btn act-snooze" title="Snooze"><i class="material-icons">schedule</i></button>
+      <button class="icon-btn act-label" title="Move to bundle"><i class="material-icons">label</i></button>
+      <button class="icon-btn act-done" title="Done"><i class="material-icons" style="color:var(--done-green)">playlist_add_check</i></button>
+      <button class="icon-btn act-things" title="Send to Things 3"><img class="things-icon" src="/static/things-icon.png?v=37" alt="Send to Things 3"></button>
+    </div>`;
   const attHtml = (row.attachments || []).length
     ? `<div class="chips">${row.attachments.map((a, i) => `<span class="chip att-chip" data-ai="${i}" title="${esc(a.filename)}"><i class="material-icons">${a.drive ? "description" : "attach_file"}</i>${esc(a.filename)}</span>`).join("")}</div>`
     : "";
@@ -72,26 +151,25 @@ function cardEl(row) {
       <div class="snippet">${esc(row.snippet)}</div>
       ${chipsHtml}${attHtml}${wakeHtml}
     </div>
-    <div class="actions">
-      <button class="icon-btn act-pin" title="Pin"><i class="material-icons">push_pin</i></button>
-      <button class="icon-btn act-snooze" title="Snooze"><i class="material-icons">schedule</i></button>
-      <button class="icon-btn act-label" title="Move to bundle"><i class="material-icons">label</i></button>
-      <button class="icon-btn act-done" title="Done"><i class="material-icons" style="color:var(--done-green)">check_circle</i></button>
-      <button class="icon-btn act-things" title="Send to Things 3"><i class="material-icons">playlist_add_check</i></button>
-    </div>`;
+    ${actionsHtml}`;
   el.addEventListener("click", (e) => {
-    if (e.target.closest(".actions") || e.target.closest(".unsub-link") || e.target.closest(".select") || e.target.closest(".att-chip")) return;
+    if (e.target.closest(".actions") || e.target.closest(".unsub-link") || e.target.closest(".select") || e.target.closest(".att-chip") || e.target.closest(".doc-chip")) return;
     openThread(row.id);
   });
+  // Doc/Drive links fetched lazily for this row (see enrichDocLinks) — render if cached.
+  if (row.docLinks && row.docLinks.length) el.querySelector(".body").appendChild(docChipsEl(row.docLinks, "card"));
   el.querySelectorAll(".att-chip").forEach((c) => {
-    c.onclick = (e) => { e.stopPropagation(); openAttachment(row.attachments[+c.dataset.ai]); };
+    c.onclick = (e) => { e.stopPropagation(); openAttachment({ ...row.attachments[+c.dataset.ai], threadId: row.id }); };
   });
   el.querySelector(".select").onclick = (e) => { e.stopPropagation(); toggleSelect(row.id, el); };
-  el.querySelector(".act-done").onclick = (e) => { e.stopPropagation(); doDone(row); };
-  el.querySelector(".act-pin").onclick = (e) => { e.stopPropagation(); doPin(row, el); };
-  el.querySelector(".act-snooze").onclick = (e) => { e.stopPropagation(); openSnooze(e.currentTarget, row); };
-  el.querySelector(".act-label").onclick = (e) => { e.stopPropagation(); openRelabel(e.currentTarget, row); };
-  el.querySelector(".act-things").onclick = (e) => { e.stopPropagation(); doThings(row); };
+  // Guarded: the Done view renders a different action set (no pin/snooze/label/done).
+  const wire = (sel, fn) => { const b = el.querySelector(sel); if (b) b.onclick = fn; };
+  wire(".act-done", (e) => { e.stopPropagation(); doDone(row); });
+  wire(".act-pin", (e) => { e.stopPropagation(); doPin(row); });
+  wire(".act-snooze", (e) => { e.stopPropagation(); openSnooze(e.currentTarget, row); });
+  wire(".act-label", (e) => { e.stopPropagation(); openRelabel(e.currentTarget, row); });
+  wire(".act-things", (e) => { e.stopPropagation(); doThings(row); });
+  wire(".act-restore", (e) => { e.stopPropagation(); doRestore(row); });
   const ul = el.querySelector(".unsub-link");
   if (ul) ul.onclick = (e) => { e.stopPropagation(); doUnsub(row.messageId, ul, row.sender); };
   enableSwipe(el, row);
@@ -108,6 +186,7 @@ function bundleEl(b) {
       <button class="icon-btn bsweep" title="Sweep all to Done"><i class="material-icons" style="color:var(--done-green)">done_all</i></button>
     </div>
     <div class="bundle-items"></div>`;
+  el.dataset.bname = b.name; // lets incremental backfill find this bundle to sync its count
   const head = el.querySelector(".bundle-head");
   const items = el.querySelector(".bundle-items");
   const populate = () => { if (!items.childElementCount) b.items.forEach((r) => items.appendChild(cardEl(r))); };
@@ -121,9 +200,31 @@ function bundleEl(b) {
   });
   el.querySelector(".bsweep").onclick = async (e) => {
     e.stopPropagation();
-    for (const r of b.items) await post("/api/done", { threadId: r.id });
-    toast(`${b.name} swept to Done`);
-    load();
+    if (el.classList.contains("sweeping")) return;      // guard double-clicks
+    const ids = b.items.map((r) => r.id);
+    if (!ids.length) return;
+    // Optimistic, animated collapse of the whole category (no full reload, no scroll yank).
+    el.style.maxHeight = el.offsetHeight + "px";
+    el.classList.add("sweeping");
+    requestAnimationFrame(() => { el.style.maxHeight = "0px"; });
+    const idx = (STATE.data.bundles || []).findIndex((x) => x.name === b.name);
+    const removed = idx >= 0 ? STATE.data.bundles.splice(idx, 1)[0] : null;
+    ids.forEach((id) => STATE.threads.delete(id));
+    STATE.openBundles.delete(b.name);
+    setTimeout(() => { el.remove(); renderNavBundles(); }, 300);
+    // Archive all members in one parallel round trip.
+    let res;
+    try { res = await post("/api/bulk_done", { threadIds: ids }); } catch (_) { res = { error: 1 }; }
+    if (!res || res.error) {
+      if (removed) STATE.data.bundles.splice(Math.min(idx, STATE.data.bundles.length), 0, removed);
+      load();
+      toast("Sweep failed — restored");
+      return;
+    }
+    toast(`${b.name} swept to Done`, async () => {
+      await post("/api/bulk_undo_done", { threadIds: ids });
+      load();
+    });
   };
   return el;
 }
@@ -145,19 +246,28 @@ function render() {
     }
     if (!pinnedOnly) {
       d.bundles?.forEach((b) => list.appendChild(bundleEl(b)));
-      if (d.primary?.length) {
-        if (d.bundles?.length || d.pinned?.length) list.appendChild(label("Mail"));
-        d.primary.forEach((r) => list.appendChild(cardEl(r)));
-      }
+      if (d.primary?.length) appendGrouped(list, d.primary);
     }
     const total = (d.pinned?.length || 0) + (pinnedOnly ? 0 : (d.primary?.length || 0) + (d.bundles?.length || 0));
     if (!total) $("#empty").hidden = false;
   } else {
     const rows = d.items || [];
     if (!rows.length) $("#empty").hidden = false;
-    rows.forEach((r) => list.appendChild(cardEl(r)));
+    if (STATE.view === "snoozed") rows.forEach((r) => list.appendChild(cardEl(r)));
+    else appendGrouped(list, rows);
   }
   // Bottom footer: "N in view" + a "Load more" button when a full page came back
+  const footer = footerNode();
+  if (footer) list.appendChild(footer);
+  // Gmail-style total next to the Inbox tab (last-known inbox total, persists across views)
+  const it = STATE.inboxCache && STATE.inboxCache.inboxTotal;
+  $("#inboxCount").textContent = it != null ? it.toLocaleString() : "";
+}
+// Build the "N in view" + "Load more" footer for the current view (null if neither applies).
+// Backfill appends only new cards, so the button no longer needs to save/restore scroll.
+function footerNode() {
+  const d = STATE.data;
+  if (!d) return null;
   let n;
   if (STATE.view === "inbox") {
     n = $("#pinnedOnly").checked
@@ -167,32 +277,59 @@ function render() {
     n = (d.items || []).length;
   }
   const hasMore = !!STATE.token;
-  if (n || hasMore) {
-    const footer = document.createElement("div");
-    footer.className = "list-footer";
-    if (hasMore) {
-      const btn = document.createElement("button");
-      btn.className = "load-more";
-      btn.textContent = "Load more";
-      btn.onclick = () => {
-        const sc = document.scrollingElement || document.documentElement;
-        const y = sc.scrollTop;
-        btn.textContent = "Loading…"; btn.disabled = true;
-        loadMore().then(() => { try { sc.scrollTop = y; } catch (e) {} });
-      };
-      footer.appendChild(btn);
-    }
-    const count = document.createElement("div");
-    count.className = "view-count";
-    count.textContent = n ? `${n} in view` : "";
-    footer.appendChild(count);
-    list.appendChild(footer);
+  if (!(n || hasMore)) return null;
+  const footer = document.createElement("div");
+  footer.className = "list-footer";
+  if (hasMore) {
+    const btn = document.createElement("button");
+    btn.className = "load-more";
+    btn.textContent = "Load more";
+    btn.onclick = () => { btn.textContent = "Loading…"; btn.disabled = true; loadMore(); };
+    footer.appendChild(btn);
   }
-  // Gmail-style total next to the Inbox tab (last-known inbox total, persists across views)
-  const it = STATE.inboxCache && STATE.inboxCache.inboxTotal;
-  $("#inboxCount").textContent = it != null ? it.toLocaleString() : "";
+  const count = document.createElement("div");
+  count.className = "view-count";
+  count.textContent = n ? `${n} in view` : "";
+  footer.appendChild(count);
+  return footer;
+}
+// Swap the footer in place after an incremental append (count + token may have changed).
+function refreshFooter() {
+  const list = $("#list");
+  const old = list.querySelector(".list-footer");
+  if (old) old.remove();
+  const f = footerNode();
+  if (f) list.appendChild(f);
+}
+// Full re-render that keeps the scroll position (used when backfill changes structure,
+// e.g. a new bundle category appears, where an incremental append can't place it).
+function scrollPreservingRender() {
+  const sc = document.scrollingElement || document.documentElement;
+  const y = sc.scrollTop;
+  render();
+  try { sc.scrollTop = y; } catch (e) {}
 }
 function label(t) { const e = document.createElement("div"); e.className = "section-label"; e.textContent = t; return e; }
+function dateBucket(ts) {
+  const t = +ts; if (!t) return "Older";
+  const d = new Date(t), now = new Date();
+  const sod = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const today = sod(now), day = 86400000, dd = sod(d);
+  if (dd >= today) return "Today";
+  if (dd >= today - day) return "Yesterday";
+  if (dd >= today - 7 * day) return "This week";
+  if (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth()) return "This month";
+  return "Older";
+}
+// Append cards with "Today / Yesterday / This week …" separators between date buckets.
+function appendGrouped(list, rows) {
+  let cur = null;
+  (rows || []).forEach((r) => {
+    const b = dateBucket(r.ts);
+    if (b !== cur) { list.appendChild(label(b)); cur = b; }
+    list.appendChild(cardEl(r));
+  });
+}
 function esc(s) { return (s || "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 function fmtBytes(n) {
   n = +n || 0;
@@ -203,16 +340,34 @@ function fmtBytes(n) {
 
 // ---------- Actions ----------
 async function doDone(row) {
+  const snap = { ...row };
   removeCard(row.id);
   removeFromData(row.id);
-  await post("/api/done", { threadId: row.id });
-  toast("Marked done", async () => { await post("/api/undo_done", { threadId: row.id }); load(); });
+  try {
+    await post("/api/done", { threadId: row.id });
+    toast("Marked done", async () => { await post("/api/undo_done", { threadId: row.id }); load(); });
+  } catch (err) {
+    // Auto-rollback: restore the card if the archive call never reached the server.
+    (STATE.data.primary || STATE.data.items || (STATE.data.primary = [])).unshift(snap);
+    STATE.threads.set(snap.id, snap);
+    render();
+    toast("Couldn't archive — restored");
+  }
   ensureFilled();
 }
-async function doPin(row, el) {
-  row.pinned = !row.pinned;
-  await post("/api/pin", { threadId: row.id, pinned: row.pinned });
-  load();
+// Optimistic pin: flip in place and move between Pinned/Mail sections — no reload flash.
+async function doPin(row) {
+  const willPin = !row.pinned;
+  const d = STATE.data;
+  optimistic(row.id, (r) => {
+    r.pinned = willPin;
+    if (d && STATE.view === "inbox" && d.pinned && d.primary) {
+      const from = willPin ? d.primary : d.pinned;
+      const to = willPin ? d.pinned : d.primary;
+      const i = from.findIndex((x) => x.id === r.id);
+      if (i >= 0) to.unshift(from.splice(i, 1)[0]);
+    }
+  }, () => post("/api/pin", { threadId: row.id, pinned: willPin }));
 }
 // ---------- Multi-select ----------
 function toggleSelect(id, cardEl) {
@@ -247,11 +402,18 @@ function findRow(id) {
 }
 async function bulkDone() {
   const ids = [...STATE.selected];
-  ids.forEach(removeCard);
+  if (!ids.length) return;
+  // Animate the cards out and prune the model; archive in one parallel round trip.
+  ids.forEach((id) => { removeCard(id); removeFromData(id); });
   clearSelection();
-  for (const id of ids) await post("/api/done", { threadId: id });
-  toast(`${ids.length} marked done`);
-  load();
+  ensureFilled(); // top the list back up smoothly, same as single Done
+  let res;
+  try { res = await post("/api/bulk_done", { threadIds: ids }); } catch (_) { res = { error: 1 }; }
+  if (!res || res.error) { load(); toast("Couldn't archive — restored"); return; }
+  toast(`${ids.length} marked done`, async () => {
+    await post("/api/bulk_undo_done", { threadIds: ids });
+    load();
+  });
 }
 async function bulkPin() {
   const ids = [...STATE.selected];
@@ -267,7 +429,10 @@ async function bulkThings() {
     await post("/api/to_things", { threadId: id, title: r.subject || "(email)", sender: r.sender || "", snippet: r.snippet || "" });
   }
   clearSelection();
-  toast(`${ids.length} sent to Things 3`);
+  toast(`${ids.length} sent to Things 3`, async () => {
+    for (const id of ids) await post("/api/undo_things", { threadId: id });
+    toast(`Removed ${ids.length} from Things 3`);
+  });
 }
 async function doUnsub(messageId, btn, name) {
   if (!messageId) return;
@@ -290,12 +455,37 @@ async function doUnsub(messageId, btn, name) {
 }
 async function doThings(row) {
   const r = await post("/api/to_things", { threadId: row.id, title: row.subject, sender: row.sender, snippet: row.snippet });
-  toast(r.ok ? "Sent to Things 3" : "Things 3 not reachable");
+  if (r.ok) toast("Sent to Things 3", async () => { await post("/api/undo_things", { threadId: row.id }); toast("Removed from Things 3"); });
+  else toast("Things 3 not reachable");
 }
+// Move a thread out of Done and back to the Inbox (Done-view per-card action).
+async function doRestore(row) {
+  removeCard(row.id);
+  removeFromData(row.id);
+  STATE.inboxCache = null; // force the inbox to refetch so the restored thread reappears
+  try {
+    await post("/api/undo_done", { threadId: row.id });
+    toast("Moved to Inbox", async () => { await post("/api/done", { threadId: row.id }); STATE.inboxCache = null; load(); });
+  } catch (e) {
+    toast("Couldn't move — restored");
+    load();
+  }
+}
+// Animate the card out AND collapse its height so the cards below glide up
+// instead of snapping into the gap (matches the bundle-sweep collapse).
 function removeCard(tid) {
   document.querySelectorAll(`.card[data-tid="${tid}"]`).forEach((c) => {
-    c.style.opacity = 0; c.style.transform = "translateX(60px)";
-    setTimeout(() => c.remove(), 180);
+    if (c.classList.contains("removing")) return; // already collapsing
+    c.style.maxHeight = c.offsetHeight + "px";
+    c.getBoundingClientRect();                     // force reflow so max-height has a start value to animate from
+    c.classList.add("removing");
+    c.style.maxHeight = "0px";
+    c.style.opacity = "0";
+    c.style.marginBottom = "0px";
+    c.style.paddingTop = "0px";
+    c.style.paddingBottom = "0px";
+    c.style.transform = "translateX(40px)";
+    setTimeout(() => c.remove(), 300);
   });
 }
 
@@ -329,7 +519,8 @@ async function commitSnooze(payload) {
   if (STATE.snoozeMulti) clearSelection();
   for (const id of ids) await post("/api/snooze", Object.assign({ threadId: id }, payload));
   STATE.snoozeMulti = false;
-  toast(ids.length > 1 ? `${ids.length} snoozed` : "Snoozed");
+  toast(ids.length > 1 ? `${ids.length} snoozed` : "Snoozed",
+        async () => { for (const id of ids) await post("/api/unsnooze", { threadId: id }); load(); });
   afterTriage();
 }
 $("#snoozeMenu").querySelectorAll("a").forEach((a) => {
@@ -430,6 +621,66 @@ function enableSwipe(el, row) {
 function openSnoozeFromSwipe(el, row) { openSnooze(el.querySelector(".act-snooze") || el, row); }
 
 // ---------- Thread reader ----------
+// Block remote images (read-receipt tracking) by injecting a CSP into the sandboxed
+// srcdoc. data: images and inline styles still render; remote http(s) images don't.
+const IMG_CSP = '<meta http-equiv="Content-Security-Policy" content="img-src data:; style-src \'unsafe-inline\' data:; font-src data:; default-src \'none\'">';
+const HAS_REMOTE_IMG = /<img[^>]+src=["']?https?:/i;
+
+function renderMsgBody(mb, m, forceImages) {
+  if (mb.dataset.rendered && !forceImages) return;
+  mb.dataset.rendered = "1";
+  mb.innerHTML = "";
+  if (!m.html) { mb.textContent = m.text || "(no content)"; return; }
+  const blocked = STATE.imageBlock && !forceImages;
+  if (blocked && HAS_REMOTE_IMG.test(m.html)) {
+    const banner = document.createElement("div");
+    banner.className = "img-banner";
+    banner.innerHTML = `<i class="material-icons">visibility_off</i><span>Remote images blocked.</span><button class="img-load">Load images</button>`;
+    banner.querySelector(".img-load").onclick = () => renderMsgBody(mb, m, true);
+    mb.appendChild(banner);
+  }
+  const f = document.createElement("iframe");
+  // allow-same-origin (NEVER allow-scripts) lets the parent read the email DOM for
+  // height + link routing; email JS stays disabled by the sandbox spec.
+  f.setAttribute("sandbox", "allow-same-origin");
+  f.style.width = "100%";
+  f.style.minHeight = "120px";
+  f.onload = () => {
+    try {
+      const doc = f.contentWindow.document;
+      f.style.height = (doc.body.scrollHeight + 24) + "px";
+      routeIframeLinks(doc);
+    } catch (e) {}
+  };
+  mb.appendChild(f);
+  f.srcdoc = (blocked ? IMG_CSP : "") + m.html;
+}
+// Resolve an email link to the URL it was AUTHORED with. We must read the raw href
+// attribute, not a.href: the IDL property resolves relative to the iframe's base,
+// which for a srcdoc frame is the app's own 127.0.0.1 origin — so an absolute
+// https link would otherwise come back as http://127.0.0.1:5008/… and fail to load.
+function externalHref(a) {
+  const raw = (a.getAttribute("href") || "").trim();
+  if (/^(https?:|mailto:|tel:)/i.test(raw)) return raw;
+  if (raw.startsWith("//")) return "https:" + raw;
+  return null; // app-relative or javascript:/# — never navigate the app to it
+}
+// Route every link inside a rendered email out to the system browser. One delegated
+// capture-phase listener (more robust than per-anchor binding), target stripped so a
+// sandboxed _blank never gets popup-blocked into a dead click.
+function routeIframeLinks(doc) {
+  doc.querySelectorAll("a[target]").forEach((a) => a.removeAttribute("target"));
+  const handler = (e) => {
+    const a = e.target.closest && e.target.closest("a[href]");
+    if (!a) return;
+    e.preventDefault();
+    const url = externalHref(a);
+    if (url) openExternal(url);
+  };
+  doc.addEventListener("click", handler, true);
+  doc.addEventListener("auxclick", handler, true);
+}
+
 async function openThread(tid) {
   const reader = $("#reader");
   $("#readerSubject").textContent = "Loading…";
@@ -442,11 +693,31 @@ async function openThread(tid) {
   const t = await api("/api/thread/" + tid);
   STATE.threadCache[tid] = t;
   if (t.error) { $("#readerSubject").textContent = "Error"; $("#readerBody").textContent = t.error; return; }
+  // Restore an autosaved reply draft for this thread (if any), and reset autosave state.
+  clearTimeout(replyDraftTimer); replySaving = false; replyDirty = false;
+  STATE.replyDraftId = (t.replyDraft && t.replyDraft.draftId) || null;
+  if (t.replyDraft && t.replyDraft.html) $("#replyBox").innerHTML = t.replyDraft.html;
+  setReplyStatus(STATE.replyDraftId ? "Draft saved" : "");
   $("#readerSubject").textContent = t.subject;
   reader.dataset.tid = tid;
   reader.dataset.rfc = t.rfcMessageId || "";
-  reader.dataset.to = t.messages.length ? t.messages[t.messages.length - 1].senderEmail : "";
+  reader.dataset.rfcChain = (t.allRfcIds || []).join(" ");
   reader.dataset.subject = t.subject;
+  reader.dataset.muted = t.muted ? "1" : "";
+  // Reply vs Reply-all recipient sets (minus self)
+  const last = t.messages[t.messages.length - 1] || {};
+  const me = (STATE.email || "").toLowerCase();
+  const parseAddrs = (s) => (s || "").split(/,\s*/).map((a) => {
+    const m = a.match(/<([^>]+)>/); return (m ? m[1] : a).trim();
+  }).filter(Boolean);
+  reader.dataset.to = last.senderEmail || "";
+  const all = new Set([last.senderEmail, ...parseAddrs(last.to), ...parseAddrs(last.cc)]);
+  [...all].forEach((a) => { if (a && a.toLowerCase() === me) all.delete(a); });
+  all.delete("");
+  reader.dataset.toAll = [...all].join(", ");
+  // Show "Reply all" only when there's more than one other recipient
+  $("#replySendAll").hidden = all.size <= 1;
+  $("#readerMute").querySelector(".material-icons").textContent = t.muted ? "volume_up" : "volume_off";
   const body = $("#readerBody");
   body.innerHTML = "";
   if (t.unsub) {
@@ -458,40 +729,30 @@ async function openThread(tid) {
     banner.querySelector(".unsub-btn").onclick = (e) => doUnsub(mid, e.currentTarget, who);
     body.appendChild(banner);
   }
-  t.messages.forEach((m) => {
+  const lastIdx = t.messages.length - 1;
+  t.messages.forEach((m, idx) => {
+    const collapsed = t.messages.length > 2 && idx < lastIdx;
     const d = document.createElement("div");
-    d.className = "msg";
+    d.className = "msg" + (collapsed ? " collapsed" : "");
     d.innerHTML = `<div class="mhead"><span class="mfrom">${esc(m.sender)}</span><span>${esc(m.date)}</span></div>
+      <div class="mpreview">${esc((m.text || "").replace(/\s+/g, " ").trim().slice(0, 120))}</div>
       <div class="mbody"></div>`;
     const mb = d.querySelector(".mbody");
-    if (m.html) {
-      const f = document.createElement("iframe");
-      // allow-same-origin (no allow-scripts) lets the parent read/instrument the email
-      // DOM for height + link routing, while email JS stays disabled.
-      f.setAttribute("sandbox", "allow-same-origin");
-      f.style.width = "100%";
-      f.style.minHeight = "120px";
-      f.onload = () => {
-        try {
-          const doc = f.contentWindow.document;
-          f.style.height = (doc.body.scrollHeight + 24) + "px";
-          // Route every email link to the system browser. Works in both Chrome and the
-          // native WebKit window, and avoids X-Frame-Options / ERR_BLOCKED_BY_RESPONSE.
-          doc.querySelectorAll("a[href]").forEach((a) => {
-            a.addEventListener("click", (e) => { e.preventDefault(); openExternal(a.href); });
-          });
-        } catch (e) {}
-      };
-      mb.appendChild(f);
-      f.srcdoc = m.html;
-    } else {
-      mb.textContent = m.text || "(no content)";
-    }
+    // The whole collapsed message is the expand target (the header strip alone was
+    // too small to hit, and the preview line below it looked clickable but wasn't).
+    // Once expanded this no-ops so inner links/attachments keep working.
+    d.addEventListener("click", (e) => {
+      if (!d.classList.contains("collapsed")) return;
+      if (e.target.closest(".msg-attachments")) return; // let attachment chips open instead
+      d.classList.remove("collapsed");
+      renderMsgBody(mb, m);
+    });
+    if (!collapsed) renderMsgBody(mb, m);
     if (m.attachments && m.attachments.length) {
       const wrap = document.createElement("div");
       wrap.className = "msg-attachments";
       m.attachments.forEach((a) => {
-        const att = { ...a, messageId: a.messageId || m.id };
+        const att = { ...a, messageId: a.messageId || m.id, threadId: t.id };
         const chip = document.createElement("button");
         chip.className = "attach-chip";
         chip.innerHTML = `<i class="material-icons" style="font-size:16px;color:#5f6368">${a.drive ? "description" : "attach_file"}</i><span>${esc(a.filename)}</span><small>${a.drive ? "Drive" : fmtBytes(a.size)}</small>`;
@@ -500,10 +761,38 @@ async function openThread(tid) {
       });
       d.appendChild(wrap);
     }
+    // Shared Google Docs/Drive links surfaced as real chips (they arrive as plain
+    // body links, not Gmail chips), rendered outside the sandboxed iframe so a click
+    // reliably opens them in the browser.
+    if (m.docLinks && m.docLinks.length) d.appendChild(docChipsEl(m.docLinks, "reader"));
     body.appendChild(d);
   });
 }
-function closeReader() { $("#reader").hidden = true; load(); }
+const DOC_ICONS = { doc: "description", sheet: "table_chart", slides: "slideshow",
+                    form: "assignment", folder: "folder", file: "insert_drive_file" };
+// Chips for shared Docs/Drive links. style "card" = compact pill row (inbox row),
+// "reader" = larger attachment-style chip. Click opens the doc in the browser.
+function docChipsEl(links, style) {
+  const wrap = document.createElement("div");
+  wrap.className = style === "reader" ? "msg-attachments doc-links" : "chips doc-links";
+  links.forEach((dl) => {
+    const chip = document.createElement(style === "reader" ? "button" : "span");
+    chip.className = (style === "reader" ? "attach-chip" : "chip") + " doc-chip";
+    const icon = `<i class="material-icons">${DOC_ICONS[dl.kind] || "link"}</i>`;
+    chip.innerHTML = style === "reader"
+      ? `${icon}<span>${esc(dl.title)}</span><small>${dl.kind === "folder" ? "Drive" : "Google " + (dl.kind || "doc")}</small>`
+      : `${icon}${esc(dl.title)}`;
+    chip.onclick = (e) => { e.stopPropagation(); openExternal(dl.url); };
+    wrap.appendChild(chip);
+  });
+  return wrap;
+}
+function closeReader() {
+  clearTimeout(replyDraftTimer);
+  // Capture the last keystrokes of an in-progress reply before leaving the thread.
+  if (!$("#reader").hidden && replyHasContent()) saveReplyDraftNow();
+  $("#reader").hidden = true; load();
+}
 $("#readerBack").onclick = closeReader;
 $("#readerDone").onclick = async () => { await post("/api/done", { threadId: $("#reader").dataset.tid }); toast("Marked done"); closeReader(); };
 $("#readerPin").onclick = async () => { const t = STATE.threadCache[$("#reader").dataset.tid]; await post("/api/pin", { threadId: $("#reader").dataset.tid, pinned: !(t && t.pinned) }); toast("Pinned"); };
@@ -520,41 +809,212 @@ $("#readerThings").onclick = async () => {
   const res = await post("/api/to_things", { threadId: r.dataset.tid, title: r.dataset.subject, sender: first.sender || "", snippet: (first.text || "").slice(0, 140) });
   toast(res.ok ? "Sent to Things 3" : "Things 3 not reachable");
 };
-$("#replySend").onclick = async () => {
+// Unified handling of /api/send responses (immediate, undo-window, or scheduled).
+function handleSendResult(res) {
+  if (!res) { toast("Send failed"); return false; }
+  if (res.actionId && res.undoWindow) {
+    toast(`Sending in ${res.undoWindow}s`, async () => {
+      const c = await post("/api/cancel_send", { actionId: res.actionId });
+      toast(c.cancelled ? "Send cancelled" : "Already sent");
+    });
+    return true;
+  }
+  if (res.scheduled) { toast("Scheduled to send"); return true; }
+  if (res.ok) { toast("Sent"); return true; }
+  toast("Send failed: " + (res.error || ""));
+  return false;
+}
+
+async function sendReply(all) {
   const r = $("#reader");
   const box = $("#replyBox");
   if (!box.innerText.trim() && !(STATE.replyAttachments || []).length) return;
+  clearTimeout(replyDraftTimer); // cancel pending autosave so it can't resurrect after send
   const subj = r.dataset.subject.startsWith("Re:") ? r.dataset.subject : "Re: " + r.dataset.subject;
   const fd = new FormData();
-  fd.append("to", r.dataset.to);
+  fd.append("to", all ? (r.dataset.toAll || r.dataset.to) : r.dataset.to);
   fd.append("subject", subj);
   fd.append("html", box.innerHTML);
   fd.append("text", box.innerText);
   fd.append("threadId", r.dataset.tid);
   fd.append("inReplyTo", r.dataset.rfc);
+  fd.append("references", r.dataset.rfcChain || "");
+  if (STATE.replyDraftId) fd.append("draftId", STATE.replyDraftId); // server deletes the autosaved draft on send
   (STATE.replyAttachments || []).forEach((f) => fd.append("attachments", f, f.name));
-  const send = $("#replySend"); send.disabled = true;
+  const btns = [$("#replySend"), $("#replySendAll")];
+  btns.forEach((b) => (b.disabled = true));
   let res;
   try { res = await (await fetch("/api/send", { method: "POST", body: fd })).json(); }
   catch (e) { res = { error: String(e) }; }
-  send.disabled = false;
-  if (res.ok) { box.innerHTML = ""; STATE.replyAttachments = []; renderChips("replyAttachments", "#rAttachments"); toast("Sent"); openThread(r.dataset.tid); }
-  else toast("Send failed: " + (res.error || ""));
+  btns.forEach((b) => (b.disabled = false));
+  if (handleSendResult(res)) {
+    const tid = r.dataset.tid;
+    STATE.replyDraftId = null; setReplyStatus("");
+    box.innerHTML = ""; STATE.replyAttachments = []; renderChips("replyAttachments", "#rAttachments");
+    setTimeout(() => { if ($("#reader").dataset.tid === tid && !$("#reader").hidden) openThread(tid); },
+              (res.undoWindow || 0) * 1000 + 900);
+  }
+}
+$("#replySend").onclick = () => sendReply(false);
+$("#replySendAll").onclick = () => sendReply(true);
+// ---------- Reply autosave (mirrors compose) ----------
+let replyDraftTimer = null, replySaving = false, replyDirty = false;
+function setReplyStatus(t) { const e = $("#replySaveStatus"); if (e) e.textContent = t; }
+function replyHasContent() { return !!$("#replyBox").innerText.trim(); }
+function replySubject() {
+  const s = $("#reader").dataset.subject || "";
+  return /^re:/i.test(s) ? s : "Re: " + s;
+}
+function scheduleReplyDraftSave() {
+  if ($("#reader").hidden) return;
+  setReplyStatus(replyHasContent() ? "Saving…" : "");
+  clearTimeout(replyDraftTimer);
+  replyDraftTimer = setTimeout(saveReplyDraftNow, 1100);
+}
+async function saveReplyDraftNow() {
+  clearTimeout(replyDraftTimer);
+  if (!replyHasContent()) { setReplyStatus(""); return; }
+  if (replySaving) { replyDirty = true; return; } // serialize so we never create dupes
+  replySaving = true; replyDirty = false;
+  setReplyStatus("Saving…");
+  const r0 = $("#reader");
+  let r = null;
+  try {
+    r = await post("/api/save_draft", {
+      to: r0.dataset.to || "", subject: replySubject(),
+      html: $("#replyBox").innerHTML, body: $("#replyBox").innerText,
+      threadId: r0.dataset.tid, inReplyTo: r0.dataset.rfc || null,
+      references: r0.dataset.rfcChain || null,
+      draftId: STATE.replyDraftId || null,
+    });
+  } catch (e) { r = null; }
+  if (r && r.draftId) { STATE.replyDraftId = r.draftId; setReplyStatus("Draft saved"); }
+  else setReplyStatus("Couldn't save draft");
+  replySaving = false;
+  if (replyDirty) saveReplyDraftNow();
+}
+$("#replyBox").addEventListener("input", scheduleReplyDraftSave);
+
+async function doForward() {
+  const r = $("#reader");
+  const t = STATE.threadCache[r.dataset.tid];
+  if (!t) return;
+  const last = (t.messages || [])[(t.messages || []).length - 1] || {};
+  const fwd = `<br><br>---------- Forwarded message ---------<br>` +
+    `<b>From:</b> ${esc(last.sender)} &lt;${esc(last.senderEmail)}&gt;<br>` +
+    `<b>Date:</b> ${esc(last.date)}<br>` +
+    `<b>Subject:</b> ${esc(t.subject)}<br><br>` +
+    (last.html || esc(last.text || "(no content)"));
+  openCompose({
+    subject: (t.subject || "").startsWith("Fwd:") ? t.subject : "Fwd: " + (t.subject || ""),
+    html: fwd,
+    forwardAttachments: (last.attachments || []).map((a) => ({ ...a, messageId: a.messageId || last.id })),
+  });
+}
+$("#readerForward").onclick = doForward;
+$("#readerMute").onclick = async () => {
+  const r = $("#reader");
+  const willMute = r.dataset.muted !== "1";
+  await post("/api/mute", { threadId: r.dataset.tid, muted: willMute });
+  toast(willMute ? "Thread muted" : "Unmuted");
+  if (willMute) closeReader();
+  else { r.dataset.muted = ""; $("#readerMute").querySelector(".material-icons").textContent = "volume_off"; }
+};
+$("#readerMarkUnread").onclick = async () => {
+  await post("/api/mark", { threadId: $("#reader").dataset.tid, read: false });
+  toast("Marked unread"); closeReader();
+};
+$("#readerFollowup").onclick = async () => {
+  const r = await post("/api/followup", { threadId: $("#reader").dataset.tid });
+  toast(r.deduped ? "Reminder already set" : `Will remind in ${r.days || 3} days if no reply`);
 };
 
 // ---------- Compose ----------
 function openCompose(opts = {}) {
   STATE.composeDraftId = opts.draftId || null;
+  clearTimeout(draftSaveTimer); draftSaving = false; draftDirty = false;
+  setSaveStatus(opts.draftId ? "Draft saved" : "");
   STATE.attachments = [];
+  STATE.fwdAttachments = (opts.forwardAttachments || []).map((a) => ({ ...a, keep: !a.drive }));
+  STATE.scheduleAt = 0;
+  $("#composeTitle").textContent = opts.draftId ? "Draft" : (opts.subject && opts.subject.startsWith("Fwd:") ? "Forward" : "New message");
   $("#cTo").value = opts.to || "";
+  $("#cCc").value = ""; $("#cBcc").value = "";
+  $("#cCc").hidden = true; $("#cBcc").hidden = true;
+  $("#cCcToggle").style.display = ""; $("#cBccToggle").style.display = "";
   $("#cSubject").value = opts.subject || "";
-  $("#cBody").innerHTML = opts.html || (opts.body ? esc(opts.body).replace(/\n/g, "<br>") : "");
+  const body = opts.html || (opts.body ? esc(opts.body).replace(/\n/g, "<br>") : "");
+  const sig = STATE.settings.signature;
+  // Append the signature on fresh compose/forward (not when reopening a saved draft).
+  $("#cBody").innerHTML = body + (sig && !opts.draftId ? `<br><br><div class="sig">${sig}</div>` : "");
   renderAttachChips();
+  renderFwdChips();
   $("#composeDiscard").style.display = STATE.composeDraftId ? "" : "none";
   $("#composeOverlay").hidden = false;
+  setTimeout(() => (opts.to ? $("#cBody") : $("#cTo")).focus(), 30);
 }
-function closeCompose() { $("#composeOverlay").hidden = true; STATE.composeDraftId = null; STATE.attachments = []; }
-function clearCompose() { $("#cTo").value = $("#cSubject").value = ""; $("#cBody").innerHTML = ""; STATE.attachments = []; renderAttachChips(); }
+function renderFwdChips() {
+  const wrap = $("#cFwdAttachments");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  (STATE.fwdAttachments || []).forEach((a, i) => {
+    const chip = document.createElement("label");
+    chip.className = "attach-chip fwd";
+    chip.innerHTML = `<input type="checkbox" ${a.keep ? "checked" : ""}${a.drive ? " disabled" : ""}>` +
+      `<i class="material-icons" style="font-size:16px;color:#5f6368">attach_file</i><span>${esc(a.filename)}</span>`;
+    chip.querySelector("input").onchange = (e) => { STATE.fwdAttachments[i].keep = e.target.checked; };
+    wrap.appendChild(chip);
+  });
+}
+function closeCompose() {
+  clearTimeout(draftSaveTimer);
+  // Capture the last keystrokes (the debounce may not have fired yet) when dismissing
+  // via X / backdrop / Esc. Send & discard paths clear the fields first, so this no-ops.
+  if (!$("#composeOverlay").hidden && composeHasContent()) saveDraftNow();
+  $("#composeOverlay").hidden = true; $("#scheduleMenu").hidden = true; STATE.composeDraftId = null; STATE.attachments = []; STATE.fwdAttachments = []; setSaveStatus("");
+}
+function clearCompose() { $("#cTo").value = $("#cSubject").value = $("#cCc").value = $("#cBcc").value = ""; $("#cBody").innerHTML = ""; STATE.attachments = []; STATE.fwdAttachments = []; renderAttachChips(); renderFwdChips(); }
+// ---------- Draft autosave ----------
+let draftSaveTimer = null, draftSaving = false, draftDirty = false;
+function setSaveStatus(t) { const e = $("#composeSaveStatus"); if (e) e.textContent = t; }
+function composeHasContent() {
+  return !!($("#cTo").value.trim() || $("#cSubject").value.trim() || $("#cCc").value.trim()
+    || $("#cBcc").value.trim() || $("#cBody").innerText.trim());
+}
+// Debounced autosave: ~1.1s after the last keystroke, persist to a Gmail draft.
+function scheduleDraftSave() {
+  if ($("#composeOverlay").hidden) return;
+  setSaveStatus(composeHasContent() ? "Saving…" : "");
+  clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(saveDraftNow, 1100);
+}
+async function saveDraftNow() {
+  clearTimeout(draftSaveTimer);
+  if (!composeHasContent()) { setSaveStatus(""); return; }
+  if (draftSaving) { draftDirty = true; return; } // serialize so we never create dupes
+  draftSaving = true; draftDirty = false;
+  setSaveStatus("Saving…");
+  let r = null;
+  try {
+    r = await post("/api/save_draft", {
+      to: $("#cTo").value, subject: $("#cSubject").value,
+      html: $("#cBody").innerHTML, body: $("#cBody").innerText,
+      cc: $("#cCc").value || null, bcc: $("#cBcc").value || null,
+      draftId: STATE.composeDraftId || null,
+    });
+  } catch (e) { r = null; }
+  if (r && r.draftId) {
+    STATE.composeDraftId = r.draftId;       // reuse for subsequent saves (update in place)
+    $("#composeDiscard").style.display = "";
+    setSaveStatus("Draft saved");
+  } else {
+    setSaveStatus("Couldn't save draft");
+  }
+  draftSaving = false;
+  if (draftDirty) saveDraftNow();           // changes arrived while we were saving
+}
+["#cTo", "#cSubject", "#cCc", "#cBcc"].forEach((s) => $(s).addEventListener("input", scheduleDraftSave));
+$("#cBody").addEventListener("input", scheduleDraftSave);
 $("#fab").onclick = () => openCompose();
 $("#composeClose").onclick = closeCompose;
 // Click the dimmed backdrop to dismiss compose
@@ -562,32 +1022,154 @@ $("#composeOverlay").addEventListener("click", (e) => { if (e.target.id === "com
 // Escape closes the topmost overlay
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  const helpO = $("#helpOverlay");
+  if (!$("#cmdkOverlay").hidden) { $("#cmdkOverlay").hidden = true; return; }
+  if (!$("#acDropdown").hidden) { $("#acDropdown").hidden = true; return; }
+  if (!$("#scheduleMenu").hidden) { $("#scheduleMenu").hidden = true; return; }
   if (!$("#snoozeMenu").hidden) { $("#snoozeMenu").hidden = true; return; }
   if (!$("#relabelMenu").hidden) { $("#relabelMenu").hidden = true; return; }
+  if (helpO && !helpO.hidden) { helpO.hidden = true; return; }
+  if (!$("#settingsOverlay").hidden) { $("#settingsOverlay").hidden = true; return; }
   if (!$("#composeOverlay").hidden) { closeCompose(); return; }
   if (!$("#reader").hidden) { closeReader(); return; }
 });
-$("#composeSend").onclick = async () => {
+async function doComposeSend(sendAt) {
+  clearTimeout(draftSaveTimer); // cancel any pending autosave so it can't fire mid/after-send
   const wasDraft = !!STATE.composeDraftId;
   const fd = new FormData();
   fd.append("to", $("#cTo").value);
+  if ($("#cCc").value.trim()) fd.append("cc", $("#cCc").value.trim());
+  if ($("#cBcc").value.trim()) fd.append("bcc", $("#cBcc").value.trim());
   fd.append("subject", $("#cSubject").value);
   fd.append("html", $("#cBody").innerHTML);
   fd.append("text", $("#cBody").innerText);
   if (STATE.composeDraftId) fd.append("draftId", STATE.composeDraftId);
+  if (sendAt) fd.append("sendAt", String(sendAt));
   (STATE.attachments || []).forEach((f) => fd.append("attachments", f, f.name));
   const btn = $("#composeSend"); btn.disabled = true;
+  // Pull down any carried-forward attachments and re-attach them as real files.
+  for (const a of (STATE.fwdAttachments || []).filter((x) => x.keep && !x.drive)) {
+    try {
+      const resp = await fetch(`/api/attachment/${a.messageId}/${a.attachmentId}?name=${encodeURIComponent(a.filename)}&mime=${encodeURIComponent(a.mimeType)}`);
+      fd.append("attachments", new File([await resp.blob()], a.filename, { type: a.mimeType }));
+    } catch (e) { /* skip an attachment that won't fetch */ }
+  }
   let res;
   try { res = await (await fetch("/api/send", { method: "POST", body: fd })).json(); }
   catch (e) { res = { error: String(e) }; }
   btn.disabled = false;
-  if (res.ok) { closeCompose(); clearCompose(); toast("Sent"); if (wasDraft && STATE.view === "drafts") load(); }
-  else toast("Send failed: " + (res.error || ""));
+  // Clear BEFORE close so closeCompose's final-save sees empty fields (the autosaved
+  // draft is removed server-side as part of the send, via the draftId we passed).
+  if (handleSendResult(res)) { clearCompose(); closeCompose(); if (wasDraft && STATE.view === "drafts") load(); }
+}
+$("#composeSend").onclick = () => doComposeSend(0);
+$("#cCcToggle").onclick = () => { $("#cCc").hidden = false; $("#cCcToggle").style.display = "none"; $("#cCc").focus(); };
+$("#cBccToggle").onclick = () => { $("#cBcc").hidden = false; $("#cBccToggle").style.display = "none"; $("#cBcc").focus(); };
+
+// ---------- Scheduled send ----------
+function resolveScheduleEpoch(preset) {
+  const now = new Date(), t = new Date(now);
+  if (preset === "later_today") t.setHours(now.getHours() + 3, 0, 0, 0);
+  else if (preset === "tomorrow") { t.setDate(now.getDate() + 1); t.setHours(8, 0, 0, 0); }
+  else if (preset === "next_week") { const add = ((8 - now.getDay()) % 7) || 7; t.setDate(now.getDate() + add); t.setHours(8, 0, 0, 0); }
+  return Math.floor(t.getTime() / 1000);
+}
+$("#composeSchedule").onclick = (e) => {
+  e.stopPropagation();
+  const m = $("#scheduleMenu"), r = e.currentTarget.getBoundingClientRect();
+  m.hidden = false;
+  m.style.top = Math.max(8, r.top - m.offsetHeight - 6) + "px";
+  m.style.left = Math.min(r.left, window.innerWidth - 250) + "px";
 };
+$("#scheduleMenu").querySelectorAll("a").forEach((a) => {
+  a.onclick = () => {
+    const s = a.dataset.sched; $("#scheduleMenu").hidden = true;
+    if (s === "pick") {
+      const dt = $("#scheduleDT");
+      dt.onchange = () => { const ep = Math.floor(new Date(dt.value).getTime() / 1000); if (ep) doComposeSend(ep); };
+      dt.showPicker ? dt.showPicker() : dt.focus();
+      return;
+    }
+    doComposeSend(resolveScheduleEpoch(s));
+  };
+});
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#scheduleMenu") && !e.target.closest("#composeSchedule")) $("#scheduleMenu").hidden = true;
+});
+
+// ---------- Paste sanitizer (compose, reply, signature) ----------
+function stripDangerousHtml(html) {
+  const d = document.createElement("div");
+  d.innerHTML = html;
+  d.querySelectorAll("script,style,meta,link,head,object,embed,iframe").forEach((n) => n.remove());
+  d.querySelectorAll("img[src]").forEach((img) => { if (!(img.getAttribute("src") || "").startsWith("data:")) img.remove(); });
+  d.querySelectorAll("*").forEach((el) => [...el.attributes].forEach((at) => { if (/^on/i.test(at.name)) el.removeAttribute(at.name); }));
+  return d.innerHTML;
+}
+["cBody", "replyBox", "setSignature"].forEach((id) => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener("paste", (e) => {
+    e.preventDefault();
+    const html = e.clipboardData.getData("text/html");
+    const text = e.clipboardData.getData("text/plain");
+    if (html) document.execCommand("insertHTML", false, stripDangerousHtml(html));
+    else document.execCommand("insertText", false, text);
+  });
+});
+
+// ---------- Drag-to-attach (Finder → compose) ----------
+(function wireDrop() {
+  const co = $("#composeOverlay");
+  const show = (on) => $("#cDropHint").classList.toggle("show", on);
+  ["dragenter", "dragover"].forEach((ev) => co.addEventListener(ev, (e) => { if (co.hidden) return; e.preventDefault(); show(true); }));
+  co.addEventListener("dragleave", (e) => { if (e.relatedTarget && co.contains(e.relatedTarget)) return; show(false); });
+  co.addEventListener("drop", (e) => {
+    if (co.hidden) return;
+    e.preventDefault(); show(false);
+    const files = [...((e.dataTransfer && e.dataTransfer.files) || [])];
+    if (files.length) { STATE.attachments = (STATE.attachments || []).concat(files); renderAttachChips(); }
+  });
+})();
+
+// ---------- Contact autocomplete (To / Cc / Bcc) ----------
+let acTimer = null;
+async function runAutocomplete(input) {
+  const token = (input.value.split(",").pop() || "").trim();
+  const dd = $("#acDropdown");
+  if (token.length < 2) { dd.hidden = true; return; }
+  let r;
+  try { r = await api("/api/contacts?q=" + encodeURIComponent(token)); } catch (e) { return; }
+  const list = (r && r.contacts) || [];
+  if (!list.length) { dd.hidden = true; return; }
+  dd.innerHTML = "";
+  list.forEach((c) => {
+    const item = document.createElement("div");
+    item.className = "ac-item";
+    item.innerHTML = `<span class="ac-name">${esc(c.name || c.email)}</span><span class="ac-email">${esc(c.email)}</span>`;
+    item.onmousedown = (e) => {
+      e.preventDefault();
+      const parts = input.value.split(",");
+      parts[parts.length - 1] = c.email;
+      input.value = parts.join(", ").replace(/^\s+/, "") + ", ";
+      dd.hidden = true; input.focus();
+    };
+    dd.appendChild(item);
+  });
+  const rect = input.getBoundingClientRect();
+  dd.style.left = rect.left + "px"; dd.style.top = (rect.bottom + 2) + "px"; dd.style.width = rect.width + "px";
+  dd.hidden = false;
+}
+["#cTo", "#cCc", "#cBcc"].forEach((s) => {
+  const el = $(s);
+  el.addEventListener("input", () => { clearTimeout(acTimer); acTimer = setTimeout(() => runAutocomplete(el), 150); });
+  el.addEventListener("blur", () => setTimeout(() => ($("#acDropdown").hidden = true), 150));
+});
 $("#composeDiscard").onclick = async () => {
   if (!STATE.composeDraftId) return;
+  clearTimeout(draftSaveTimer);                 // stop autosave from resurrecting it
   await post("/api/discard_draft", { draftId: STATE.composeDraftId });
-  closeCompose(); clearCompose(); toast("Draft discarded");
+  clearCompose(); closeCompose(); toast("Draft discarded");
   if (STATE.view === "drafts") load();
 };
 async function openDraft(draftId) {
@@ -663,6 +1245,143 @@ $("#searchInput").addEventListener("keydown", (e) => {
   load();
 });
 
+// ---------- Settings panel ----------
+function openSettings() {
+  const s = STATE.settings || {};
+  $("#setSignature").innerHTML = s.signature || "";
+  $("#setUndoWindow").value = String(s.undo_send_window ?? 10);
+  $("#setDarkMode").value = s.dark_mode || "auto";
+  $("#setImageBlock").checked = s.image_block ?? false;
+  $("#setFollowupDays").value = String(s.followup_default_days ?? 3);
+  $("#settingsOverlay").hidden = false;
+}
+$("#settingsBtn").onclick = openSettings;
+$("#settingsClose").onclick = () => ($("#settingsOverlay").hidden = true);
+$("#settingsOverlay").addEventListener("click", (e) => { if (e.target.id === "settingsOverlay") $("#settingsOverlay").hidden = true; });
+$("#settingsSave").onclick = async () => {
+  const upd = {
+    signature: $("#setSignature").innerHTML,
+    undo_send_window: +$("#setUndoWindow").value,
+    dark_mode: $("#setDarkMode").value,
+    image_block: $("#setImageBlock").checked,
+    followup_default_days: +$("#setFollowupDays").value,
+  };
+  STATE.settings = Object.assign(STATE.settings || {}, upd);
+  applySettings(STATE.settings);
+  await post("/api/settings", upd);
+  $("#settingsOverlay").hidden = true;
+  toast("Settings saved");
+};
+
+// ---------- Keyboard help ----------
+const HELP_ROWS = [
+  ["j / k", "Move down / up"], ["Enter or o", "Open conversation"],
+  ["e", "Done (archive)"], ["p", "Pin"], ["s", "Snooze"], ["r", "Reply / open"],
+  ["c", "Compose"], ["/", "Search"], ["⌘K / Ctrl+K", "Command palette"],
+  ["?", "This help"], ["Esc", "Close / back"],
+].map((r) => `<div class="help-row"><kbd>${esc(r[0])}</kbd><span>${esc(r[1])}</span></div>`).join("");
+function openHelp() {
+  let o = $("#helpOverlay");
+  if (!o) {
+    o = document.createElement("div");
+    o.id = "helpOverlay"; o.className = "modal-overlay center";
+    o.innerHTML = `<div class="help-card"><div class="compose-head">Keyboard shortcuts <button class="icon-btn" id="helpClose"><i class="material-icons">close</i></button></div><div class="help-body">${HELP_ROWS}</div></div>`;
+    document.body.appendChild(o);
+    o.addEventListener("click", (e) => { if (e.target.id === "helpOverlay" || e.target.closest("#helpClose")) o.hidden = true; });
+  }
+  o.hidden = false;
+}
+$("#helpBtn").onclick = openHelp;
+
+// ---------- Command palette ----------
+function gotoView(v) {
+  document.querySelectorAll(".nav-item").forEach((x) => x.classList.remove("active"));
+  const n = document.querySelector(`.nav-item[data-view="${v}"]`);
+  if (n) n.classList.add("active");
+  STATE.view = v; STATE.token = null; load();
+}
+const COMMANDS = [
+  { label: "Compose new email", icon: "edit", run: () => openCompose() },
+  { label: "Go to Inbox", icon: "inbox", run: () => gotoView("inbox") },
+  { label: "Go to Snoozed", icon: "schedule", run: () => gotoView("snoozed") },
+  { label: "Go to Done", icon: "done", run: () => gotoView("done") },
+  { label: "Go to Drafts", icon: "drafts", run: () => gotoView("drafts") },
+  { label: "Go to Sent", icon: "send", run: () => gotoView("sent") },
+  { label: "Refresh", icon: "refresh", run: () => load() },
+  { label: "Open settings", icon: "settings", run: () => openSettings() },
+  { label: "Toggle pinned only", icon: "push_pin", run: () => { $("#pinnedOnly").checked = !$("#pinnedOnly").checked; render(); } },
+  { label: "Keyboard shortcuts", icon: "keyboard", run: () => openHelp() },
+];
+let palIdx = 0, palFiltered = [];
+function openPalette() { $("#cmdkOverlay").hidden = false; $("#cmdkInput").value = ""; renderPalette(""); $("#cmdkInput").focus(); }
+function closePalette() { $("#cmdkOverlay").hidden = true; }
+function renderPalette(q) {
+  q = (q || "").toLowerCase();
+  palFiltered = COMMANDS.filter((c) => c.label.toLowerCase().includes(q));
+  palIdx = 0;
+  const list = $("#cmdkList"); list.innerHTML = "";
+  palFiltered.forEach((c, i) => {
+    const el = document.createElement("div");
+    el.className = "cmdk-item" + (i === 0 ? " sel" : "");
+    el.innerHTML = `<i class="material-icons">${c.icon}</i><span>${esc(c.label)}</span>`;
+    el.onmousedown = (e) => { e.preventDefault(); runPalette(i); };
+    list.appendChild(el);
+  });
+}
+function runPalette(i) { const c = palFiltered[i]; closePalette(); if (c) c.run(); }
+function markPal() {
+  [...$("#cmdkList").children].forEach((el, i) => el.classList.toggle("sel", i === palIdx));
+  const sel = $("#cmdkList").children[palIdx]; if (sel) sel.scrollIntoView({ block: "nearest" });
+}
+$("#cmdkInput").addEventListener("input", (e) => renderPalette(e.target.value));
+$("#cmdkInput").addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { closePalette(); return; }
+  if (e.key === "ArrowDown") { e.preventDefault(); palIdx = Math.min(palIdx + 1, palFiltered.length - 1); markPal(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); palIdx = Math.max(palIdx - 1, 0); markPal(); }
+  else if (e.key === "Enter") { e.preventDefault(); runPalette(palIdx); }
+});
+$("#cmdkOverlay").addEventListener("click", (e) => { if (e.target.id === "cmdkOverlay") closePalette(); });
+
+// ---------- Keyboard verbs (calm: verbs without density) ----------
+let cursorIdx = -1;
+function visibleCards() { return [...document.querySelectorAll("#list .card")]; }
+function setCursor(i) {
+  const cards = visibleCards();
+  if (!cards.length) return;
+  cursorIdx = Math.max(0, Math.min(i, cards.length - 1));
+  cards.forEach((c) => c.classList.remove("cursor"));
+  const el = cards[cursorIdx];
+  el.classList.add("cursor");
+  el.scrollIntoView({ block: "nearest" });
+}
+function cursorRow() {
+  const el = visibleCards()[cursorIdx];
+  if (!el) return null;
+  return findRow(el.dataset.tid) || STATE.threads.get(el.dataset.tid) || null;
+}
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); return; }
+  if (!$("#cmdkOverlay").hidden) return;
+  const t = e.target;
+  if (t && (t.matches("input,textarea,select") || t.isContentEditable)) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (!$("#composeOverlay").hidden || !$("#settingsOverlay").hidden) return;
+  const inReader = !$("#reader").hidden;
+  switch (e.key) {
+    case "j": setCursor(cursorIdx + 1); break;
+    case "k": setCursor(cursorIdx - 1); break;
+    case "o": case "Enter": { if (!inReader) { const r = cursorRow(); if (r) openThread(r.id); } break; }
+    case "e": { if (inReader) $("#readerDone").click(); else { const r = cursorRow(); if (r) doDone(r); } break; }
+    case "p": { if (!inReader) { const r = cursorRow(); if (r) doPin(r); } break; }
+    case "s": { if (!inReader) { const cards = visibleCards(); const r = cursorRow(); if (r && cards[cursorIdx]) openSnooze(cards[cursorIdx], r); } break; }
+    case "r": { if (inReader) $("#replyBox").focus(); else { const r = cursorRow(); if (r) openThread(r.id); } break; }
+    case "c": openCompose(); break;
+    case "/": e.preventDefault(); $("#searchInput").focus(); break;
+    case "?": openHelp(); break;
+    default: return;
+  }
+});
+
 // ---------- Snackbar ----------
 function toast(msg, undo) {
   const sb = $("#snackbar");
@@ -717,10 +1436,47 @@ async function load() {
     STATE.token = null;
   }
   STATE.data = d;
+  indexThreads(d);
+  if (d.email) STATE.email = d.email;
   if (d.email) $("#acctEmail").textContent = d.email;
   if (v === "inbox") renderNavBundles();
   render();
+  enrichDocLinks();
   ensureFilled();
+}
+
+// ---------- Lazy Docs/Drive link chips on cards ----------
+function allVisibleRows() {
+  const d = STATE.data;
+  if (!d) return [];
+  const pools = [d.pinned, d.primary, d.items, ...((d.bundles || []).map((b) => b.items))];
+  const rows = [];
+  pools.forEach((p) => { if (p) p.forEach((r) => rows.push(r)); });
+  return rows;
+}
+function injectDocChips(row) {
+  document.querySelectorAll(`.card[data-tid="${row.id}"]`).forEach((c) => {
+    if (c.querySelector(".doc-links")) return; // already there
+    const body = c.querySelector(".body");
+    if (body) body.appendChild(docChipsEl(row.docLinks, "card"));
+  });
+}
+// After a list renders, fetch shared Docs/Drive links for the visible rows (the list
+// fetch skips bodies) and pop them onto the cards. Deduped via row.docLinks so the
+// inbox shows instantly and chips fill in a beat later; cached on the row so re-renders
+// (backfill, view switches) keep them without refetching.
+async function enrichDocLinks() {
+  const need = allVisibleRows().filter((r) => r.messageId && r.docLinks === undefined);
+  if (!need.length) return;
+  need.forEach((r) => { r.docLinks = null; }); // mark in-flight
+  let res;
+  try { res = await post("/api/doc_links", { messageIds: need.map((r) => r.messageId) }); }
+  catch (e) { res = null; }
+  if (!res) { need.forEach((r) => { if (r.docLinks === null) r.docLinks = undefined; }); return; }
+  need.forEach((r) => {
+    r.docLinks = res[r.messageId] || [];
+    if (r.docLinks.length) injectDocChips(r);
+  });
 }
 
 // Merge a fresh inbox page into the accumulated cache, deduping by thread id
@@ -750,12 +1506,17 @@ function mergeInbox(base, page) {
 }
 
 // "Load more": fetch only the NEXT page via pageToken and append it.
+// Appends ONLY the newly-arrived cards to the existing DOM so existing cards
+// never get torn down — no flash, no scroll jump, no interrupted animations.
 async function loadMore() {
   if (!STATE.token) return;
   const v = STATE.view;
   const lim = "limit=" + PAGE;
   const tok = "&pageToken=" + encodeURIComponent(STATE.token);
   if (v === "inbox" || v === "pinned" || v.startsWith("bundle:")) {
+    const cache0 = STATE.inboxCache || {};
+    const prevPinned = new Set((cache0.pinned || []).map((r) => r.id));
+    const prevBundles = new Set((cache0.bundles || []).map((b) => b.name));
     const p = await api("/api/inbox?" + lim + tok);
     STATE.inboxCache = mergeInbox(STATE.inboxCache, p);
     STATE.token = p.nextPageToken || null;
@@ -765,20 +1526,95 @@ async function loadMore() {
       const b = (STATE.inboxCache.bundles || []).find((x) => x.name === v.slice(7));
       STATE.data = { items: b ? b.items : [], email: STATE.inboxCache.email };
     }
-  } else {
-    let url;
-    if (v === "snoozed") url = "/api/snoozed?" + lim + tok;
-    else if (v === "done") url = "/api/done_list?" + lim + tok;
-    else if (v === "sent") url = "/api/sent?" + lim + tok;
-    else if (v === "search") url = "/api/search?q=" + encodeURIComponent(STATE.query || "") + "&" + lim + tok;
-    else return;
-    const p = await api(url);
-    STATE.data.items = STATE.data.items || [];
-    const seen = new Set(STATE.data.items.map((r) => r.id));
-    (p.items || []).forEach((r) => { if (!seen.has(r.id)) { STATE.data.items.push(r); seen.add(r.id); } });
-    STATE.token = p.nextPageToken || null;
+    indexThreads(STATE.data);
+    if (v === "inbox") {
+      const cache = STATE.inboxCache;
+      // Pinned growth or a brand-new bundle category changes the list structure
+      // above the append point — an incremental tail-append can't place those, so
+      // re-render once (keeping scroll). The common case (more primary mail) appends.
+      const grewPinned = (cache.pinned || []).some((r) => !prevPinned.has(r.id));
+      const newBundle = (cache.bundles || []).some((b) => !prevBundles.has(b.name));
+      if (grewPinned || newBundle || $("#pinnedOnly").checked) { scrollPreservingRender(); enrichDocLinks(); return; }
+      appendInboxDelta();
+      syncBundles();
+      refreshFooter();
+    } else {
+      appendItemsDelta();
+    }
+    enrichDocLinks();
+    return;
   }
-  render();
+  let url;
+  if (v === "snoozed") url = "/api/snoozed?" + lim + tok;
+  else if (v === "done") url = "/api/done_list?" + lim + tok;
+  else if (v === "sent") url = "/api/sent?" + lim + tok;
+  else if (v === "search") url = "/api/search?q=" + encodeURIComponent(STATE.query || "") + "&" + lim + tok;
+  else return;
+  const p = await api(url);
+  STATE.data.items = STATE.data.items || [];
+  const seen = new Set(STATE.data.items.map((r) => r.id));
+  (p.items || []).forEach((r) => { if (!seen.has(r.id)) { STATE.data.items.push(r); seen.add(r.id); } });
+  STATE.token = p.nextPageToken || null;
+  indexThreads(STATE.data);
+  appendItemsDelta();
+  enrichDocLinks();
+}
+
+// Insert cards before the footer, emitting date-bucket labels and continuing
+// from `startBucket` (the bucket of the last card already in the flow).
+function insertGrouped(list, footer, rows, startBucket) {
+  let cur = startBucket == null ? null : startBucket;
+  rows.forEach((r) => {
+    const b = dateBucket(r.ts);
+    if (b !== cur) { list.insertBefore(label(b), footer); cur = b; }
+    list.insertBefore(cardEl(r), footer);
+  });
+}
+// Bucket of the last top-level card currently in the list (ignores nested bundle cards).
+function lastDirectCardBucket(list) {
+  const direct = [...list.children].filter((el) => el.classList.contains("card"));
+  const last = direct[direct.length - 1];
+  return last ? dateBucket(last.dataset.ts) : null;
+}
+// Append just the primary rows that aren't on screen yet (inbox view).
+function appendInboxDelta() {
+  const list = $("#list");
+  const footer = list.querySelector(".list-footer");
+  const have = new Set([...list.querySelectorAll(".card[data-tid]")].map((c) => c.dataset.tid));
+  const newRows = (STATE.data.primary || []).filter((r) => !have.has(r.id));
+  if (!newRows.length) return;
+  // Only continue the prior bucket if primary cards are already on screen; if the
+  // primary section was empty, start fresh (the last card would be a pinned one).
+  const primaryShown = (STATE.data.primary || []).length - newRows.length;
+  insertGrouped(list, footer, newRows, primaryShown > 0 ? lastDirectCardBucket(list) : null);
+}
+// Append just the rows that aren't on screen yet (non-inbox list views), then fix the footer.
+function appendItemsDelta() {
+  const list = $("#list");
+  const footer = list.querySelector(".list-footer");
+  const have = new Set([...list.querySelectorAll(".card[data-tid]")].map((c) => c.dataset.tid));
+  const newRows = (STATE.data.items || []).filter((r) => !have.has(r.id));
+  if (newRows.length) {
+    if (STATE.view === "snoozed") newRows.forEach((r) => list.insertBefore(cardEl(r), footer));
+    else insertGrouped(list, footer, newRows, lastDirectCardBucket(list));
+  }
+  refreshFooter();
+}
+// After a backfill, refresh each visible bundle's count badge and top up any open bundle.
+function syncBundles() {
+  const list = $("#list");
+  const map = new Map((STATE.data.bundles || []).map((b) => [b.name, b]));
+  list.querySelectorAll(".bundle").forEach((el) => {
+    const b = map.get(el.dataset.bname);
+    if (!b) return;
+    const bc = el.querySelector(".bcount");
+    if (bc) bc.textContent = b.count;
+    if (el.classList.contains("open")) {
+      const items = el.querySelector(".bundle-items");
+      const have = new Set([...items.querySelectorAll(".card[data-tid]")].map((c) => c.dataset.tid));
+      b.items.forEach((r) => { if (!have.has(r.id)) items.appendChild(cardEl(r)); });
+    }
+  });
 }
 
 // ---------- Keep the inbox topped up to ~50 in view ----------
@@ -810,6 +1646,7 @@ function removeFromData(id) {
   const prune = (arr) => { if (arr) { const i = arr.findIndex((r) => r.id === id); if (i >= 0) arr.splice(i, 1); } };
   prune(d.pinned); prune(d.primary); prune(d.items);
   (d.bundles || []).forEach((b) => { prune(b.items); b.count = b.items.length; });
+  STATE.threads.delete(id);
 }
 
 // nav bundles populated after first load
@@ -855,8 +1692,14 @@ function startStream() {
 }
 
 (async function start() {
+  try { STATE.settings = await api("/api/settings"); } catch (e) { STATE.settings = {}; }
+  applySettings(STATE.settings);
   await load();
   renderNavBundles();
   startStream();
   if (window.OPEN_THREAD) openThread(window.OPEN_THREAD);
 })();
+// Re-evaluate auto dark mode when the OS theme flips.
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if ((STATE.settings.dark_mode || "auto") === "auto") applySettings(STATE.settings);
+});

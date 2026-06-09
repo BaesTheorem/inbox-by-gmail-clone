@@ -9,7 +9,7 @@
 <link rel="apple-touch-icon" href="/static/favicon.png">
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css?v=33">
+<link rel="stylesheet" href="/static/style.css?v=49">
 </head>
 <body>
 <header class="appbar">
@@ -27,6 +27,8 @@
     </span>
   </label>
   <button class="icon-btn" id="refreshBtn" title="Refresh"><i class="material-icons">refresh</i></button>
+  <button class="icon-btn" id="helpBtn" title="Keyboard shortcuts (?)"><i class="material-icons">keyboard</i></button>
+  <button class="icon-btn" id="settingsBtn" title="Settings"><i class="material-icons">settings</i></button>
 </header>
 
 <!-- Bulk-action bar (shown when ≥1 email is selected) -->
@@ -36,8 +38,8 @@
   <span class="spacer"></span>
   <button class="icon-btn" id="selPin" title="Pin"><i class="material-icons">push_pin</i></button>
   <button class="icon-btn" id="selSnooze" title="Snooze"><i class="material-icons">schedule</i></button>
-  <button class="icon-btn" id="selDone" title="Done"><i class="material-icons">check_circle</i></button>
-  <button class="icon-btn" id="selThings" title="Send to Things 3"><i class="material-icons">playlist_add_check</i></button>
+  <button class="icon-btn" id="selDone" title="Done"><i class="material-icons">playlist_add_check</i></button>
+  <button class="icon-btn" id="selThings" title="Send to Things 3"><img class="things-icon" src="/static/things-icon.png?v=37" alt="Send to Things 3"></button>
 </div>
 
 <div class="layout">
@@ -76,8 +78,12 @@
     <button class="icon-btn" id="readerPin" title="Pin"><i class="material-icons">push_pin</i></button>
     <button class="icon-btn" id="readerSnooze" title="Snooze"><i class="material-icons">schedule</i></button>
     <button class="icon-btn" id="readerLabel" title="Move to bundle"><i class="material-icons">label</i></button>
-    <button class="icon-btn" id="readerDone" title="Done"><i class="material-icons">check_circle</i></button>
-    <button class="icon-btn" id="readerThings" title="Send to Things 3"><i class="material-icons">playlist_add_check</i></button>
+    <button class="icon-btn" id="readerForward" title="Forward"><i class="material-icons">forward</i></button>
+    <button class="icon-btn" id="readerMarkUnread" title="Mark unread"><i class="material-icons">markunread</i></button>
+    <button class="icon-btn" id="readerMute" title="Mute thread"><i class="material-icons">volume_off</i></button>
+    <button class="icon-btn" id="readerFollowup" title="Remind me if no reply"><i class="material-icons">alarm_add</i></button>
+    <button class="icon-btn" id="readerDone" title="Done"><i class="material-icons" style="color:var(--done-green)">playlist_add_check</i></button>
+    <button class="icon-btn" id="readerThings" title="Send to Things 3"><img class="things-icon" src="/static/things-icon.png?v=37" alt="Send to Things 3"></button>
   </div>
   <div class="reader-body" id="readerBody"></div>
   <div class="reader-reply">
@@ -89,33 +95,128 @@
         <button type="button" class="tb-btn tb-link" title="Insert link"><i class="material-icons">link</i></button>
         <span class="tb-sep"></span>
         <button type="button" class="tb-btn" id="rAttach" title="Attach files"><i class="material-icons">attach_file</i></button>
+        <span id="replySaveStatus" class="save-status"></span>
       </div>
       <div id="replyBox" class="reply-body" contenteditable="true" data-placeholder="Reply…"></div>
       <div id="rAttachments" class="attach-list"></div>
       <input type="file" id="rFiles" multiple hidden>
     </div>
-    <button class="send-btn" id="replySend"><i class="material-icons">send</i></button>
+    <button class="send-btn wide" id="replySend"><i class="material-icons">send</i> Reply</button>
+    <button class="send-btn wide" id="replySendAll" hidden><i class="material-icons">reply_all</i> All</button>
   </div>
 </div>
 
 <!-- Compose modal -->
 <div class="modal-overlay" id="composeOverlay" hidden>
-  <div class="compose-card">
-    <div class="compose-head">New message <button class="icon-btn" id="composeClose"><i class="material-icons">close</i></button></div>
-    <input id="cTo" placeholder="To">
+  <div class="compose-card" id="composeCard">
+    <div class="compose-head"><span id="composeTitle">New message</span> <button class="icon-btn" id="composeClose"><i class="material-icons">close</i></button></div>
+    <div class="addr-row">
+      <input id="cTo" placeholder="To" autocomplete="off">
+      <div class="cc-toggles">
+        <button type="button" id="cCcToggle">Cc</button>
+        <button type="button" id="cBccToggle">Bcc</button>
+      </div>
+    </div>
+    <input id="cCc" class="addr-extra" placeholder="Cc" autocomplete="off" hidden>
+    <input id="cBcc" class="addr-extra" placeholder="Bcc" autocomplete="off" hidden>
     <input id="cSubject" placeholder="Subject">
     <div class="compose-toolbar">
       <button type="button" class="tb-btn" data-cmd="bold" title="Bold"><i class="material-icons">format_bold</i></button>
       <button type="button" class="tb-btn" data-cmd="italic" title="Italic"><i class="material-icons">format_italic</i></button>
       <button type="button" class="tb-btn" data-cmd="underline" title="Underline"><i class="material-icons">format_underlined</i></button>
+      <button type="button" class="tb-btn" data-cmd="strikeThrough" title="Strikethrough"><i class="material-icons">strikethrough_s</i></button>
       <button type="button" class="tb-btn tb-link" id="cLink" title="Insert link"><i class="material-icons">link</i></button>
+      <span class="tb-sep"></span>
+      <button type="button" class="tb-btn" data-cmd="insertUnorderedList" title="Bulleted list"><i class="material-icons">format_list_bulleted</i></button>
+      <button type="button" class="tb-btn" data-cmd="insertOrderedList" title="Numbered list"><i class="material-icons">format_list_numbered</i></button>
+      <button type="button" class="tb-btn" data-cmd="removeFormat" title="Clear formatting"><i class="material-icons">format_clear</i></button>
       <span class="tb-sep"></span>
       <button type="button" class="tb-btn" id="cAttach" title="Attach files"><i class="material-icons">attach_file</i></button>
     </div>
     <div id="cBody" class="compose-body" contenteditable="true" data-placeholder="Compose email…"></div>
+    <div id="cFwdAttachments" class="fwd-attach-list"></div>
     <div id="cAttachments" class="attach-list"></div>
     <input type="file" id="cFiles" multiple hidden>
-    <div class="compose-foot"><button class="send-btn wide" id="composeSend"><i class="material-icons">send</i> Send</button><button class="discard-btn" id="composeDiscard" style="display:none"><i class="material-icons">delete</i> Discard</button></div>
+    <div class="compose-drop-hint" id="cDropHint">Drop files to attach</div>
+    <div class="compose-foot">
+      <div class="send-split">
+        <button class="send-btn wide" id="composeSend"><i class="material-icons">send</i> Send</button>
+        <button class="send-btn caret" id="composeSchedule" title="Schedule send"><i class="material-icons">arrow_drop_down</i></button>
+      </div>
+      <button class="discard-btn" id="composeDiscard" style="display:none"><i class="material-icons">delete</i> Discard</button>
+      <span id="composeSaveStatus" class="save-status"></span>
+    </div>
+  </div>
+</div>
+
+<!-- Contact autocomplete dropdown (positioned under the focused address field) -->
+<div class="autocomplete" id="acDropdown" hidden></div>
+
+<!-- Schedule-send menu -->
+<div class="snooze-menu" id="scheduleMenu" hidden>
+  <div class="snooze-title">Schedule send</div>
+  <a data-sched="later_today"><i class="material-icons">wb_twilight</i> Later today</a>
+  <a data-sched="tomorrow"><i class="material-icons">today</i> Tomorrow morning</a>
+  <a data-sched="next_week"><i class="material-icons">event</i> Monday morning</a>
+  <a data-sched="pick"><i class="material-icons">edit_calendar</i> Pick date &amp; time</a>
+  <input type="datetime-local" id="scheduleDT" style="position:absolute;opacity:0;pointer-events:none;width:0;height:0">
+</div>
+
+<!-- Command palette -->
+<div class="cmdk-overlay" id="cmdkOverlay" hidden>
+  <div class="cmdk">
+    <input id="cmdkInput" placeholder="Type a command…" autocomplete="off">
+    <div id="cmdkList" class="cmdk-list"></div>
+  </div>
+</div>
+
+<!-- Settings panel -->
+<div class="modal-overlay center" id="settingsOverlay" hidden>
+  <div class="settings-card">
+    <div class="compose-head">Settings <button class="icon-btn" id="settingsClose"><i class="material-icons">close</i></button></div>
+    <div class="settings-body">
+      <label class="set-field">
+        <span>Signature</span>
+        <div class="compose-toolbar">
+          <button type="button" class="tb-btn" data-cmd="bold" title="Bold"><i class="material-icons">format_bold</i></button>
+          <button type="button" class="tb-btn" data-cmd="italic" title="Italic"><i class="material-icons">format_italic</i></button>
+          <button type="button" class="tb-btn tb-link" title="Insert link"><i class="material-icons">link</i></button>
+        </div>
+        <div id="setSignature" class="settings-sig" contenteditable="true" data-placeholder="Your signature…"></div>
+      </label>
+      <label class="set-field">
+        <span>Undo send window</span>
+        <select id="setUndoWindow">
+          <option value="0">Off</option>
+          <option value="5">5 seconds</option>
+          <option value="10">10 seconds</option>
+          <option value="20">20 seconds</option>
+          <option value="30">30 seconds</option>
+        </select>
+      </label>
+      <label class="set-field">
+        <span>Appearance</span>
+        <select id="setDarkMode">
+          <option value="auto">Match system</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </label>
+      <label class="set-field row">
+        <input type="checkbox" id="setImageBlock">
+        <span>Block remote images (stops read-receipt tracking)</span>
+      </label>
+      <label class="set-field">
+        <span>Follow-up nudge default</span>
+        <select id="setFollowupDays">
+          <option value="2">2 days</option>
+          <option value="3">3 days</option>
+          <option value="5">5 days</option>
+          <option value="7">1 week</option>
+        </select>
+      </label>
+    </div>
+    <div class="compose-foot"><button class="send-btn wide" id="settingsSave"><i class="material-icons">check</i> Save</button></div>
   </div>
 </div>
 
@@ -141,7 +242,7 @@
 <!-- Undo snackbar -->
 <div class="snackbar" id="snackbar" hidden><span id="snackText"></span><button id="snackUndo">UNDO</button></div>
 
-<script>window.OPEN_THREAD = "{{ open_thread }}";</script>
-<script src="/static/app.js?v=33"></script>
+<script>window.OPEN_THREAD = {{ open_thread|tojson }};</script>
+<script src="/static/app.js?v=49"></script>
 </body>
 </html>
