@@ -101,6 +101,23 @@ class Api:
             return {"ok": False, "error": str(e)}
 
 
+def _install_external_link_routing():
+    """Safety net so no link ever loads inside the app window. The email body already
+    neutralizes its links in JS, but pywebview also (a) opens target="_blank" links via
+    webbrowser.open — which silently fails here (osascript needs a TCC grant) — and
+    (b) otherwise allows in-window navigation. Route webbrowser.open through our working
+    LaunchServices opener and tell pywebview to hand external links to the browser."""
+    try:
+        _api = Api()
+        webbrowser.open = lambda url, *a, **k: bool(_api.open_external(url))
+    except Exception:
+        pass
+    try:
+        webview.settings['OPEN_EXTERNAL_LINKS_IN_BROWSER'] = True
+    except Exception:
+        pass
+
+
 def _server_up():
     try:
         urllib.request.urlopen(URL + "api/health", timeout=1)
@@ -124,6 +141,7 @@ def main():
         if _server_up():
             break
         time.sleep(0.25)
+    _install_external_link_routing()
     webview.create_window("Inbox", URL, js_api=Api(),
                           width=1180, height=820, min_size=(820, 600))
     webview.start()  # blocks on the native GUI loop until the window closes
