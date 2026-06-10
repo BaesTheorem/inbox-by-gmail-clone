@@ -951,6 +951,7 @@ function openCompose(opts = {}) {
   renderFwdChips();
   $("#composeDiscard").style.display = STATE.composeDraftId ? "" : "none";
   $("#composeOverlay").hidden = false;
+  applyComposeExpanded(); // restore the remembered full-screen / compact state
   setTimeout(() => (opts.to ? $("#cBody") : $("#cTo")).focus(), 30);
 }
 function renderFwdChips() {
@@ -1017,8 +1018,23 @@ async function saveDraftNow() {
 $("#cBody").addEventListener("input", scheduleDraftSave);
 $("#fab").onclick = () => openCompose();
 $("#composeClose").onclick = closeCompose;
+// Full-screen compose toggle — remembered across opens (like Gmail).
+function applyComposeExpanded() {
+  const on = localStorage.getItem("inbox.composeExpanded") === "1";
+  $("#composeOverlay").classList.toggle("expanded", on);
+  const ico = $("#composeExpand").querySelector(".material-icons");
+  ico.textContent = on ? "close_fullscreen" : "open_in_full";
+  $("#composeExpand").title = on ? "Exit full screen" : "Full screen";
+}
+$("#composeExpand").onclick = () => {
+  const on = $("#composeOverlay").classList.contains("expanded");
+  try { localStorage.setItem("inbox.composeExpanded", on ? "0" : "1"); } catch (e) {}
+  applyComposeExpanded();
+  $("#cBody").focus();
+};
 // Click the dimmed backdrop to dismiss compose
-$("#composeOverlay").addEventListener("click", (e) => { if (e.target.id === "composeOverlay") closeCompose(); });
+// Compose stays open until an explicit exit (the ✕, Send, or Discard). Clicking the
+// dimmed backdrop does NOT dismiss it — too easy to lose a draft-in-progress by accident.
 // Escape closes the topmost overlay
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
@@ -1030,7 +1046,8 @@ document.addEventListener("keydown", (e) => {
   if (!$("#relabelMenu").hidden) { $("#relabelMenu").hidden = true; return; }
   if (helpO && !helpO.hidden) { helpO.hidden = true; return; }
   if (!$("#settingsOverlay").hidden) { $("#settingsOverlay").hidden = true; return; }
-  if (!$("#composeOverlay").hidden) { closeCompose(); return; }
+  // Escape does NOT close compose (only its sub-popups, handled above). Compose closes
+  // only via an explicit exit, so an accidental Escape can't drop a message in progress.
   if (!$("#reader").hidden) { closeReader(); return; }
 });
 async function doComposeSend(sendAt) {
@@ -1106,6 +1123,17 @@ function stripDangerousHtml(html) {
   d.querySelectorAll("*").forEach((el) => [...el.attributes].forEach((at) => { if (/^on/i.test(at.name)) el.removeAttribute(at.name); }));
   return d.innerHTML;
 }
+// Cmd/Ctrl+Shift+V = paste without formatting. The browser would do this natively,
+// but our paste handler intercepts every paste and prefers text/html — so we must
+// honor the intent ourselves. Set on keydown (fires before the paste event), consume
+// it in the handler, with a timeout as a safety reset if no paste follows.
+let forcePlainPaste = false;
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "v" || e.key === "V")) {
+    forcePlainPaste = true;
+    setTimeout(() => { forcePlainPaste = false; }, 300);
+  }
+});
 ["cBody", "replyBox", "setSignature"].forEach((id) => {
   const el = document.getElementById(id);
   if (!el) return;
@@ -1113,8 +1141,9 @@ function stripDangerousHtml(html) {
     e.preventDefault();
     const html = e.clipboardData.getData("text/html");
     const text = e.clipboardData.getData("text/plain");
-    if (html) document.execCommand("insertHTML", false, stripDangerousHtml(html));
+    if (!forcePlainPaste && html) document.execCommand("insertHTML", false, stripDangerousHtml(html));
     else document.execCommand("insertText", false, text);
+    forcePlainPaste = false;
   });
 });
 
@@ -1229,21 +1258,180 @@ document.querySelectorAll(".nav-item").forEach((n) => {
     n.classList.add("active");
     STATE.view = n.dataset.view;
     STATE.token = null;
+    clearSearchBox(); // leaving a search → empty the box
     load();
   };
 });
 $("#refreshBtn").onclick = load;
 $("#pinnedOnly").onchange = render;
 $("#menuBtn").onclick = () => document.querySelector(".layout").classList.toggle("nav-collapsed");
-$("#searchInput").addEventListener("keydown", (e) => {
-  if (e.key !== "Enter") return;
-  const q = e.target.value.trim();
+// ---------- Search (Gmail-style: suggestions, operators, advanced builder) ----------
+const SEARCH_OPS = [
+  { op: "from:", desc: "Sender", icon: "person" },
+  { op: "to:", desc: "Recipient", icon: "person_outline" },
+  { op: "subject:", desc: "Words in the subject", icon: "subject" },
+  { op: "has:attachment", desc: "Has any attachment", icon: "attach_file" },
+  { op: "filename:", desc: "Attachment name or type (e.g. pdf)", icon: "description" },
+  { op: "is:unread", desc: "Unread mail", icon: "markunread" },
+  { op: "is:read", desc: "Read mail", icon: "drafts" },
+  { op: "is:starred", desc: "Starred / pinned", icon: "star" },
+  { op: "is:important", desc: "Marked important", icon: "label_important" },
+  { op: "in:inbox", desc: "In the inbox", icon: "inbox" },
+  { op: "in:sent", desc: "Sent mail", icon: "send" },
+  { op: "in:trash", desc: "In trash", icon: "delete" },
+  { op: "in:anywhere", desc: "Everywhere, incl. spam & trash", icon: "all_inbox" },
+  { op: "label:", desc: "Has a label", icon: "label" },
+  { op: "category:", desc: "primary / social / promotions / updates / forums", icon: "category" },
+  { op: "after:", desc: "After a date — YYYY/MM/DD", icon: "event" },
+  { op: "before:", desc: "Before a date — YYYY/MM/DD", icon: "event" },
+  { op: "newer_than:", desc: "Within a span — e.g. 7d, 1m, 1y", icon: "schedule" },
+  { op: "older_than:", desc: "Older than a span — e.g. 7d, 1m, 1y", icon: "history" },
+  { op: "larger:", desc: "Larger than a size — e.g. 5M", icon: "data_usage" },
+  { op: "smaller:", desc: "Smaller than a size — e.g. 1M", icon: "data_usage" },
+  { op: '"exact phrase"', desc: "Match an exact phrase", icon: "format_quote" },
+  { op: "-", desc: "Exclude a term", icon: "remove_circle_outline" },
+  { op: "OR", desc: "Match either term", icon: "call_split" },
+];
+const RECENT_KEY = "inbox.recentSearches";
+function recentSearches() { try { return JSON.parse(localStorage.getItem(RECENT_KEY)) || []; } catch (e) { return []; } }
+function pushRecent(q) { q = q.trim(); if (!q) return; let r = recentSearches().filter((x) => x !== q); r.unshift(q); try { localStorage.setItem(RECENT_KEY, JSON.stringify(r.slice(0, 12))); } catch (e) {} }
+function removeRecent(q) { try { localStorage.setItem(RECENT_KEY, JSON.stringify(recentSearches().filter((x) => x !== q))); } catch (e) {} }
+function clearSearchBox() { $("#searchInput").value = ""; $("#searchClear").hidden = true; $("#searchSuggest").hidden = true; $("#searchAdvanced").hidden = true; }
+
+let searchSel = -1, searchItems = [], searchContactTimer = null;
+
+function runSearch(q) {
+  q = (q || "").trim();
+  $("#searchSuggest").hidden = true; $("#searchAdvanced").hidden = true;
+  $("#searchInput").value = q; $("#searchClear").hidden = !q;
   document.querySelectorAll(".nav-item").forEach((x) => x.classList.remove("active"));
-  if (q) { STATE.view = "search"; STATE.query = q; }
+  if (q) { STATE.view = "search"; STATE.query = q; pushRecent(q); }
   else { STATE.view = "inbox"; document.querySelector('.nav-item[data-view="inbox"]').classList.add("active"); }
   STATE.token = null;
   load();
+}
+// The whitespace-delimited token under the cursor (so operators complete in place).
+function currentToken() {
+  const inp = $("#searchInput");
+  const v = inp.value.slice(0, inp.selectionStart ?? inp.value.length);
+  const m = v.match(/(\S+)$/);
+  return m ? m[1] : "";
+}
+function replaceToken(insert) {
+  const inp = $("#searchInput");
+  const pos = inp.selectionStart ?? inp.value.length;
+  const before = inp.value.slice(0, pos).replace(/\S+$/, "") + insert;
+  inp.value = before + inp.value.slice(pos);
+  inp.setSelectionRange(before.length, before.length);
+  inp.focus();
+  $("#searchClear").hidden = !inp.value;
+}
+function buildSuggestions() {
+  const inp = $("#searchInput");
+  const full = inp.value.trim();
+  const tok = currentToken(), tl = tok.toLowerCase();
+  const items = [];
+  if (full) items.push({ type: "run", icon: "search", main: full, value: full });
+  if (tok) {
+    SEARCH_OPS.filter((o) => o.op.toLowerCase().startsWith(tl) && o.op.toLowerCase() !== tl)
+      .slice(0, 6).forEach((o) => items.push({ type: "op", icon: o.icon, op: o.op, desc: o.desc, value: o.op }));
+  } else if (!full) {
+    ["from:", "to:", "subject:", "has:attachment", "is:unread", "after:"].forEach((op) => {
+      const o = SEARCH_OPS.find((x) => x.op === op); if (o) items.push({ type: "op", icon: o.icon, op: o.op, desc: o.desc, value: o.op });
+    });
+  }
+  recentSearches().filter((r) => !full || (r.toLowerCase().includes(full.toLowerCase()) && r.toLowerCase() !== full.toLowerCase()))
+    .slice(0, 5).forEach((r) => items.push({ type: "recent", icon: "history", main: r, value: r }));
+  renderSuggestions(items);
+  // Contacts — when typing a bare name fragment or after from:/to:
+  const mFT = tok.match(/^(from:|to:)(.*)$/i);
+  const cq = mFT ? mFT[2] : (/^[a-z][a-z.@-]*$/i.test(tok) && tok.length >= 2 ? tok : "");
+  if (cq && cq.length >= 2) {
+    clearTimeout(searchContactTimer);
+    searchContactTimer = setTimeout(async () => {
+      let cs; try { cs = await api("/api/contacts?q=" + encodeURIComponent(cq)); } catch (e) { return; }
+      if (!Array.isArray(cs) || !cs.length || inp.value.trim() !== full) return;
+      const prefix = mFT ? mFT[1].toLowerCase() : "from:";
+      const citems = cs.slice(0, 5).map((c) => ({ type: "contact", icon: "person", main: c.name || c.email, sub: c.email, value: prefix + c.email + " " }));
+      renderSuggestions(items.concat(citems));
+    }, 160);
+  }
+}
+function renderSuggestions(items) {
+  searchItems = items; searchSel = -1;
+  const pop = $("#searchSuggest");
+  if (!items.length) { pop.hidden = true; return; }
+  pop.innerHTML = "";
+  const headFor = (t) => t === "recent" ? "Recent searches" : t === "contact" ? "Contacts" : t === "op" ? "Search operators" : null;
+  let lastHead = null;
+  items.forEach((it, i) => {
+    const head = headFor(it.type);
+    if (head && head !== lastHead) { const h = document.createElement("div"); h.className = "ss-head"; h.textContent = head; pop.appendChild(h); }
+    lastHead = head;
+    const el = document.createElement("div");
+    el.className = "ss-item"; el.dataset.i = i;
+    if (it.type === "op") el.innerHTML = `<i class="material-icons">${it.icon}</i><span class="ss-op">${esc(it.op)}</span><span class="ss-main">${esc(it.desc)}</span>`;
+    else if (it.type === "contact") el.innerHTML = `<i class="material-icons">${it.icon}</i><span class="ss-main">${esc(it.main)}</span><span class="ss-sub">${esc(it.sub || "")}</span>`;
+    else {
+      el.innerHTML = `<i class="material-icons">${it.icon}</i><span class="ss-main">${esc(it.main)}</span>`;
+      if (it.type === "recent") { const x = document.createElement("i"); x.className = "material-icons ss-remove"; x.textContent = "close"; x.title = "Remove"; x.onmousedown = (e) => { e.preventDefault(); e.stopPropagation(); removeRecent(it.value); buildSuggestions(); }; el.appendChild(x); }
+    }
+    el.onmousedown = (e) => { e.preventDefault(); selectSuggestion(i); };
+    pop.appendChild(el);
+  });
+  pop.hidden = false;
+}
+function selectSuggestion(i) {
+  const it = searchItems[i]; if (!it) return;
+  if (it.type === "op" || it.type === "contact") { replaceToken(it.value); buildSuggestions(); }
+  else runSearch(it.value);
+}
+function moveSearchSel(d) {
+  const n = searchItems.length; if (!n) return;
+  searchSel = (searchSel + d + n) % n;
+  $("#searchSuggest").querySelectorAll(".ss-item").forEach((el) => el.classList.toggle("sel", +el.dataset.i === searchSel));
+}
+$("#searchInput").addEventListener("input", () => { $("#searchClear").hidden = !$("#searchInput").value; buildSuggestions(); });
+$("#searchInput").addEventListener("focus", () => { $("#searchAdvanced").hidden = true; buildSuggestions(); });
+$("#searchInput").addEventListener("blur", () => setTimeout(() => { $("#searchSuggest").hidden = true; }, 150));
+$("#searchInput").addEventListener("keydown", (e) => {
+  const pop = $("#searchSuggest");
+  if ((e.key === "ArrowDown" || e.key === "ArrowUp") && !pop.hidden) { e.preventDefault(); moveSearchSel(e.key === "ArrowDown" ? 1 : -1); }
+  else if (e.key === "Enter") { e.preventDefault(); (!pop.hidden && searchSel >= 0) ? selectSuggestion(searchSel) : runSearch(e.target.value); }
+  else if (e.key === "Escape") { if (!pop.hidden) pop.hidden = true; else if (!$("#searchAdvanced").hidden) $("#searchAdvanced").hidden = true; else e.target.blur(); }
+  else if (e.key === "Tab" && !pop.hidden) { const opi = searchItems.findIndex((x) => x.type === "op"); if (opi >= 0) { e.preventDefault(); selectSuggestion(opi); } }
 });
+$("#searchGo").onclick = () => runSearch($("#searchInput").value);
+$("#searchClear").onclick = () => { clearSearchBox(); if (STATE.view === "search") runSearch(""); $("#searchInput").focus(); };
+$("#searchAdvToggle").onclick = (e) => { e.stopPropagation(); $("#searchSuggest").hidden = true; const a = $("#searchAdvanced"); a.hidden = !a.hidden; };
+// Build a Gmail query from the advanced form and run it.
+function searchDateWindow(dateStr, days) {
+  const d = new Date(dateStr + "T00:00:00"), ms = +days * 86400000;
+  const fmt = (t) => { const x = new Date(t); return x.getFullYear() + "/" + (x.getMonth() + 1) + "/" + x.getDate(); };
+  return { after: fmt(d.getTime() - ms), before: fmt(d.getTime() + ms) };
+}
+function buildAdvQuery() {
+  const v = (id) => $("#" + id).value.trim();
+  const grp = (s) => /\s/.test(s) ? "(" + s + ")" : s;
+  const p = [];
+  if (v("saFrom")) p.push("from:" + grp(v("saFrom")));
+  if (v("saTo")) p.push("to:" + grp(v("saTo")));
+  if (v("saSubject")) p.push("subject:" + grp(v("saSubject")));
+  if (v("saHas")) p.push(v("saHas"));
+  if (v("saNot")) v("saNot").split(/\s+/).forEach((w) => p.push("-" + w));
+  if ($("#saHasAttach").checked) p.push("has:attachment");
+  if (v("saSizeVal")) p.push($("#saSizeOp").value + ":" + v("saSizeVal") + $("#saSizeUnit").value);
+  if ($("#saWithin").value && v("saDate")) { const w = searchDateWindow(v("saDate"), $("#saWithin").value); p.push("after:" + w.after, "before:" + w.before); }
+  if ($("#saScope").value) p.push($("#saScope").value);
+  return p.join(" ");
+}
+$("#saSearch").onclick = () => { const q = buildAdvQuery(); $("#searchAdvanced").hidden = true; if (q) runSearch(q); };
+$("#saClear").onclick = () => {
+  ["saFrom", "saTo", "saSubject", "saHas", "saNot", "saSizeVal", "saDate"].forEach((id) => ($("#" + id).value = ""));
+  $("#saHasAttach").checked = false; $("#saWithin").value = ""; $("#saScope").value = ""; $("#saSizeOp").value = "larger"; $("#saSizeUnit").value = "M";
+};
+// Close search dropdowns on an outside click.
+document.addEventListener("click", (e) => { if (!e.target.closest("#searchWrap")) { $("#searchSuggest").hidden = true; $("#searchAdvanced").hidden = true; } });
 
 // ---------- Settings panel ----------
 function openSettings() {

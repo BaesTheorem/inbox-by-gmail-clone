@@ -9,15 +9,59 @@
 <link rel="apple-touch-icon" href="/static/favicon.png">
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css?v=49">
+<link rel="stylesheet" href="/static/style.css?v=54">
 </head>
 <body>
 <header class="appbar">
   <button class="icon-btn" id="menuBtn" title="Menu"><i class="material-icons">menu</i></button>
   <span class="wordmark">Inbox</span>
-  <div class="search">
-    <i class="material-icons">search</i>
-    <input id="searchInput" placeholder="Search">
+  <div class="search" id="searchWrap">
+    <i class="material-icons search-ico" id="searchGo" title="Search">search</i>
+    <input id="searchInput" placeholder="Search mail" autocomplete="off">
+    <button class="search-btn" id="searchClear" hidden title="Clear search"><i class="material-icons">close</i></button>
+    <button class="search-btn" id="searchAdvToggle" title="Show search options"><i class="material-icons">tune</i></button>
+    <!-- Suggestions dropdown (recent searches, operators, contacts) -->
+    <div class="search-pop" id="searchSuggest" hidden></div>
+    <!-- Advanced search builder -->
+    <div class="search-pop search-adv" id="searchAdvanced" hidden>
+      <div class="sa-grid">
+        <label>From</label><input id="saFrom" autocomplete="off">
+        <label>To</label><input id="saTo" autocomplete="off">
+        <label>Subject</label><input id="saSubject" autocomplete="off">
+        <label>Has the words</label><input id="saHas" autocomplete="off">
+        <label>Doesn't have</label><input id="saNot" autocomplete="off">
+        <label>Size</label>
+        <div class="sa-inline">
+          <select id="saSizeOp"><option value="larger">greater than</option><option value="smaller">less than</option></select>
+          <input id="saSizeVal" type="number" min="0" class="sa-num" placeholder="—">
+          <select id="saSizeUnit"><option value="M">MB</option><option value="K">KB</option></select>
+        </div>
+        <label>Date within</label>
+        <div class="sa-inline">
+          <select id="saWithin">
+            <option value="">—</option><option value="1">1 day</option><option value="3">3 days</option>
+            <option value="7">1 week</option><option value="14">2 weeks</option><option value="30">1 month</option>
+            <option value="60">2 months</option><option value="180">6 months</option><option value="365">1 year</option>
+          </select>
+          <span class="sa-of">of</span><input id="saDate" type="date">
+        </div>
+        <label>Search</label>
+        <select id="saScope">
+          <option value="">All mail</option><option value="in:inbox">Inbox</option><option value="is:starred">Starred / Pinned</option>
+          <option value="in:sent">Sent</option><option value="in:drafts">Drafts</option><option value="is:snoozed">Snoozed</option>
+          <option value="is:unread">Unread</option><option value="is:important">Important</option>
+          <option value="category:primary">Category: Primary</option><option value="category:promotions">Category: Promotions</option>
+          <option value="category:social">Category: Social</option><option value="category:updates">Category: Updates</option>
+          <option value="category:forums">Category: Forums</option><option value="in:trash">Trash</option><option value="in:spam">Spam</option>
+        </select>
+        <label>Attachment</label>
+        <label class="sa-check"><input type="checkbox" id="saHasAttach"> Has attachment</label>
+      </div>
+      <div class="sa-actions">
+        <button class="sa-btn" id="saClear">Clear</button>
+        <button class="sa-btn primary" id="saSearch"><i class="material-icons">search</i> Search</button>
+      </div>
+    </div>
   </div>
   <label class="pinned-toggle" title="Pinned only">
     <span class="switch">
@@ -109,7 +153,7 @@
 <!-- Compose modal -->
 <div class="modal-overlay" id="composeOverlay" hidden>
   <div class="compose-card" id="composeCard">
-    <div class="compose-head"><span id="composeTitle">New message</span> <button class="icon-btn" id="composeClose"><i class="material-icons">close</i></button></div>
+    <div class="compose-head"><span id="composeTitle">New message</span><span class="ch-actions"><button class="icon-btn" id="composeExpand" title="Full screen"><i class="material-icons">open_in_full</i></button><button class="icon-btn" id="composeClose" title="Close"><i class="material-icons">close</i></button></span></div>
     <div class="addr-row">
       <input id="cTo" placeholder="To" autocomplete="off">
       <div class="cc-toggles">
@@ -243,6 +287,6 @@
 <div class="snackbar" id="snackbar" hidden><span id="snackText"></span><button id="snackUndo">UNDO</button></div>
 
 <script>window.OPEN_THREAD = {{ open_thread|tojson }};</script>
-<script src="/static/app.js?v=49"></script>
+<script src="/static/app.js?v=54"></script>
 </body>
 </html>
