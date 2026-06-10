@@ -665,17 +665,22 @@ function externalHref(a) {
   if (raw.startsWith("//")) return "https:" + raw;
   return null; // app-relative or javascript:/# — never navigate the app to it
 }
-// Route every link inside a rendered email out to the system browser. One delegated
-// capture-phase listener (more robust than per-anchor binding), target stripped so a
-// sandboxed _blank never gets popup-blocked into a dead click.
+// Route every link inside a rendered email out to the system browser. We NEUTRALIZE
+// each external link — stash the real URL in data-exturl and set href="#" — so the
+// WKWebView physically cannot navigate the app window to it (pywebview otherwise
+// allows same-frame link navigation, which is how links opened "inside the inbox").
+// A delegated capture-phase listener then opens the stashed URL externally.
 function routeIframeLinks(doc) {
-  doc.querySelectorAll("a[target]").forEach((a) => a.removeAttribute("target"));
+  doc.querySelectorAll("a[href]").forEach((a) => {
+    a.removeAttribute("target");
+    const url = externalHref(a);
+    if (url) { a.dataset.exturl = url; a.setAttribute("href", "#"); }
+  });
   const handler = (e) => {
-    const a = e.target.closest && e.target.closest("a[href]");
+    const a = e.target.closest && e.target.closest("a[data-exturl]");
     if (!a) return;
     e.preventDefault();
-    const url = externalHref(a);
-    if (url) openExternal(url);
+    openExternal(a.dataset.exturl);
   };
   doc.addEventListener("click", handler, true);
   doc.addEventListener("auxclick", handler, true);
