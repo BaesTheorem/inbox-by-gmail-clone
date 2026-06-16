@@ -625,6 +625,13 @@ function openSnoozeFromSwipe(el, row) { openSnooze(el.querySelector(".act-snooze
 // srcdoc. data: images and inline styles still render; remote http(s) images don't.
 const IMG_CSP = '<meta http-equiv="Content-Security-Policy" content="img-src data:; style-src \'unsafe-inline\' data:; font-src data:; default-src \'none\'">';
 const HAS_REMOTE_IMG = /<img[^>]+src=["']?https?:/i;
+// Force every email link to default to a new browsing context. The srcdoc sandbox omits
+// allow-popups, so WKWebView BLOCKS that navigation entirely — a link physically cannot
+// load inside the app window, even in the brief window before our JS routing attaches.
+// Our click handler (routeIframeLinks) then hands the URL to the real browser. This is the
+// native safety net behind the JS routing: pywebview only sends target=_blank links to the
+// browser, never normal in-frame clicks, so without this a link navigates the app in-place.
+const BASE_BLANK = '<base target="_blank">';
 
 function renderMsgBody(mb, m, forceImages) {
   if (mb.dataset.rendered && !forceImages) return;
@@ -645,15 +652,31 @@ function renderMsgBody(mb, m, forceImages) {
   f.setAttribute("sandbox", "allow-same-origin");
   f.style.width = "100%";
   f.style.minHeight = "120px";
-  f.onload = () => {
-    try {
-      const doc = f.contentWindow.document;
-      f.style.height = (doc.body.scrollHeight + 24) + "px";
-      routeIframeLinks(doc);
-    } catch (e) {}
+  // Route links as soon as the email DOM is reachable. We can't rely on the iframe `load`
+  // event alone: for srcdoc content in WKWebView it fires unreliably, and when it doesn't,
+  // links keep their real href. So we also poll. The readiness gate (about:srcdoc URL, or a
+  // populated body) skips the transient about:blank document the iframe shows before the
+  // srcdoc commits — otherwise we'd attach to the wrong doc and never route the real one.
+  const routeWhenReady = () => {
+    let tries = 0;
+    const tick = () => {
+      let ok = false;
+      try {
+        const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+        if (doc && doc.body && (doc.URL === "about:srcdoc" || doc.body.children.length > 0)) {
+          f.style.height = (doc.body.scrollHeight + 24) + "px";
+          routeIframeLinks(doc);
+          ok = true;
+        }
+      } catch (e) {}
+      if (!ok && tries++ < 40) setTimeout(tick, 50);
+    };
+    tick();
   };
+  f.onload = routeWhenReady;
   mb.appendChild(f);
-  f.srcdoc = (blocked ? IMG_CSP : "") + m.html;
+  f.srcdoc = BASE_BLANK + (blocked ? IMG_CSP : "") + m.html;
+  routeWhenReady();
 }
 // Resolve an email link to the URL it was AUTHORED with. We must read the raw href
 // attribute, not a.href: the IDL property resolves relative to the iframe's base,
@@ -671,11 +694,17 @@ function externalHref(a) {
 // allows same-frame link navigation, which is how links opened "inside the inbox").
 // A delegated capture-phase listener then opens the stashed URL externally.
 function routeIframeLinks(doc) {
+  // Neutralize every link (re-run safe: poll may call this more than once as the email
+  // finishes laying out). Real URL goes to data-exturl; href becomes "#" so even a click
+  // that races the handler can't navigate.
   doc.querySelectorAll("a[href]").forEach((a) => {
     a.removeAttribute("target");
     const url = externalHref(a);
     if (url) { a.dataset.exturl = url; a.setAttribute("href", "#"); }
   });
+  // Attach the capture-phase opener exactly once per document.
+  if (doc.__inboxExtRouted) return;
+  doc.__inboxExtRouted = true;
   const handler = (e) => {
     const a = e.target.closest && e.target.closest("a[data-exturl]");
     if (!a) return;
