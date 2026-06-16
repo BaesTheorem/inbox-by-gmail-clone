@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import secrets
+import queue
 import socket
 import sqlite3
 import subprocess
@@ -656,6 +657,8 @@ def summarize_ids(ids, outgoing=False):
         if not prev or int(msg.get("internalDate", 0)) > int(prev.get("internalDate", 0)):
             by_thread[tid] = msg
     summaries = [thread_summary(m, outgoing=outgoing) for m in by_thread.values()]
+    if not outgoing:
+        apply_body_unsub(summaries)  # body-buried opt-out from cache; scan misses in background
     summaries.sort(key=lambda r: int(r["ts"]), reverse=True)
     return summaries
 
@@ -840,6 +843,14 @@ def migrate_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_da_fire ON deferred_actions (fire_at) WHERE status='pending'")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_da_thread ON deferred_actions (thread_id) WHERE status='pending'")
     conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    # Cache of the body-buried unsubscribe scan (per message): https_url='' means scanned,
+    # no opt-out link found. Lets inbox list rows show the Unsubscribe banner without
+    # re-downloading each body — the scan runs once, on arrival or first sight.
+    conn.execute("""CREATE TABLE IF NOT EXISTS unsub_scan (
+        message_id TEXT PRIMARY KEY,
+        https_url  TEXT NOT NULL DEFAULT '',
+        checked_at INTEGER NOT NULL
+    )""")
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     if "snoozed" in tables:
         now = int(time.time())
@@ -1044,6 +1055,14 @@ def _history_loop():
                                 historyTypes=["messageAdded", "labelAdded", "labelRemoved"])
                     if resp.get("history"):
                         SYNC["version"] += 1  # something changed -> tell the browser
+                        # Scan newly-arrived inbox mail for body-buried unsubscribe links now,
+                        # so the banner is ready in the list row by the time it's viewed.
+                        added = [ma["message"]["id"]
+                                 for h in resp["history"]
+                                 for ma in h.get("messagesAdded", [])
+                                 if "INBOX" in (ma.get("message", {}).get("labelIds") or [])]
+                        if added:
+                            enqueue_unsub_scan(added)
                     SYNC["history_id"] = resp.get("historyId", SYNC["history_id"])
                 except GmailHTTPError as he:
                     # 404 = startHistoryId too old; reset cursor and force a refresh
@@ -1055,6 +1074,106 @@ def _history_loop():
         except Exception:
             log.exception("history poll failed")
         time.sleep(POLL_INTERVAL)
+
+
+# ----------------------------------------------------------------------------
+# Body-unsubscribe scan cache
+# Senders that omit the List-Unsubscribe header (KaraFun et al.) bury the opt-out in
+# the body. List rows are fetched WITHOUT body bytes (cheap), so we can't scan them
+# inline. Instead we scan each message's body once — on arrival (history poller) or the
+# first time a list row is built — on a background worker, and cache the result so the
+# Unsubscribe banner can show in the inbox list without re-downloading bodies.
+# ----------------------------------------------------------------------------
+# Body-only field mask: text parts down the same nesting depth as the list mask, no headers.
+_BODY_FIELDS = ("payload(mimeType,body/data,parts(mimeType,body/data,"
+                "parts(mimeType,body/data,parts(mimeType,body/data))))")
+_unsub_q = queue.Queue()
+_unsub_queued = set()           # ids already queued this run, so we don't re-enqueue dupes
+_unsub_queued_lock = threading.Lock()
+
+
+def unsub_cache_get(ids):
+    """Return {message_id: https_url} for the scanned ids (url '' = none found)."""
+    ids = [i for i in ids if i]
+    if not ids:
+        return {}
+    out, conn = {}, db()
+    try:
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            ph = ",".join("?" * len(chunk))
+            for mid, url in conn.execute(
+                    f"SELECT message_id, https_url FROM unsub_scan WHERE message_id IN ({ph})",
+                    chunk).fetchall():
+                out[mid] = url
+    finally:
+        conn.close()
+    return out
+
+
+def unsub_cache_put(mid, url):
+    conn = db()
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO unsub_scan (message_id, https_url, checked_at) "
+                         "VALUES (?,?,?)", (mid, url or "", int(time.time())))
+    finally:
+        conn.close()
+
+
+def enqueue_unsub_scan(ids):
+    """Queue message ids for a one-time body scan (skips ids already queued this run)."""
+    with _unsub_queued_lock:
+        fresh = [i for i in ids if i and i not in _unsub_queued]
+        _unsub_queued.update(fresh)
+    for i in fresh:
+        _unsub_q.put(i)
+
+
+def _unsub_scan_loop():
+    found_pending = False
+    while True:
+        mid = _unsub_q.get()
+        try:
+            # Skip if a prior run already cached it (queue can outlive the cache check).
+            if mid in unsub_cache_get([mid]):
+                continue
+            full = gget(f"/messages/{mid}", format="full", fields=_BODY_FIELDS)
+            _t, html = _decode_body(full.get("payload", {}))
+            info = find_body_unsubscribe(html)
+            unsub_cache_put(mid, info["httpsUrl"] if info else "")
+            if info:
+                found_pending = True
+        except Exception:
+            log.exception("unsub body scan failed for %s", mid)
+        finally:
+            _unsub_q.task_done()
+        # Coalesce UI refreshes: nudge the browser once a backfill batch drains, not per hit.
+        if found_pending and _unsub_q.empty():
+            SYNC["version"] += 1
+            found_pending = False
+        time.sleep(0.05)  # gentle on the Gmail per-second quota
+
+
+def apply_body_unsub(rows):
+    """For list rows with no header-based unsubscribe, fill in a body-buried opt-out from
+    the cache, and enqueue a background scan for any not yet cached (shows next refresh)."""
+    need = [r for r in rows if not r.get("unsub") and r.get("messageId")]
+    if not need:
+        return
+    cached = unsub_cache_get([r["messageId"] for r in need])
+    missing = []
+    for r in need:
+        mid = r["messageId"]
+        if mid in cached:
+            url = cached[mid]
+            if url:
+                r["unsub"] = {"available": True, "method": "link", "httpsUrl": url,
+                              "mailto": None, "mailtoSubject": "unsubscribe", "source": "body"}
+        else:
+            missing.append(mid)
+    if missing:
+        enqueue_unsub_scan(missing)
 
 
 # ----------------------------------------------------------------------------
@@ -1822,6 +1941,7 @@ def start_background():
     except Exception as e:
         print(f"[auth] deferred: {e}")
     threading.Thread(target=_history_loop, daemon=True).start()
+    threading.Thread(target=_unsub_scan_loop, daemon=True).start()
 
 
 def run_server():
