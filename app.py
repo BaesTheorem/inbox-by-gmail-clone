@@ -363,6 +363,44 @@ def parse_unsubscribe(headers):
             "mailto": mailto, "mailtoSubject": mailto_subject}
 
 
+# Phrases that mark an opt-out link, matched against the link text AND the words right
+# around it — so we catch both a plain "Unsubscribe" link and "Click here if you do not
+# wish to receive emails from us" where only "Click here" is the anchor.
+_UNSUB_RE = re.compile(
+    r"unsubscrib|opt[\s\-]?out|wish\s+to\s+receive|no\s+longer\s+(?:wish|want)|"
+    r"stop\s+receiving|stop\s+these\s+e-?mails|cancel\s+(?:your\s+)?subscription|"
+    r"manage\s+(?:your\s+)?(?:e-?mail\s+)?(?:preferences|subscriptions?)|"
+    r"e-?mail\s+preferences|manage\s+subscriptions?|remove\s+(?:me|from\s+(?:this\s+)?list)",
+    re.I)
+
+
+def find_body_unsubscribe(html):
+    """Last-resort unsubscribe link for senders that omit the List-Unsubscribe header but
+    bury the opt-out in the body. Scans each <a>: prefers a link whose own text says
+    unsubscribe; otherwise falls back to one whose surrounding sentence does (the
+    'Click here if you do not wish to receive…' pattern). Returns the same shape as
+    parse_unsubscribe (always method 'link' — we never auto-POST a body link), or None."""
+    if not html:
+        return None
+    def strip(s):
+        return _htmlmod.unescape(re.sub(r"<[^>]+>", " ", s or ""))
+    fallback = None
+    for m in re.finditer(r'<a\b[^>]*?href=(["\'])(.*?)\1[^>]*?>(.*?)</a>', html, re.I | re.S):
+        href = _htmlmod.unescape(m.group(2)).strip()
+        if not href.lower().startswith("http"):
+            continue
+        inner = strip(m.group(3))
+        if _UNSUB_RE.search(inner):
+            return {"available": True, "method": "link", "httpsUrl": href,
+                    "mailto": None, "mailtoSubject": "unsubscribe", "source": "body"}
+        # Context window on either side of the anchor catches the phrasing-around-a-bare-link case.
+        ctx = strip(html[max(0, m.start() - 200):m.start()]) + " " + inner + " " + strip(html[m.end():m.end() + 200])
+        if fallback is None and _UNSUB_RE.search(ctx):
+            fallback = {"available": True, "method": "link", "httpsUrl": href,
+                        "mailto": None, "mailtoSubject": "unsubscribe", "source": "body"}
+    return fallback
+
+
 def _decode_body(payload):
     """Return (text, html) walking the MIME tree."""
     text, html = "", ""
@@ -667,6 +705,14 @@ def fetch_thread(thread_id):
             "docLinks": extract_doc_links(html),
             "unread": "UNREAD" in m.get("labelIds", []),
         })
+    # No List-Unsubscribe header? Fall back to an opt-out link buried in the body, newest
+    # message first — so senders that hide unsubscribe in the body still get the banner.
+    if not unsub:
+        for m in reversed(messages):
+            bu = find_body_unsubscribe(m.get("html"))
+            if bu:
+                unsub, unsub_mid = bu, m.get("id")
+                break
     reply_draft = None
     if draft_msg:
         try:
@@ -1636,7 +1682,12 @@ def api_unsubscribe():
                    metadataHeaders=["List-Unsubscribe", "List-Unsubscribe-Post", "From", "Subject"])
         info = parse_unsubscribe(msg.get("payload", {}).get("headers", []))
         if not info:
-            return jsonify({"error": "no List-Unsubscribe header"}), 400
+            # No List-Unsubscribe header — fall back to an opt-out link buried in the body.
+            full = gget(f"/messages/{mid}", format="full")
+            _t, _h = _decode_body(full.get("payload", {}))
+            info = find_body_unsubscribe(_h)
+            if not info:
+                return jsonify({"error": "no unsubscribe link found"}), 400
 
         if info["method"] == "one-click":
             if not _is_safe_public_url(info["httpsUrl"]):
