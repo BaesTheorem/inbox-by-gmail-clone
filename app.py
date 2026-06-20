@@ -1931,6 +1931,143 @@ def api_undo_things():
         return jsonify({"error": str(e)}), 500
 
 
+# ---------- addy.io aliases (disposable email) ----------
+# Key lives in the harness disposable-email/secrets.json (canonical home, gitignored)
+# so the alias.py CLI and this app share one credential. Falls back to a local
+# credentials/addy.json if the harness path isn't present.
+ADDY_BASE = "https://app.addy.io/api/v1"
+_ADDY_SECRET_PATHS = [
+    os.path.expanduser("~/Documents/Exobrain harness/disposable-email/secrets.json"),
+    os.path.join(CRED_DIR, "addy.json"),
+]
+
+
+def _addy_cfg():
+    for p in _ADDY_SECRET_PATHS:
+        if os.path.exists(p):
+            try:
+                c = json.load(open(p))
+                if c.get("addy_api_key"):
+                    return c
+            except Exception:
+                pass
+    return None
+
+
+def _addy_req(method, path, body=None):
+    """Call the addy.io API. Returns (status_code, parsed_json_or_None)."""
+    cfg = _addy_cfg()
+    if not cfg:
+        return 0, {"error": "addy not configured"}
+    headers = {
+        "Authorization": "Bearer " + cfg["addy_api_key"],
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    r = requests.request(method, ADDY_BASE + path, headers=headers,
+                         json=body, timeout=20)
+    data = None
+    if r.text:
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+    return r.status_code, data
+
+
+def _addy_alias_row(a):
+    """Trim addy's verbose alias object to what the UI needs."""
+    return {
+        "id": a.get("id"),
+        "email": a.get("email"),
+        "active": a.get("active"),
+        "description": a.get("description") or "",
+        "forwarded": a.get("emails_forwarded", 0),
+        "blocked": a.get("emails_blocked", 0),
+        "replied": a.get("emails_replied", 0),
+        "sent": a.get("emails_sent", 0),
+        "created": (a.get("created_at") or "")[:10],
+        "last_forwarded": a.get("last_forwarded"),
+    }
+
+
+@app.route("/api/aliases")
+def api_aliases():
+    """List addy.io aliases + account quota (free plan caps active shared aliases)."""
+    if not _addy_cfg():
+        return jsonify({"configured": False})
+    sc, data = _addy_req("GET", "/aliases")
+    if sc != 200 or not data:
+        return jsonify({"configured": True, "error": "list failed (%s)" % sc,
+                        "aliases": []}), 200
+    rows = [_addy_alias_row(a) for a in data.get("data", [])]
+    rows.sort(key=lambda r: r["created"], reverse=True)
+    acc_sc, acc = _addy_req("GET", "/account-details")
+    quota = {}
+    if acc_sc == 200 and acc:
+        d = acc["data"]
+        quota = {
+            "active": d.get("active_shared_domain_alias_count", 0),
+            "limit": d.get("active_shared_domain_alias_limit", 0),
+            "domain": d.get("default_alias_domain", "anonaddy.me"),
+            "recipient_count": d.get("recipient_count", 0),
+            "bandwidth": d.get("bandwidth", 0),
+            "bandwidth_limit": d.get("bandwidth_limit", 0),
+            "plan": d.get("subscription", ""),
+        }
+    return jsonify({"configured": True, "aliases": rows, "quota": quota})
+
+
+@app.route("/api/aliases", methods=["POST"])
+def api_alias_create():
+    """Mint a new alias. Body: {description}. Forwards to the addy default recipient."""
+    cfg = _addy_cfg()
+    if not cfg:
+        return jsonify({"error": "addy not configured"}), 400
+    desc = (request.json or {}).get("description", "").strip()
+    body = {"domain": cfg.get("addy_domain", "anonaddy.me"), "description": desc}
+    sc, data = _addy_req("POST", "/aliases", body)
+    if sc not in (200, 201) or not data:
+        msg = (data or {}).get("message") or "create failed (%s)" % sc
+        return jsonify({"error": msg}), 400
+    return jsonify({"ok": True, "alias": _addy_alias_row(data["data"])})
+
+
+@app.route("/api/alias_toggle", methods=["POST"])
+def api_alias_toggle():
+    """Activate/deactivate an alias. Body: {id, active}. Deactivated aliases bounce mail
+    and free a slot against the free-plan active cap."""
+    b = request.json or {}
+    aid, active = b.get("id"), b.get("active")
+    if not aid:
+        return jsonify({"error": "missing id"}), 400
+    if active:
+        sc, _ = _addy_req("POST", "/active-aliases", {"id": aid})
+        ok = sc in (200, 201)
+    else:
+        sc, _ = _addy_req("DELETE", "/active-aliases/" + aid)
+        ok = sc in (200, 204)
+    return (jsonify({"ok": True}) if ok
+            else (jsonify({"error": "toggle failed (%s)" % sc}), 400))
+
+
+@app.route("/api/alias_delete", methods=["POST"])
+def api_alias_delete():
+    """Delete an alias. Body: {id, forget}. forget=true permanently removes it
+    (frees the slot AND lets the local part be reused); otherwise a soft delete
+    that bounces future mail but keeps stats."""
+    b = request.json or {}
+    aid = b.get("id")
+    if not aid:
+        return jsonify({"error": "missing id"}), 400
+    if b.get("forget"):
+        sc, _ = _addy_req("DELETE", "/aliases/" + aid + "/forget")
+    else:
+        sc, _ = _addy_req("DELETE", "/aliases/" + aid)
+    return (jsonify({"ok": True}) if sc in (200, 204)
+            else (jsonify({"error": "delete failed (%s)" % sc}), 400))
+
+
 def start_background():
     """Migrate the DB, start the Deferred Action Engine, trigger auth, poll history."""
     migrate_db()

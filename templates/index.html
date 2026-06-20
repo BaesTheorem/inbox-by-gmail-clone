@@ -94,6 +94,7 @@
     <a class="nav-item" data-view="done"><i class="material-icons">done</i> Done</a>
     <a class="nav-item" data-view="drafts"><i class="material-icons">drafts</i> Drafts</a>
     <a class="nav-item" data-view="sent"><i class="material-icons">send</i> Sent</a>
+    <a class="nav-item" data-panel="aliases"><i class="material-icons">alternate_email</i> Aliases</a>
     <div class="nav-sep">Bundles</div>
     <div id="navBundles"></div>
   </nav>
@@ -264,6 +265,21 @@
   </div>
 </div>
 
+<!-- Aliases panel (addy.io disposable email) -->
+<div class="modal-overlay center" id="aliasOverlay" hidden>
+  <div class="settings-card alias-card">
+    <div class="compose-head">Email aliases
+      <span class="alias-quota" id="aliasQuota"></span>
+      <button class="icon-btn" id="aliasClose"><i class="material-icons">close</i></button>
+    </div>
+    <div class="alias-new">
+      <input type="text" id="aliasDesc" placeholder="What's this alias for? (e.g. jagex, newegg trial)" maxlength="80">
+      <button class="send-btn" id="aliasCreate"><i class="material-icons">add</i> Mint</button>
+    </div>
+    <div class="settings-body alias-body" id="aliasList"></div>
+  </div>
+</div>
+
 <!-- Snooze menu -->
 <div class="snooze-menu" id="snoozeMenu" hidden>
   <div class="snooze-title">Snooze until…</div>
@@ -287,6 +303,6 @@
 <div class="snackbar" id="snackbar" hidden><span id="snackText"></span><button id="snackUndo">UNDO</button></div>
 
 <script>window.OPEN_THREAD = {{ open_thread|tojson }};</script>
-<script src="/static/app.js?v=56"></script>
+<script src="/static/app.js?v=59"></script>
 </body>
 </html>
