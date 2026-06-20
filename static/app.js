@@ -625,12 +625,11 @@ function openSnoozeFromSwipe(el, row) { openSnooze(el.querySelector(".act-snooze
 // srcdoc. data: images and inline styles still render; remote http(s) images don't.
 const IMG_CSP = '<meta http-equiv="Content-Security-Policy" content="img-src data:; style-src \'unsafe-inline\' data:; font-src data:; default-src \'none\'">';
 const HAS_REMOTE_IMG = /<img[^>]+src=["']?https?:/i;
-// Force every email link to default to a new browsing context. The srcdoc sandbox omits
-// allow-popups, so WKWebView BLOCKS that navigation entirely — a link physically cannot
-// load inside the app window, even in the brief window before our JS routing attaches.
-// Our click handler (routeIframeLinks) then hands the URL to the real browser. This is the
-// native safety net behind the JS routing: pywebview only sends target=_blank links to the
-// browser, never normal in-frame clicks, so without this a link navigates the app in-place.
+// Force every email link to default to a new browsing context. Paired with the iframe's
+// allow-popups sandbox flag, this routes every click through pywebview's createWebView
+// delegate, which opens the link's real URL in the default browser. pywebview only sends
+// target=_blank links to the browser (never normal in-frame clicks), so without this a link
+// would just navigate the app in-place. See stripIframeLinkTargets for the full mechanism.
 const BASE_BLANK = '<base target="_blank">';
 
 function renderMsgBody(mb, m, forceImages) {
@@ -649,14 +648,21 @@ function renderMsgBody(mb, m, forceImages) {
   const f = document.createElement("iframe");
   // allow-same-origin (NEVER allow-scripts) lets the parent read the email DOM for
   // height + link routing; email JS stays disabled by the sandbox spec.
-  f.setAttribute("sandbox", "allow-same-origin");
+  // allow-popups is REQUIRED: BASE_BLANK makes every link target a new context, and a
+  // sandbox without allow-popups BLOCKS that navigation outright — the click reaches
+  // neither pywebview's native external-link handler nor (when the iframe's load event
+  // misfires) our JS router, so links silently do nothing. With allow-popups the _blank
+  // click reaches pywebview's createWebView handler, which opens it in the real browser.
+  // No popup window ever appears: pywebview intercepts and returns nil. Email JS still
+  // can't open windows — that needs allow-scripts, which we never grant.
+  f.setAttribute("sandbox", "allow-same-origin allow-popups");
   f.style.width = "100%";
   f.style.minHeight = "120px";
-  // Route links as soon as the email DOM is reachable. We can't rely on the iframe `load`
-  // event alone: for srcdoc content in WKWebView it fires unreliably, and when it doesn't,
-  // links keep their real href. So we also poll. The readiness gate (about:srcdoc URL, or a
-  // populated body) skips the transient about:blank document the iframe shows before the
-  // srcdoc commits — otherwise we'd attach to the wrong doc and never route the real one.
+  // Once the email DOM is reachable, size the frame to its content and strip explicit link
+  // targets (see stripIframeLinkTargets). We can't rely on the iframe `load` event alone —
+  // for srcdoc content in WKWebView it fires unreliably — so we also poll. The readiness
+  // gate (about:srcdoc URL, or a populated body) skips the transient about:blank document
+  // the iframe shows before the srcdoc commits.
   const routeWhenReady = () => {
     let tries = 0;
     const tick = () => {
@@ -665,7 +671,7 @@ function renderMsgBody(mb, m, forceImages) {
         const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
         if (doc && doc.body && (doc.URL === "about:srcdoc" || doc.body.children.length > 0)) {
           f.style.height = (doc.body.scrollHeight + 24) + "px";
-          routeIframeLinks(doc);
+          stripIframeLinkTargets(doc);
           ok = true;
         }
       } catch (e) {}
@@ -678,41 +684,19 @@ function renderMsgBody(mb, m, forceImages) {
   f.srcdoc = BASE_BLANK + (blocked ? IMG_CSP : "") + m.html;
   routeWhenReady();
 }
-// Resolve an email link to the URL it was AUTHORED with. We must read the raw href
-// attribute, not a.href: the IDL property resolves relative to the iframe's base,
-// which for a srcdoc frame is the app's own 127.0.0.1 origin — so an absolute
-// https link would otherwise come back as http://127.0.0.1:5008/… and fail to load.
-function externalHref(a) {
-  const raw = (a.getAttribute("href") || "").trim();
-  if (/^(https?:|mailto:|tel:)/i.test(raw)) return raw;
-  if (raw.startsWith("//")) return "https:" + raw;
-  return null; // app-relative or javascript:/# — never navigate the app to it
-}
-// Route every link inside a rendered email out to the system browser. We NEUTRALIZE
-// each external link — stash the real URL in data-exturl and set href="#" — so the
-// WKWebView physically cannot navigate the app window to it (pywebview otherwise
-// allows same-frame link navigation, which is how links opened "inside the inbox").
-// A delegated capture-phase listener then opens the stashed URL externally.
-function routeIframeLinks(doc) {
-  // Neutralize every link (re-run safe: poll may call this more than once as the email
-  // finishes laying out). Real URL goes to data-exturl; href becomes "#" so even a click
-  // that races the handler can't navigate.
-  doc.querySelectorAll("a[href]").forEach((a) => {
-    a.removeAttribute("target");
-    const url = externalHref(a);
-    if (url) { a.dataset.exturl = url; a.setAttribute("href", "#"); }
-  });
-  // Attach the capture-phase opener exactly once per document.
-  if (doc.__inboxExtRouted) return;
-  doc.__inboxExtRouted = true;
-  const handler = (e) => {
-    const a = e.target.closest && e.target.closest("a[data-exturl]");
-    if (!a) return;
-    e.preventDefault();
-    openExternal(a.dataset.exturl);
-  };
-  doc.addEventListener("click", handler, true);
-  doc.addEventListener("auxclick", handler, true);
+// Email links open in the system browser entirely through pywebview's NATIVE handler:
+// BASE_BLANK makes every link target a new browsing context, allow-popups lets that click
+// reach pywebview's createWebView delegate, and the delegate hands the link's real URL to
+// the default browser (no popup window ever appears). We tried routing clicks in JS, but in
+// this WKWebView the in-iframe click listener never fires, so the native path is the only
+// reliable one — and it reads the link's own resolved URL.
+//
+// So JS must do exactly one thing and NOT a second: strip any EXPLICIT target on a link
+// (target="_self"/"_top" would override BASE_BLANK and navigate the app in-frame). It must
+// NOT rewrite href — a placeholder like "#" resolves to the app's own 127.0.0.1 origin, so
+// the native handler would open the app instead of the link (the bug we just had).
+function stripIframeLinkTargets(doc) {
+  doc.querySelectorAll("a[target]").forEach((a) => a.removeAttribute("target"));
 }
 
 async function openThread(tid) {
@@ -1288,6 +1272,7 @@ async function discardDraft(draftId) {
 // ---------- Nav ----------
 document.querySelectorAll(".nav-item").forEach((n) => {
   n.onclick = () => {
+    if (n.dataset.panel === "aliases") { openAliases(); return; }
     document.querySelectorAll(".nav-item").forEach((x) => x.classList.remove("active"));
     n.classList.add("active");
     STATE.view = n.dataset.view;
@@ -1495,6 +1480,87 @@ $("#settingsSave").onclick = async () => {
   toast("Settings saved");
 };
 
+// ---------- Aliases (addy.io disposable email) ----------
+async function openAliases() {
+  $("#aliasOverlay").hidden = false;
+  await loadAliases();
+}
+async function loadAliases() {
+  const list = $("#aliasList");
+  list.innerHTML = '<div class="alias-empty">Loading…</div>';
+  const d = await api("/api/aliases");
+  if (!d || d.configured === false) {
+    $("#aliasQuota").textContent = "";
+    list.innerHTML = '<div class="alias-empty">addy.io isn\'t configured. Add your API key to '
+      + '<code>disposable-email/secrets.json</code>.</div>';
+    return;
+  }
+  const q = d.quota || {};
+  if (q.limit) {
+    const full = q.active >= q.limit;
+    $("#aliasQuota").innerHTML = `<span class="${full ? "quota-full" : ""}">${q.active}/${q.limit} active</span>`
+      + (q.plan ? ` · ${esc(q.plan)}` : "");
+    $("#aliasCreate").disabled = full;
+    $("#aliasCreate").title = full ? "At the free-plan limit — deactivate or delete one first" : "";
+  } else {
+    $("#aliasQuota").textContent = "";
+  }
+  const rows = d.aliases || [];
+  if (!rows.length) {
+    list.innerHTML = '<div class="alias-empty">No aliases yet. Mint one above — it forwards into this inbox.</div>';
+    return;
+  }
+  list.innerHTML = "";
+  rows.forEach((a) => list.appendChild(aliasEl(a)));
+}
+function aliasEl(a) {
+  const el = document.createElement("div");
+  el.className = "alias-row" + (a.active ? "" : " inactive");
+  const stats = [];
+  if (a.forwarded) stats.push(`${a.forwarded} fwd`);
+  if (a.replied) stats.push(`${a.replied} repl`);
+  if (a.blocked) stats.push(`${a.blocked} blocked`);
+  el.innerHTML = `
+    <div class="alias-main">
+      <div class="alias-addr">${esc(a.email)}
+        <button class="alias-copy icon-btn" title="Copy address"><i class="material-icons">content_copy</i></button>
+      </div>
+      <div class="alias-meta">${a.description ? esc(a.description) + " · " : ""}${esc(a.created)}${stats.length ? " · " + stats.join(" · ") : ""}${a.active ? "" : " · <span class=\"alias-off\">deactivated</span>"}</div>
+    </div>
+    <div class="alias-actions">
+      <button class="alias-toggle" title="${a.active ? "Deactivate (bounce mail, free a slot)" : "Reactivate"}">
+        <i class="material-icons">${a.active ? "toggle_on" : "toggle_off"}</i></button>
+      <button class="alias-del" title="Delete permanently (forget)"><i class="material-icons">delete_outline</i></button>
+    </div>`;
+  el.querySelector(".alias-copy").onclick = () => {
+    navigator.clipboard.writeText(a.email); toast("Copied " + a.email);
+  };
+  el.querySelector(".alias-toggle").onclick = async () => {
+    const r = await post("/api/alias_toggle", { id: a.id, active: !a.active });
+    if (r.ok) loadAliases(); else toast(r.error || "Failed");
+  };
+  el.querySelector(".alias-del").onclick = async () => {
+    if (!confirm(`Delete ${a.email} permanently? This frees the slot and can't be undone.`)) return;
+    const r = await post("/api/alias_delete", { id: a.id, forget: true });
+    if (r.ok) { toast("Alias deleted"); loadAliases(); } else toast(r.error || "Failed");
+  };
+  return el;
+}
+$("#aliasClose").onclick = () => ($("#aliasOverlay").hidden = true);
+$("#aliasOverlay").addEventListener("click", (e) => { if (e.target.id === "aliasOverlay") $("#aliasOverlay").hidden = true; });
+$("#aliasCreate").onclick = async () => {
+  const desc = $("#aliasDesc").value.trim();
+  $("#aliasCreate").disabled = true;
+  const r = await post("/api/aliases", { description: desc });
+  $("#aliasCreate").disabled = false;
+  if (r.ok) {
+    $("#aliasDesc").value = "";
+    if (r.alias && r.alias.email) { navigator.clipboard.writeText(r.alias.email); toast("Minted + copied " + r.alias.email); }
+    loadAliases();
+  } else { toast(r.error || "Create failed"); }
+};
+$("#aliasDesc").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#aliasCreate").click(); });
+
 // ---------- Keyboard help ----------
 const HELP_ROWS = [
   ["j / k", "Move down / up"], ["Enter or o", "Open conversation"],
@@ -1530,6 +1596,7 @@ const COMMANDS = [
   { label: "Go to Drafts", icon: "drafts", run: () => gotoView("drafts") },
   { label: "Go to Sent", icon: "send", run: () => gotoView("sent") },
   { label: "Refresh", icon: "refresh", run: () => load() },
+  { label: "Email aliases", icon: "alternate_email", run: () => openAliases() },
   { label: "Open settings", icon: "settings", run: () => openSettings() },
   { label: "Toggle pinned only", icon: "push_pin", run: () => { $("#pinnedOnly").checked = !$("#pinnedOnly").checked; render(); } },
   { label: "Keyboard shortcuts", icon: "keyboard", run: () => openHelp() },

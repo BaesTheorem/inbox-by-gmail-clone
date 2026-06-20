@@ -345,3 +345,30 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 :root[data-theme="dark"] .reply-body{background:var(--bg-card);color:var(--text-primary)}
 :root[data-theme="dark"] .msg .mbody iframe{background:#fff;border-radius:4px}
 :root[data-theme="dark"] .empty .material-icons{color:#8a6d00}
+
+/* ---------- Aliases panel (addy.io) ---------- */
+.alias-card{width:560px;max-width:94vw;display:flex;flex-direction:column;max-height:84vh}
+.alias-quota{margin-left:auto;margin-right:10px;font-size:12px;font-weight:400;color:#cfcfcf}
+.alias-quota .quota-full{color:#ffb4ab;font-weight:600}
+.alias-new{display:flex;gap:8px;padding:12px 14px;border-bottom:1px solid var(--divider)}
+.alias-new input{flex:1;height:40px;padding:0 12px;border:1px solid var(--divider);background:var(--bg-card);color:var(--text-primary);font-size:14px}
+.alias-new .send-btn{height:40px}
+.alias-new .send-btn:disabled{opacity:.45;cursor:not-allowed}
+.alias-body{padding:0;overflow-y:auto}
+.alias-empty{padding:24px 16px;color:var(--text-secondary);text-align:center;font-size:13px}
+.alias-empty code{background:var(--bg-page);padding:1px 5px;border:1px solid var(--divider)}
+.alias-row{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--divider)}
+.alias-row:hover{background:var(--bg-page)}
+.alias-row.inactive{opacity:.55}
+.alias-main{flex:1;min-width:0}
+.alias-addr{display:flex;align-items:center;gap:4px;font-family:monospace;font-size:13px;color:var(--text-primary);word-break:break-all}
+.alias-addr .alias-copy{width:24px;height:24px;flex-shrink:0}
+.alias-addr .alias-copy .material-icons{font-size:15px;color:var(--text-secondary)}
+.alias-meta{font-size:12px;color:var(--text-secondary);margin-top:2px}
+.alias-off{color:var(--fab-red)}
+.alias-actions{display:flex;gap:2px;flex-shrink:0}
+.alias-actions button{background:none;border:0;cursor:pointer;width:32px;height:32px;display:inline-flex;align-items:center;justify-content:center;color:var(--text-secondary)}
+.alias-actions button:hover{background:var(--divider)}
+.alias-toggle .material-icons{font-size:22px}
+.alias-row:not(.inactive) .alias-toggle .material-icons{color:var(--done-green)}
+.alias-del:hover{color:var(--fab-red)}
