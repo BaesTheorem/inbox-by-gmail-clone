@@ -119,6 +119,11 @@ function cardEl(row) {
     ? `<div class="chips">${row.highlights.map((h) => `<span class="chip"><i class="material-icons">${h.icon}</i>${esc(h.text)}</span>`).join("")}</div>`
     : "";
   const wakeHtml = row.wake ? `<div class="wake"><i class="material-icons">schedule</i>${esc(row.wake)}</div>` : "";
+  const aliasHtml = row.alias
+    ? `<div class="chips"><span class="chip alias-chip${row.alias.active ? "" : " dead"}" title="${esc(row.alias.description || row.alias.alias)}"><i class="material-icons">alternate_email</i>via ${esc(row.alias.alias)}${row.alias.active
+        ? '<button class="alias-kill" title="Deactivate this alias (mail to it bounces)"><i class="material-icons">block</i></button>'
+        : " · off"}</span></div>`
+    : "";
   // In the Done view the triage actions (pin/snooze/label/done) don't apply; show a
   // persistent "Move back to Inbox" instead, alongside Send to Things 3.
   const inDone = STATE.view === "done";
@@ -149,11 +154,11 @@ function cardEl(row) {
       </div>
       <div class="subject">${esc(row.subject)}</div>
       <div class="snippet">${esc(row.snippet)}</div>
-      ${chipsHtml}${attHtml}${wakeHtml}
+      ${aliasHtml}${chipsHtml}${attHtml}${wakeHtml}
     </div>
     ${actionsHtml}`;
   el.addEventListener("click", (e) => {
-    if (e.target.closest(".actions") || e.target.closest(".unsub-link") || e.target.closest(".select") || e.target.closest(".att-chip") || e.target.closest(".doc-chip")) return;
+    if (e.target.closest(".actions") || e.target.closest(".unsub-link") || e.target.closest(".select") || e.target.closest(".att-chip") || e.target.closest(".doc-chip") || e.target.closest(".alias-chip")) return;
     openThread(row.id);
   });
   // Doc/Drive links fetched lazily for this row (see enrichDocLinks) — render if cached.
@@ -172,6 +177,14 @@ function cardEl(row) {
   wire(".act-restore", (e) => { e.stopPropagation(); doRestore(row); });
   const ul = el.querySelector(".unsub-link");
   if (ul) ul.onclick = (e) => { e.stopPropagation(); doUnsub(row.messageId, ul, row.sender); };
+  const ak = el.querySelector(".alias-kill");
+  if (ak) ak.onclick = async (e) => {
+    e.stopPropagation();
+    if (!confirm(`Deactivate ${row.alias.alias}? Mail to it will bounce. You can reactivate it in Aliases.`)) return;
+    const r = await post("/api/alias_toggle", { id: row.alias.id, active: false });
+    if (r.ok) { const c = ak.closest(".alias-chip"); c.classList.add("dead"); ak.remove(); c.insertAdjacentText("beforeend", " · off"); toast("Alias deactivated"); }
+    else toast(r.error || "Failed");
+  };
   enableSwipe(el, row);
   return el;
 }
@@ -722,6 +735,19 @@ async function openThread(tid) {
   reader.dataset.rfcChain = (t.allRfcIds || []).join(" ");
   reader.dataset.subject = t.subject;
   reader.dataset.muted = t.muted ? "1" : "";
+  // Reply-via-alias: if this thread arrived to an active alias, offer (and default to)
+  // sending the reply through addy so the contact never sees the real Gmail address.
+  const aliasWrap = $("#replyViaAlias");
+  if (t.alias && t.alias.active) {
+    reader.dataset.alias = t.alias.alias;
+    $("#replyViaAliasChk").checked = true;
+    $("#replyViaAliasLabel").textContent = "as " + t.alias.alias;
+    aliasWrap.hidden = false;
+  } else {
+    reader.dataset.alias = "";
+    $("#replyViaAliasChk").checked = false;
+    aliasWrap.hidden = true;
+  }
   // Reply vs Reply-all recipient sets (minus self)
   const last = t.messages[t.messages.length - 1] || {};
   const me = (STATE.email || "").toLowerCase();
@@ -857,6 +883,7 @@ async function sendReply(all) {
   fd.append("threadId", r.dataset.tid);
   fd.append("inReplyTo", r.dataset.rfc);
   fd.append("references", r.dataset.rfcChain || "");
+  if (r.dataset.alias && $("#replyViaAliasChk").checked) fd.append("viaAlias", r.dataset.alias);
   if (STATE.replyDraftId) fd.append("draftId", STATE.replyDraftId); // server deletes the autosaved draft on send
   (STATE.replyAttachments || []).forEach((f) => fd.append("attachments", f, f.name));
   const btns = [$("#replySend"), $("#replySendAll")];
@@ -968,9 +995,28 @@ function openCompose(opts = {}) {
   renderAttachChips();
   renderFwdChips();
   $("#composeDiscard").style.display = STATE.composeDraftId ? "" : "none";
+  populateFromSelector(opts.from);
   $("#composeOverlay").hidden = false;
   applyComposeExpanded(); // restore the remembered full-screen / compact state
   setTimeout(() => (opts.to ? $("#cBody") : $("#cTo")).focus(), 30);
+}
+// Fill the compose "From" dropdown: real Gmail (default) + active addy aliases.
+// Picking an alias routes the send through addy so the recipient only sees the alias.
+async function populateFromSelector(preferred) {
+  const sel = $("#cFrom"), row = $("#cFromRow");
+  sel.innerHTML = `<option value="">${esc(STATE.email || "me")}</option>`;
+  row.hidden = false;
+  try {
+    const d = await api("/api/aliases");
+    if (!d || d.configured === false) return;
+    (d.aliases || []).filter((a) => a.active).forEach((a) => {
+      const o = document.createElement("option");
+      o.value = a.email;
+      o.textContent = a.email + (a.description ? " — " + a.description : "");
+      sel.appendChild(o);
+    });
+    if (preferred) sel.value = preferred;
+  } catch (e) { /* addy optional — leave just the real address */ }
 }
 function renderFwdChips() {
   const wrap = $("#cFwdAttachments");
@@ -1079,6 +1125,8 @@ async function doComposeSend(sendAt) {
   fd.append("html", $("#cBody").innerHTML);
   fd.append("text", $("#cBody").innerText);
   if (STATE.composeDraftId) fd.append("draftId", STATE.composeDraftId);
+  const fromAlias = $("#cFrom") && $("#cFrom").value;
+  if (fromAlias) fd.append("viaAlias", fromAlias);
   if (sendAt) fd.append("sendAt", String(sendAt));
   (STATE.attachments || []).forEach((f) => fd.append("attachments", f, f.name));
   const btn = $("#composeSend"); btn.disabled = true;

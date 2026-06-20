@@ -9,7 +9,7 @@
 <link rel="apple-touch-icon" href="/static/favicon.png">
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css?v=55">
+<link rel="stylesheet" href="/static/style.css?v=56">
 </head>
 <body>
 <header class="appbar">
@@ -141,6 +141,10 @@
         <span class="tb-sep"></span>
         <button type="button" class="tb-btn" id="rAttach" title="Attach files"><i class="material-icons">attach_file</i></button>
         <span id="replySaveStatus" class="save-status"></span>
+        <label id="replyViaAlias" class="reply-alias" hidden title="Send through addy so they only see your alias, not your real address">
+          <input type="checkbox" id="replyViaAliasChk">
+          <i class="material-icons">alternate_email</i><span id="replyViaAliasLabel">as alias</span>
+        </label>
       </div>
       <div id="replyBox" class="reply-body" contenteditable="true" data-placeholder="Reply…"></div>
       <div id="rAttachments" class="attach-list"></div>
@@ -155,6 +159,10 @@
 <div class="modal-overlay" id="composeOverlay" hidden>
   <div class="compose-card" id="composeCard">
     <div class="compose-head"><span id="composeTitle">New message</span><span class="ch-actions"><button class="icon-btn" id="composeExpand" title="Full screen"><i class="material-icons">open_in_full</i></button><button class="icon-btn" id="composeClose" title="Close"><i class="material-icons">close</i></button></span></div>
+    <div class="addr-row from-row" id="cFromRow" hidden>
+      <label class="from-label" for="cFrom">From</label>
+      <select id="cFrom"></select>
+    </div>
     <div class="addr-row">
       <input id="cTo" placeholder="To" autocomplete="off">
       <div class="cc-toggles">
@@ -274,7 +282,7 @@
     </div>
     <div class="alias-new">
       <input type="text" id="aliasDesc" placeholder="What's this alias for? (e.g. jagex, newegg trial)" maxlength="80">
-      <button class="send-btn" id="aliasCreate"><i class="material-icons">add</i> Mint</button>
+      <button class="send-btn wide" id="aliasCreate"><i class="material-icons">add</i> Mint</button>
     </div>
     <div class="settings-body alias-body" id="aliasList"></div>
   </div>
@@ -303,6 +311,6 @@
 <div class="snackbar" id="snackbar" hidden><span id="snackText"></span><button id="snackUndo">UNDO</button></div>
 
 <script>window.OPEN_THREAD = {{ open_thread|tojson }};</script>
-<script src="/static/app.js?v=59"></script>
+<script src="/static/app.js?v=60"></script>
 </body>
 </html>

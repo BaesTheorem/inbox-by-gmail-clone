@@ -538,6 +538,7 @@ def thread_summary(msg, outgoing=False):
     snippet = msg.get("snippet", "")
     unsub = None
     bulk = False
+    alias = None
     if outgoing:
         name, addr = _parse_addr(_header(headers, "To"))
         sender = "To: " + (name or "(no recipient)")
@@ -547,6 +548,7 @@ def thread_summary(msg, outgoing=False):
         sender = name
         bundle = _bundle_for(labels, subject, name, snippet)
         unsub = parse_unsubscribe(headers)
+        alias = _detect_alias(headers)
         # Bulk/promo mail: treat inline images as decoration (hide them as attachments)
         bulk = bool(unsub) or any(l in CATEGORY_BUNDLES for l in labels)
     atts = [dict(a, messageId=msg.get("id"))
@@ -566,6 +568,7 @@ def thread_summary(msg, outgoing=False):
         "bundle": bundle,
         "highlights": [] if outgoing else compute_highlights(subject, snippet, bundle),
         "unsub": unsub,
+        "alias": alias,
         "attachments": atts,
         "permalink": gmail_permalink(msg.get("threadId")),
     }
@@ -676,6 +679,7 @@ def fetch_thread(thread_id):
     unsub = None
     unsub_mid = None
     muted = False
+    alias = None  # the addy alias this thread arrived to, if any (for reply-via-alias)
     draft_msg = None  # (message_id, html) of an unsent reply draft living in this thread
     for m in thread.get("messages", []):
         # An autosaved reply rides in the thread as a DRAFT message — don't render it as
@@ -692,6 +696,8 @@ def fetch_thread(thread_id):
         if rfc_id:
             last_rfc_id = rfc_id
             all_rfc_ids.append(rfc_id)
+        if alias is None:
+            alias = _detect_alias(headers)
         u = parse_unsubscribe(headers)
         if u:
             unsub, unsub_mid = u, m.get("id")  # prefer the most recent message's list-unsubscribe
@@ -738,6 +744,7 @@ def fetch_thread(thread_id):
         "muted": muted,
         "unsub": unsub,
         "unsubMessageId": unsub_mid,
+        "alias": alias,
         "replyDraft": reply_draft,
     }
 
@@ -1589,6 +1596,24 @@ def api_relabel():
         return jsonify({"error": str(e)}), 500
 
 
+def _addy_encode_to(addr_str, alias):
+    """Rewrite a comma-separated recipient list into addy's send-from-alias form so
+    the outbound mail goes through addy and the contact only ever sees the alias:
+    `aliasLocal+contactLocal=contactDomain@aliasDomain`. The message is still sent
+    from the verified Gmail recipient, which is what addy requires."""
+    if not addr_str or not alias or "@" not in alias:
+        return addr_str
+    a_local, a_domain = alias.rsplit("@", 1)
+    out = []
+    for part in addr_str.split(","):
+        _, email_addr = _parse_addr(part.strip())
+        if not email_addr or "@" not in email_addr:
+            continue
+        r_local, r_domain = email_addr.rsplit("@", 1)
+        out.append("%s+%s=%s@%s" % (a_local, r_local, r_domain, a_domain))
+    return ", ".join(out)
+
+
 @app.route("/api/send", methods=["POST"])
 def api_send():
     ctype = request.content_type or ""
@@ -1601,6 +1626,7 @@ def api_send():
         references = f.get("references") or None
         draft_id = f.get("draftId") or None
         send_at = f.get("sendAt") or None
+        via_alias = f.get("viaAlias") or None
         attachments = [(fl.filename, fl.mimetype, fl.read()) for fl in request.files.getlist("attachments")]
     else:
         d = request.json or {}
@@ -1611,6 +1637,15 @@ def api_send():
         references = d.get("references")
         draft_id, attachments = d.get("draftId"), []
         send_at = d.get("sendAt")
+        via_alias = d.get("viaAlias")
+    # Send through an alias: encode every recipient so addy relays it as the alias
+    # and the contact never sees the real Gmail address.
+    if via_alias:
+        to = _addy_encode_to(to, via_alias)
+        if cc:
+            cc = _addy_encode_to(cc, via_alias)
+        if bcc:
+            bcc = _addy_encode_to(bcc, via_alias)
     try:
         raw = _build_raw_message(to, subject, body_text, cc=cc, bcc=bcc,
                                  in_reply_to=in_reply_to, references=references,
@@ -1991,6 +2026,62 @@ def _addy_alias_row(a):
     }
 
 
+# --- Tier 2: tag inbound mail with which alias it arrived to ---
+_ADDY_ALIAS_CACHE = {"ts": 0.0, "map": {}}
+_ADDY_CACHE_LOCK = threading.Lock()
+_ADDY_CACHE_TTL = 60  # seconds; alias set changes rarely, refetch is cheap
+_ADDR_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+# Headers addy/Gmail may carry the original alias recipient in, most specific first.
+_ALIAS_HEADERS = ("X-AnonAddy-Original-Recipient", "X-Original-To", "Delivered-To",
+                  "X-Forwarded-To", "To", "Cc")
+
+
+def _alias_map():
+    """email_lower -> {id, active, description}, cached briefly. Empty if addy off."""
+    if not _addy_cfg():
+        return {}
+    now = time.time()
+    with _ADDY_CACHE_LOCK:
+        if now - _ADDY_ALIAS_CACHE["ts"] < _ADDY_CACHE_TTL and _ADDY_ALIAS_CACHE["map"]:
+            return _ADDY_ALIAS_CACHE["map"]
+    sc, data = _addy_req("GET", "/aliases")
+    if sc != 200 or not data:
+        return _ADDY_ALIAS_CACHE["map"]  # serve stale on transient error
+    m = {}
+    for a in data.get("data", []):
+        if a.get("email"):
+            m[a["email"].lower()] = {"id": a.get("id"), "active": a.get("active"),
+                                     "description": a.get("description") or ""}
+    with _ADDY_CACHE_LOCK:
+        _ADDY_ALIAS_CACHE["ts"] = now
+        _ADDY_ALIAS_CACHE["map"] = m
+    return m
+
+
+def _addy_cache_bust():
+    with _ADDY_CACHE_LOCK:
+        _ADDY_ALIAS_CACHE["ts"] = 0.0
+
+
+def _detect_alias(headers):
+    """If an inbound message arrived to one of the user's addy aliases, return
+    {alias, id, active, description}; else None. Matches recipient headers against
+    the known alias set, so it's domain-agnostic (custom shared domains work too)."""
+    m = _alias_map()
+    if not m:
+        return None
+    for hname in _ALIAS_HEADERS:
+        val = _header(headers, hname)
+        if not val:
+            continue
+        for addr in _ADDR_RE.findall(val):
+            hit = m.get(addr.lower())
+            if hit:
+                return {"alias": addr.lower(), "id": hit["id"],
+                        "active": hit["active"], "description": hit["description"]}
+    return None
+
+
 @app.route("/api/aliases")
 def api_aliases():
     """List addy.io aliases + account quota (free plan caps active shared aliases)."""
@@ -2030,6 +2121,7 @@ def api_alias_create():
     if sc not in (200, 201) or not data:
         msg = (data or {}).get("message") or "create failed (%s)" % sc
         return jsonify({"error": msg}), 400
+    _addy_cache_bust()
     return jsonify({"ok": True, "alias": _addy_alias_row(data["data"])})
 
 
@@ -2047,6 +2139,8 @@ def api_alias_toggle():
     else:
         sc, _ = _addy_req("DELETE", "/active-aliases/" + aid)
         ok = sc in (200, 204)
+    if ok:
+        _addy_cache_bust()
     return (jsonify({"ok": True}) if ok
             else (jsonify({"error": "toggle failed (%s)" % sc}), 400))
 
@@ -2064,6 +2158,8 @@ def api_alias_delete():
         sc, _ = _addy_req("DELETE", "/aliases/" + aid + "/forget")
     else:
         sc, _ = _addy_req("DELETE", "/aliases/" + aid)
+    if sc in (200, 204):
+        _addy_cache_bust()
     return (jsonify({"ok": True}) if sc in (200, 204)
             else (jsonify({"error": "delete failed (%s)" % sc}), 400))
 
