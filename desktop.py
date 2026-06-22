@@ -8,6 +8,7 @@
 #   "pywebview",
 #   "pyobjc-framework-Cocoa",
 #   "pyobjc-framework-WebKit",
+#   "setproctitle",
 # ]
 # ///
 """
