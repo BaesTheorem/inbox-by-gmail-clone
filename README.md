@@ -104,18 +104,6 @@ External links *inside emails* are routed to the default browser via pywebview's
   expanded bundles + selection). No manual Refresh needed. Requires `threaded=True` on the
   Flask server. (Chosen over Gmail Pub/Sub push, which needs a public HTTPS endpoint
   a 127.0.0.1 app can't provide without a tunnel.)
-- **Templates + auto-reply** (Gmail's "Advanced → Templates" plus the vacation responder,
-  in one panel — drawer **Templates**, ⌘K, or Settings → Advanced). Save reusable replies
-  (name / subject / rich body) and insert them while composing via the toolbar article
-  button (toggle the whole feature off under Settings → Advanced). The **auto-reply** reads
-  and writes Gmail's real vacation responder over `gmail.settings.basic` (`/settings/vacation`),
-  with a first/last day and contacts-only restriction. Each template can carry an optional
-  **expiration date** — Gmail has no such thing. An expired template drops out of the compose
-  picker, can't be selected as an auto-reply, and if it's *driving* the active auto-reply the
-  responder is switched off automatically the moment it expires (a `template_expire` job on the
-  Deferred Action Engine). When a template drives the auto-reply, its expiration also caps the
-  responder's "last day" — the auto-reply can never outlive the template behind it. State lives
-  in the `templates` table in `snooze.db`; the picker hits `GET /api/templates?active=1`.
 
 ## Not yet built
 - Snooze-by-location (geofencing isn't feasible from a local web app; Inbox itself
