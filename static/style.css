@@ -428,3 +428,16 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .tmpl-menu a:hover{background:rgba(0,0,0,.05)}
 .tmpl-menu a .material-icons{font-size:18px;color:var(--text-secondary)}
 .tmpl-menu-empty{padding:10px 14px;font-size:13px;color:var(--text-secondary)}
+
+/* ---------- Filters editor ---------- */
+.fe-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
+.fe-grid .set-field{margin:6px 0}
+.fe-grid .set-field.row{align-items:center}
+.fe-grid input[type=text]{padding:9px 10px;border:1px solid var(--divider);border-radius:6px;font:inherit;font-size:14px;background:var(--bg-card);color:var(--text-primary)}
+.fe-grid select{padding:8px;border:1px solid var(--divider);border-radius:6px;font:inherit;background:var(--bg-card);color:var(--text-primary)}
+.fe-actions-head{margin:14px 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-secondary);font-weight:500}
+.fe-actions-head small{text-transform:none;letter-spacing:0;font-weight:400}
+.fe-actions{display:grid;grid-template-columns:1fr 1fr;gap:4px 14px}
+.fe-actions label.row{display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer}
+.set-field small{font-weight:400;color:var(--text-secondary)}
+#filterNew{margin-left:auto;margin-right:8px}

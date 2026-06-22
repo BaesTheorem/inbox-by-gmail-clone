@@ -9,7 +9,7 @@
 <link rel="apple-touch-icon" href="/static/favicon.png">
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css?v=57">
+<link rel="stylesheet" href="/static/style.css?v=58">
 </head>
 <body>
 <header class="appbar">
@@ -96,6 +96,7 @@
     <a class="nav-item" data-view="sent"><i class="material-icons">send</i> Sent</a>
     <a class="nav-item" data-panel="aliases"><i class="material-icons">alternate_email</i> Aliases</a>
     <a class="nav-item" data-panel="templates"><i class="material-icons">article</i> Templates</a>
+    <a class="nav-item" data-panel="filters"><i class="material-icons">filter_alt</i> Filters</a>
     <div class="nav-sep">Bundles</div>
     <div id="navBundles"></div>
   </nav>
@@ -280,6 +281,10 @@
         <span>Templates &amp; auto-reply</span>
         <button type="button" class="set-link-btn" id="setOpenTemplates"><i class="material-icons">article</i> Manage templates &amp; auto-reply…</button>
       </label>
+      <label class="set-field">
+        <span>Filters</span>
+        <button type="button" class="set-link-btn" id="setOpenFilters"><i class="material-icons">filter_alt</i> Manage filters &amp; send-template rules…</button>
+      </label>
     </div>
     <div class="compose-foot"><button class="send-btn wide" id="settingsSave"><i class="material-icons">check</i> Save</button></div>
   </div>
@@ -374,6 +379,62 @@
   </div>
 </div>
 
+<!-- Filters panel (Gmail filters + app-native send-template rules) -->
+<div class="modal-overlay center" id="filterOverlay" hidden>
+  <div class="settings-card tmpl-card">
+    <div class="compose-head">Filters
+      <button class="set-link-btn" id="filterNew"><i class="material-icons">add</i> New filter</button>
+      <button class="icon-btn" id="filterClose"><i class="material-icons">close</i></button>
+    </div>
+    <div class="settings-body tmpl-body">
+      <div class="tmpl-hint" id="filterTemplateHint" hidden></div>
+      <div class="tmpl-list" id="filterList"></div>
+
+      <!-- Filter editor -->
+      <div class="tmpl-editor" id="filterEditor" hidden>
+        <div class="fe-grid">
+          <label class="set-field"><span>From</span><input type="text" id="feFrom" placeholder="sender@example.com, other@x.com"></label>
+          <label class="set-field"><span>To</span><input type="text" id="feTo" placeholder="recipient"></label>
+          <label class="set-field"><span>Subject</span><input type="text" id="feSubject" placeholder="subject contains"></label>
+          <label class="set-field"><span>Has the words</span><input type="text" id="feQuery" placeholder="words anywhere"></label>
+          <label class="set-field"><span>Doesn't have</span><input type="text" id="feNot" placeholder="exclude (Gmail-side only)"></label>
+          <label class="set-field row"><input type="checkbox" id="feHasAttach"><span>Has attachment</span></label>
+        </div>
+
+        <div class="fe-actions-head">Do this</div>
+        <div class="fe-actions">
+          <label class="row"><input type="checkbox" id="aArchive"><span>Skip inbox (archive)</span></label>
+          <label class="row"><input type="checkbox" id="aMarkRead"><span>Mark as read</span></label>
+          <label class="row"><input type="checkbox" id="aStar"><span>Star it</span></label>
+          <label class="row"><input type="checkbox" id="aDelete"><span>Delete it</span></label>
+          <label class="row"><input type="checkbox" id="aImportant"><span>Mark important</span></label>
+          <label class="row"><input type="checkbox" id="aNeverSpam"><span>Never send to spam</span></label>
+        </div>
+        <div class="fe-grid">
+          <label class="set-field"><span>Apply label</span>
+            <select id="aLabel"><option value="">— none —</option></select></label>
+          <label class="set-field"><span>Forward to <small>(must be a verified Gmail forwarding address)</small></span>
+            <input type="text" id="aForward" placeholder="forward@example.com"></label>
+        </div>
+
+        <div class="fe-actions-head">Send a template <small>(handled by this app, not Gmail)</small></div>
+        <div class="fe-grid">
+          <label class="set-field"><span>Auto-reply with template</span>
+            <select id="aTemplate"><option value="">— none —</option></select></label>
+          <label class="set-field row"><input type="checkbox" id="aOncePerSender" checked><span>Only reply once per sender</span></label>
+          <label class="set-field row"><input type="checkbox" id="aEnabled" checked><span>Rule active</span></label>
+        </div>
+        <div class="tmpl-hint" id="feSendWarn" hidden>Heads up: an active send-template rule emails people automatically when matching mail arrives. The app skips no-reply addresses, mailing lists, and auto-responders to avoid loops, and replies at most once per sender.</div>
+
+        <div class="tmpl-editor-foot">
+          <button class="discard-btn" id="feCancel">Cancel</button>
+          <button class="send-btn" id="feSave"><i class="material-icons">check</i> Create filter</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Snooze menu -->
 <div class="snooze-menu" id="snoozeMenu" hidden>
   <div class="snooze-title">Snooze until…</div>
@@ -397,6 +458,6 @@
 <div class="snackbar" id="snackbar" hidden><span id="snackText"></span><button id="snackUndo">UNDO</button></div>
 
 <script>window.OPEN_THREAD = {{ open_thread|tojson }};</script>
-<script src="/static/app.js?v=61"></script>
+<script src="/static/app.js?v=62"></script>
 </body>
 </html>
