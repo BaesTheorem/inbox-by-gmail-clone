@@ -858,6 +858,18 @@ def migrate_db():
         https_url  TEXT NOT NULL DEFAULT '',
         checked_at INTEGER NOT NULL
     )""")
+    # Templates ("canned responses"). expires_at is the grafted feature Gmail lacks:
+    # an epoch-seconds cutoff after which the template is hidden from the compose
+    # picker and can no longer drive the auto-reply. NULL = never expires.
+    conn.execute("""CREATE TABLE IF NOT EXISTS templates (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        subject    TEXT NOT NULL DEFAULT '',
+        body_html  TEXT NOT NULL DEFAULT '',
+        expires_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    )""")
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     if "snoozed" in tables:
         now = int(time.time())
@@ -884,6 +896,7 @@ SETTINGS_DEFAULTS = {
     "image_block": False,          # show remote images by default (toggle in Settings to block)
     "page_size": 50,
     "followup_default_days": 3,
+    "templates_enabled": True,     # Gmail "Advanced → Templates" toggle: surface templates in compose
 }
 
 
@@ -906,6 +919,66 @@ def _set_setting(key, value):
                      (key, json.dumps(value)))
         conn.commit()
         conn.close()
+
+
+# ---------- Templates ("canned responses") ----------
+def _template_row(r):
+    """Map a templates row tuple to a dict, computing the live `expired` flag."""
+    tid, name, subject, body, expires_at, created_at, updated_at = r
+    return {
+        "id": tid, "name": name, "subject": subject, "body_html": body,
+        "expires_at": expires_at,
+        "expired": bool(expires_at and expires_at <= int(time.time())),
+        "created_at": created_at, "updated_at": updated_at,
+    }
+
+
+def _list_templates(active_only=False):
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, name, subject, body_html, expires_at, created_at, updated_at "
+        "FROM templates ORDER BY LOWER(name)").fetchall()
+    conn.close()
+    out = [_template_row(r) for r in rows]
+    if active_only:
+        out = [t for t in out if not t["expired"]]
+    return out
+
+
+def _get_template(tid):
+    conn = db()
+    r = conn.execute(
+        "SELECT id, name, subject, body_html, expires_at, created_at, updated_at "
+        "FROM templates WHERE id=?", (tid,)).fetchone()
+    conn.close()
+    return _template_row(r) if r else None
+
+
+# ---------- Vacation responder (Gmail "Auto-reply", settings.basic scope) ----------
+def _get_vacation():
+    """Raw Gmail vacation settings. Times are epoch-millis strings (or absent)."""
+    return gget("/settings/vacation")
+
+
+def _set_vacation(body):
+    return gput("/settings/vacation", json=body)
+
+
+def _disable_vacation_if_driven_by(template_id):
+    """Turn the auto-reply off if it is currently being driven by this template.
+    Called when a template expires so an expired template can't keep replying."""
+    if _get_setting("autoreply_template_id", "") != template_id:
+        return False
+    try:
+        v = _get_vacation()
+        if v.get("enableAutoReply"):
+            v["enableAutoReply"] = False
+            _set_vacation(v)
+            log.info("auto-reply disabled: driving template %s expired", template_id)
+            return True
+    except Exception:
+        log.exception("failed to disable expired-template auto-reply")
+    return False
 
 
 # ---------- Deferred Action Engine ----------
@@ -1000,11 +1073,25 @@ def _handle_followup_nudge(thread_id, message_id, payload):
         SYNC["version"] += 1
 
 
+def _handle_template_expire(thread_id, message_id, payload):
+    """A template's expiration date arrived. Verify it's still the live cutoff
+    (the user may have pushed it out or cleared it), then enforce: if this template
+    drives the active auto-reply, switch the auto-reply off. The template itself is
+    left in place but reads as `expired` and drops out of the compose picker."""
+    tid = payload.get("template_id")
+    t = _get_template(tid) if tid else None
+    if not t or not t["expired"]:
+        return  # template gone, or its cutoff was moved/cleared — nothing to do
+    _disable_vacation_if_driven_by(tid)
+    SYNC["version"] += 1
+
+
 _DAE_HANDLERS = {
     "snooze_wake": _handle_snooze_wake,
     "send_scheduled": _handle_send,
     "undo_send_commit": _handle_send,
     "followup_nudge": _handle_followup_nudge,
+    "template_expire": _handle_template_expire,
 }
 
 
@@ -1716,6 +1803,137 @@ def api_settings_post():
         if key in SETTINGS_DEFAULTS:
             _set_setting(key, value)
     return jsonify({"ok": True})
+
+
+# ----------------------------------------------------------------------------
+# Templates + Auto-reply (Gmail "Advanced → Templates" and the vacation responder)
+# ----------------------------------------------------------------------------
+def _schedule_template_expiry(template_id, expires_at):
+    """(Re)arm the DAE expiration for a template. Cancels any prior arming so an
+    edited cutoff supersedes the old one; a cleared/past cutoff just stays cancelled."""
+    _dae_cancel_kind_for_thread("template_expire", template_id)  # thread_id slot holds the template id
+    if expires_at and expires_at > int(time.time()):
+        _dae_enqueue("template_expire", expires_at, thread_id=template_id,
+                     payload={"template_id": template_id})
+
+
+@app.route("/api/templates", methods=["GET"])
+def api_templates_get():
+    # ?active=1 → only non-expired, for the compose picker.
+    active_only = request.args.get("active") in ("1", "true")
+    return jsonify({"templates": _list_templates(active_only=active_only),
+                    "enabled": bool(_get_setting("templates_enabled", True))})
+
+
+@app.route("/api/templates", methods=["POST"])
+def api_templates_post():
+    """Create or update a template (upsert by id). expires_at is epoch seconds or null."""
+    d = request.json or {}
+    name = (d.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "Name is required"}), 400
+    subject = d.get("subject") or ""
+    body = d.get("body_html") or ""
+    expires_at = d.get("expires_at")
+    expires_at = int(expires_at) if expires_at else None
+    now = int(time.time())
+    tid = d.get("id") or secrets.token_hex(8)
+    with _DAE_LOCK:
+        conn = db()
+        exists = conn.execute("SELECT created_at FROM templates WHERE id=?", (tid,)).fetchone()
+        created_at = exists[0] if exists else now
+        conn.execute(
+            "INSERT OR REPLACE INTO templates "
+            "(id, name, subject, body_html, expires_at, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (tid, name, subject, body, expires_at, created_at, now))
+        conn.commit()
+        conn.close()
+    _schedule_template_expiry(tid, expires_at)
+    return jsonify({"ok": True, "template": _get_template(tid)})
+
+
+@app.route("/api/template_delete", methods=["POST"])
+def api_template_delete():
+    tid = (request.json or {}).get("id")
+    if not tid:
+        return jsonify({"ok": False, "error": "Missing id"}), 400
+    _dae_cancel_kind_for_thread("template_expire", tid)
+    with _DAE_LOCK:
+        conn = db()
+        conn.execute("DELETE FROM templates WHERE id=?", (tid,))
+        conn.commit()
+        conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/vacation", methods=["GET"])
+def api_vacation_get():
+    """Current auto-reply state, normalized to seconds + the driving template id."""
+    try:
+        v = _get_vacation()
+    except Exception as exc:
+        log.exception("vacation get failed")
+        return jsonify({"ok": False, "error": str(exc)}), 502
+    def _sec(ms):
+        try:
+            return int(int(ms) / 1000)
+        except Exception:
+            return None
+    return jsonify({
+        "ok": True,
+        "enabled": bool(v.get("enableAutoReply")),
+        "subject": v.get("responseSubject") or "",
+        "body_html": v.get("responseBodyHtml") or v.get("responseBodyPlainText") or "",
+        "start": _sec(v.get("startTime")),
+        "end": _sec(v.get("endTime")),
+        "restrict_contacts": bool(v.get("restrictToContacts")),
+        "template_id": _get_setting("autoreply_template_id", ""),
+    })
+
+
+@app.route("/api/vacation", methods=["POST"])
+def api_vacation_post():
+    """Write the auto-reply. If driven by a template, pull subject/body from it and
+    clamp the end date to the template's expiration — that's the grafted expiry: the
+    auto-reply can never outlive the template behind it."""
+    d = request.json or {}
+    enabled = bool(d.get("enabled"))
+    subject = d.get("subject") or ""
+    body = d.get("body_html") or ""
+    start = d.get("start")
+    end = d.get("end")
+    template_id = (d.get("template_id") or "").strip()
+
+    if template_id:
+        t = _get_template(template_id)
+        if not t:
+            return jsonify({"ok": False, "error": "Template not found"}), 400
+        if t["expired"]:
+            return jsonify({"ok": False, "error": "That template has expired"}), 400
+        subject = t["subject"] or subject
+        body = t["body_html"] or body
+        # Graft: the template's expiration caps the auto-reply window.
+        if t["expires_at"]:
+            end = t["expires_at"] if not end else min(int(end), t["expires_at"])
+
+    body_obj = {
+        "enableAutoReply": enabled,
+        "responseSubject": subject,
+        "responseBodyHtml": body,
+        "restrictToContacts": bool(d.get("restrict_contacts")),
+    }
+    if start:
+        body_obj["startTime"] = int(start) * 1000
+    if end:
+        body_obj["endTime"] = int(end) * 1000
+    try:
+        _set_vacation(body_obj)
+    except Exception as exc:
+        log.exception("vacation set failed")
+        return jsonify({"ok": False, "error": str(exc)}), 502
+    _set_setting("autoreply_template_id", template_id)
+    return jsonify({"ok": True, "end": end})
 
 
 # Contact autocomplete — mined from sent-mail headers (covered by gmail.modify; no

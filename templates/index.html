@@ -9,7 +9,7 @@
 <link rel="apple-touch-icon" href="/static/favicon.png">
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css?v=56">
+<link rel="stylesheet" href="/static/style.css?v=57">
 </head>
 <body>
 <header class="appbar">
@@ -95,6 +95,7 @@
     <a class="nav-item" data-view="drafts"><i class="material-icons">drafts</i> Drafts</a>
     <a class="nav-item" data-view="sent"><i class="material-icons">send</i> Sent</a>
     <a class="nav-item" data-panel="aliases"><i class="material-icons">alternate_email</i> Aliases</a>
+    <a class="nav-item" data-panel="templates"><i class="material-icons">article</i> Templates</a>
     <div class="nav-sep">Bundles</div>
     <div id="navBundles"></div>
   </nav>
@@ -185,7 +186,9 @@
       <button type="button" class="tb-btn" data-cmd="removeFormat" title="Clear formatting"><i class="material-icons">format_clear</i></button>
       <span class="tb-sep"></span>
       <button type="button" class="tb-btn" id="cAttach" title="Attach files"><i class="material-icons">attach_file</i></button>
+      <button type="button" class="tb-btn" id="cTemplate" title="Insert template" hidden><i class="material-icons">article</i></button>
     </div>
+    <div class="tmpl-menu" id="cTemplateMenu" hidden></div>
     <div id="cBody" class="compose-body" contenteditable="true" data-placeholder="Compose email…"></div>
     <div id="cFwdAttachments" class="fwd-attach-list"></div>
     <div id="cAttachments" class="attach-list"></div>
@@ -268,6 +271,15 @@
           <option value="7">1 week</option>
         </select>
       </label>
+      <div class="set-divider">Advanced</div>
+      <label class="set-field row">
+        <input type="checkbox" id="setTemplatesEnabled">
+        <span>Templates — save reusable replies and insert them while composing</span>
+      </label>
+      <label class="set-field">
+        <span>Templates &amp; auto-reply</span>
+        <button type="button" class="set-link-btn" id="setOpenTemplates"><i class="material-icons">article</i> Manage templates &amp; auto-reply…</button>
+      </label>
     </div>
     <div class="compose-foot"><button class="send-btn wide" id="settingsSave"><i class="material-icons">check</i> Save</button></div>
   </div>
@@ -285,6 +297,80 @@
       <button class="send-btn wide" id="aliasCreate"><i class="material-icons">add</i> Mint</button>
     </div>
     <div class="settings-body alias-body" id="aliasList"></div>
+  </div>
+</div>
+
+<!-- Templates + auto-reply panel -->
+<div class="modal-overlay center" id="tmplOverlay" hidden>
+  <div class="settings-card tmpl-card">
+    <div class="compose-head">Templates &amp; auto-reply
+      <button class="icon-btn" id="tmplClose"><i class="material-icons">close</i></button>
+    </div>
+    <div class="settings-body tmpl-body">
+
+      <!-- Auto-reply (Gmail vacation responder) -->
+      <div class="tmpl-section">
+        <div class="tmpl-section-head">
+          <span>Auto-reply</span>
+          <label class="switch-inline"><input type="checkbox" id="arEnabled"> <span>On</span></label>
+        </div>
+        <div class="tmpl-ar-grid" id="arGrid">
+          <label class="set-field">
+            <span>Use template</span>
+            <select id="arTemplate"><option value="">Custom (write below)</option></select>
+          </label>
+          <div class="ar-dates">
+            <label class="set-field"><span>First day</span><input type="date" id="arStart"></label>
+            <label class="set-field"><span>Last day (auto-reply stops)</span><input type="date" id="arEnd"></label>
+          </div>
+          <label class="set-field" id="arSubjectField">
+            <span>Subject</span>
+            <input type="text" id="arSubject" placeholder="Out of office">
+          </label>
+          <label class="set-field" id="arBodyField">
+            <span>Message</span>
+            <div id="arBody" class="settings-sig" contenteditable="true" data-placeholder="I'm away and will reply when I'm back…"></div>
+          </label>
+          <label class="set-field row">
+            <input type="checkbox" id="arRestrict">
+            <span>Only reply to people in my contacts</span>
+          </label>
+          <div class="tmpl-hint" id="arExpiryHint" hidden></div>
+        </div>
+        <div class="tmpl-section-foot">
+          <button class="send-btn wide" id="arSave"><i class="material-icons">check</i> Save auto-reply</button>
+        </div>
+      </div>
+
+      <!-- Template library -->
+      <div class="tmpl-section">
+        <div class="tmpl-section-head">
+          <span>Saved templates</span>
+          <button class="set-link-btn" id="tmplNew"><i class="material-icons">add</i> New template</button>
+        </div>
+        <div class="tmpl-list" id="tmplList"></div>
+
+        <!-- Inline editor (hidden until New / Edit) -->
+        <div class="tmpl-editor" id="tmplEditor" hidden>
+          <input type="hidden" id="teId">
+          <label class="set-field"><span>Name</span><input type="text" id="teName" placeholder="e.g. Out of office" maxlength="80"></label>
+          <label class="set-field"><span>Subject</span><input type="text" id="teSubject" placeholder="Subject line (optional)"></label>
+          <label class="set-field">
+            <span>Body</span>
+            <div id="teBody" class="settings-sig" contenteditable="true" data-placeholder="Template body…"></div>
+          </label>
+          <label class="set-field">
+            <span>Expiration date <small>(optional — hides the template and stops any auto-reply it drives)</small></span>
+            <input type="date" id="teExpires">
+          </label>
+          <div class="tmpl-editor-foot">
+            <button class="discard-btn" id="teCancel">Cancel</button>
+            <button class="send-btn" id="teSave"><i class="material-icons">check</i> Save template</button>
+          </div>
+        </div>
+      </div>
+
+    </div>
   </div>
 </div>
 
@@ -311,6 +397,6 @@
 <div class="snackbar" id="snackbar" hidden><span id="snackText"></span><button id="snackUndo">UNDO</button></div>
 
 <script>window.OPEN_THREAD = {{ open_thread|tojson }};</script>
-<script src="/static/app.js?v=60"></script>
+<script src="/static/app.js?v=61"></script>
 </body>
 </html>

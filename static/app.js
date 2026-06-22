@@ -83,7 +83,10 @@ function applySettings(s) {
   document.documentElement.dataset.theme = dark ? "dark" : "light";
   STATE.imageBlock = s.image_block ?? false;
   STATE.undoSendWindow = s.undo_send_window ?? 10;
+  STATE.templatesEnabled = s.templates_enabled ?? true;
   if (s.page_size) PAGE = s.page_size;
+  const tb = $("#cTemplate");
+  if (tb) tb.hidden = !STATE.templatesEnabled;
 }
 
 function initials(name) {
@@ -1321,6 +1324,7 @@ async function discardDraft(draftId) {
 document.querySelectorAll(".nav-item").forEach((n) => {
   n.onclick = () => {
     if (n.dataset.panel === "aliases") { openAliases(); return; }
+    if (n.dataset.panel === "templates") { openTemplates(); return; }
     document.querySelectorAll(".nav-item").forEach((x) => x.classList.remove("active"));
     n.classList.add("active");
     STATE.view = n.dataset.view;
@@ -1508,6 +1512,7 @@ function openSettings() {
   $("#setDarkMode").value = s.dark_mode || "auto";
   $("#setImageBlock").checked = s.image_block ?? false;
   $("#setFollowupDays").value = String(s.followup_default_days ?? 3);
+  $("#setTemplatesEnabled").checked = s.templates_enabled ?? true;
   $("#settingsOverlay").hidden = false;
 }
 $("#settingsBtn").onclick = openSettings;
@@ -1520,6 +1525,7 @@ $("#settingsSave").onclick = async () => {
     dark_mode: $("#setDarkMode").value,
     image_block: $("#setImageBlock").checked,
     followup_default_days: +$("#setFollowupDays").value,
+    templates_enabled: $("#setTemplatesEnabled").checked,
   };
   STATE.settings = Object.assign(STATE.settings || {}, upd);
   applySettings(STATE.settings);
@@ -1527,6 +1533,7 @@ $("#settingsSave").onclick = async () => {
   $("#settingsOverlay").hidden = true;
   toast("Settings saved");
 };
+$("#setOpenTemplates").onclick = () => { $("#settingsOverlay").hidden = true; openTemplates(); };
 
 // ---------- Aliases (addy.io disposable email) ----------
 async function openAliases() {
@@ -1609,6 +1616,207 @@ $("#aliasCreate").onclick = async () => {
 };
 $("#aliasDesc").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#aliasCreate").click(); });
 
+// ---------- Templates + auto-reply ----------
+// Date<->epoch helpers. A "date" means the whole local day: expirations and the
+// auto-reply "last day" run through 23:59:59 so the chosen day is inclusive.
+function dateInputToEpoch(str, endOfDay) {
+  if (!str) return null;
+  const [y, m, d] = str.split("-").map(Number);
+  const dt = endOfDay ? new Date(y, m - 1, d, 23, 59, 59) : new Date(y, m - 1, d, 0, 0, 0);
+  return Math.floor(dt.getTime() / 1000);
+}
+function epochToDateInput(sec) {
+  if (!sec) return "";
+  const dt = new Date(sec * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}`;
+}
+function fmtExpiry(sec) {
+  return new Date(sec * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+STATE.templates = [];
+
+async function openTemplates() {
+  $("#tmplOverlay").hidden = false;
+  $("#tmplEditor").hidden = true;
+  await loadTemplates();
+  await loadAutoReply();
+}
+async function loadTemplates() {
+  const d = await api("/api/templates");
+  STATE.templates = (d && d.templates) || [];
+  renderTemplateList();
+  renderAutoReplyTemplateOptions();
+}
+function renderTemplateList() {
+  const list = $("#tmplList");
+  if (!STATE.templates.length) {
+    list.innerHTML = '<div class="tmpl-empty">No templates yet. Create one to reuse it in compose or as an auto-reply.</div>';
+    return;
+  }
+  list.innerHTML = "";
+  STATE.templates.forEach((t) => list.appendChild(templateRowEl(t)));
+}
+function templateRowEl(t) {
+  const el = document.createElement("div");
+  el.className = "tmpl-row" + (t.expired ? " expired" : "");
+  const expChip = t.expires_at
+    ? `<span class="tmpl-chip${t.expired ? " dead" : ""}"><i class="material-icons">schedule</i>${t.expired ? "Expired " : "Expires "}${fmtExpiry(t.expires_at)}</span>`
+    : "";
+  el.innerHTML = `
+    <div class="tmpl-main">
+      <div class="tmpl-name">${esc(t.name)} ${expChip}</div>
+      <div class="tmpl-sub">${esc(t.subject || "(no subject)")}</div>
+    </div>
+    <div class="tmpl-actions">
+      <button class="tmpl-edit icon-btn" title="Edit"><i class="material-icons">edit</i></button>
+      <button class="tmpl-del icon-btn" title="Delete"><i class="material-icons">delete_outline</i></button>
+    </div>`;
+  el.querySelector(".tmpl-edit").onclick = () => openTemplateEditor(t);
+  el.querySelector(".tmpl-del").onclick = async () => {
+    if (!confirm(`Delete template "${t.name}"?`)) return;
+    const r = await post("/api/template_delete", { id: t.id });
+    if (r.ok) { toast("Template deleted"); loadTemplates(); } else toast(r.error || "Failed");
+  };
+  return el;
+}
+function openTemplateEditor(t) {
+  t = t || {};
+  $("#teId").value = t.id || "";
+  $("#teName").value = t.name || "";
+  $("#teSubject").value = t.subject || "";
+  $("#teBody").innerHTML = t.body_html || "";
+  $("#teExpires").value = epochToDateInput(t.expires_at);
+  $("#tmplEditor").hidden = false;
+  $("#tmplEditor").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  $("#teName").focus();
+}
+$("#tmplNew").onclick = () => openTemplateEditor({});
+$("#teCancel").onclick = () => ($("#tmplEditor").hidden = true);
+$("#teSave").onclick = async () => {
+  const name = $("#teName").value.trim();
+  if (!name) { toast("Name is required"); return; }
+  const payload = {
+    id: $("#teId").value || undefined,
+    name,
+    subject: $("#teSubject").value,
+    body_html: $("#teBody").innerHTML,
+    expires_at: dateInputToEpoch($("#teExpires").value, true),
+  };
+  const r = await post("/api/templates", payload);
+  if (r.ok) { toast("Template saved"); $("#tmplEditor").hidden = true; loadTemplates(); }
+  else toast(r.error || "Save failed");
+};
+$("#tmplClose").onclick = () => ($("#tmplOverlay").hidden = true);
+$("#tmplOverlay").addEventListener("click", (e) => { if (e.target.id === "tmplOverlay") $("#tmplOverlay").hidden = true; });
+
+// --- Auto-reply (vacation responder) ---
+function renderAutoReplyTemplateOptions() {
+  const sel = $("#arTemplate");
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">Custom (write below)</option>';
+  STATE.templates.filter((t) => !t.expired).forEach((t) => {
+    const o = document.createElement("option");
+    o.value = t.id; o.textContent = t.name;
+    sel.appendChild(o);
+  });
+  sel.value = cur;
+}
+function applyAutoReplyTemplateMode() {
+  const usingTemplate = !!$("#arTemplate").value;
+  // When a template drives the reply, subject/body come from it — lock the fields.
+  $("#arSubjectField").style.display = usingTemplate ? "none" : "";
+  $("#arBodyField").style.display = usingTemplate ? "none" : "";
+  const t = STATE.templates.find((x) => x.id === $("#arTemplate").value);
+  const hint = $("#arExpiryHint");
+  if (t && t.expires_at) {
+    hint.hidden = false;
+    hint.textContent = `This template expires ${fmtExpiry(t.expires_at)} — the auto-reply will stop then, even if no last day is set.`;
+  } else { hint.hidden = true; }
+}
+$("#arTemplate").onchange = applyAutoReplyTemplateMode;
+async function loadAutoReply() {
+  let v;
+  try { v = await api("/api/vacation"); } catch (e) { v = null; }
+  if (!v || v.ok === false) {
+    $("#arGrid").classList.add("disabled-block");
+    toast("Couldn't load auto-reply settings");
+    return;
+  }
+  $("#arGrid").classList.remove("disabled-block");
+  $("#arEnabled").checked = v.enabled;
+  $("#arSubject").value = v.subject || "";
+  $("#arBody").innerHTML = v.body_html || "";
+  $("#arStart").value = epochToDateInput(v.start);
+  $("#arEnd").value = epochToDateInput(v.end);
+  $("#arRestrict").checked = v.restrict_contacts;
+  $("#arTemplate").value = v.template_id || "";
+  applyAutoReplyTemplateMode();
+}
+$("#arSave").onclick = async () => {
+  const payload = {
+    enabled: $("#arEnabled").checked,
+    template_id: $("#arTemplate").value,
+    subject: $("#arSubject").value,
+    body_html: $("#arBody").innerHTML,
+    start: dateInputToEpoch($("#arStart").value, false),
+    end: dateInputToEpoch($("#arEnd").value, true),
+    restrict_contacts: $("#arRestrict").checked,
+  };
+  $("#arSave").disabled = true;
+  const r = await post("/api/vacation", payload);
+  $("#arSave").disabled = false;
+  if (r.ok) {
+    toast($("#arEnabled").checked ? "Auto-reply on" : "Auto-reply off");
+    if (r.end) { $("#arEnd").value = epochToDateInput(r.end); }
+  } else toast(r.error || "Failed to save");
+};
+
+// --- Insert template into compose ---
+$("#cTemplate").onclick = async (e) => {
+  e.preventDefault();
+  const menu = $("#cTemplateMenu");
+  if (!menu.hidden) { menu.hidden = true; return; }
+  const d = await api("/api/templates?active=1");
+  const items = (d && d.templates) || [];
+  if (!items.length) {
+    menu.innerHTML = '<div class="tmpl-menu-empty">No templates yet. Add some in Templates.</div>';
+  } else {
+    menu.innerHTML = items.map((t) =>
+      `<a data-tid="${t.id}"><i class="material-icons">article</i>${esc(t.name)}</a>`).join("");
+  }
+  menu.hidden = false;
+};
+$("#cTemplateMenu").addEventListener("click", (e) => {
+  const a = e.target.closest("a[data-tid]");
+  if (!a) return;
+  const t = STATE.templates.find((x) => x.id === a.dataset.tid)
+    || null;
+  $("#cTemplateMenu").hidden = true;
+  // STATE.templates may be stale (panel never opened) — fetch the one we need.
+  insertTemplateIntoCompose(a.dataset.tid, t);
+});
+async function insertTemplateIntoCompose(tid, cached) {
+  let t = cached;
+  if (!t) {
+    const d = await api("/api/templates?active=1");
+    t = ((d && d.templates) || []).find((x) => x.id === tid);
+  }
+  if (!t) { toast("Template unavailable"); return; }
+  if (t.subject && !$("#cSubject").value.trim()) $("#cSubject").value = t.subject;
+  const body = $("#cBody");
+  body.focus();
+  if (!document.execCommand("insertHTML", false, t.body_html)) {
+    body.innerHTML = t.body_html + body.innerHTML;
+  }
+  draftDirty = true;
+}
+document.addEventListener("click", (e) => {
+  if (!e.target.closest("#cTemplate") && !e.target.closest("#cTemplateMenu"))
+    $("#cTemplateMenu").hidden = true;
+}, true);
+
 // ---------- Keyboard help ----------
 const HELP_ROWS = [
   ["j / k", "Move down / up"], ["Enter or o", "Open conversation"],
@@ -1645,6 +1853,7 @@ const COMMANDS = [
   { label: "Go to Sent", icon: "send", run: () => gotoView("sent") },
   { label: "Refresh", icon: "refresh", run: () => load() },
   { label: "Email aliases", icon: "alternate_email", run: () => openAliases() },
+  { label: "Templates & auto-reply", icon: "article", run: () => openTemplates() },
   { label: "Open settings", icon: "settings", run: () => openSettings() },
   { label: "Toggle pinned only", icon: "push_pin", run: () => { $("#pinnedOnly").checked = !$("#pinnedOnly").checked; render(); } },
   { label: "Keyboard shortcuts", icon: "keyboard", run: () => openHelp() },
