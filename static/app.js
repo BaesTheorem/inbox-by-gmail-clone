@@ -1325,6 +1325,7 @@ document.querySelectorAll(".nav-item").forEach((n) => {
   n.onclick = () => {
     if (n.dataset.panel === "aliases") { openAliases(); return; }
     if (n.dataset.panel === "templates") { openTemplates(); return; }
+    if (n.dataset.panel === "filters") { openFilters(); return; }
     document.querySelectorAll(".nav-item").forEach((x) => x.classList.remove("active"));
     n.classList.add("active");
     STATE.view = n.dataset.view;
@@ -1534,6 +1535,7 @@ $("#settingsSave").onclick = async () => {
   toast("Settings saved");
 };
 $("#setOpenTemplates").onclick = () => { $("#settingsOverlay").hidden = true; openTemplates(); };
+$("#setOpenFilters").onclick = () => { $("#settingsOverlay").hidden = true; openFilters(); };
 
 // ---------- Aliases (addy.io disposable email) ----------
 async function openAliases() {
@@ -1817,6 +1819,156 @@ document.addEventListener("click", (e) => {
     $("#cTemplateMenu").hidden = true;
 }, true);
 
+// ---------- Filters (Gmail filters + app-native send-template rules) ----------
+STATE.filterLabels = [];
+async function openFilters() {
+  $("#filterOverlay").hidden = false;
+  $("#filterEditor").hidden = true;
+  await loadFilters();
+}
+async function loadFilters() {
+  const list = $("#filterList");
+  list.innerHTML = '<div class="tmpl-empty">Loading…</div>';
+  let d;
+  try { d = await api("/api/filters"); } catch (e) { d = null; }
+  if (!d || d.ok === false) {
+    list.innerHTML = '<div class="tmpl-empty">Couldn\'t load filters.</div>';
+    return;
+  }
+  STATE.filterLabels = d.labels || [];
+  fillLabelSelect();
+  await fillFilterTemplateSelect();
+  const rows = [];
+  (d.filters || []).forEach((f) => rows.push(filterRowEl(f)));
+  (d.standalone_rules || []).forEach((r) => rows.push(ruleRowEl(r)));
+  if (!rows.length) {
+    list.innerHTML = '<div class="tmpl-empty">No filters yet. Create one to auto-organize mail or fire a template.</div>';
+    return;
+  }
+  list.innerHTML = "";
+  rows.forEach((el) => list.appendChild(el));
+}
+function critText(c) {
+  const parts = [];
+  if (c.from) parts.push(`from: ${c.from}`);
+  if (c.to) parts.push(`to: ${c.to}`);
+  if (c.subject) parts.push(`subject: ${c.subject}`);
+  if (c.query) parts.push(`has: ${c.query}`);
+  if (c.negatedQuery) parts.push(`not: ${c.negatedQuery}`);
+  if (c.hasAttachment) parts.push("has attachment");
+  return parts.join(" · ") || "(any message)";
+}
+function filterRowEl(f) {
+  const el = document.createElement("div");
+  el.className = "tmpl-row";
+  const acts = (f.actions || []).slice();
+  let ruleChip = "";
+  if (f.rule) {
+    acts.push(`Send template: ${f.rule.template_name}`);
+    if (!f.rule.enabled) ruleChip = '<span class="tmpl-chip dead">template off</span>';
+    else if (f.rule.template_expired) ruleChip = '<span class="tmpl-chip dead">template expired</span>';
+  }
+  el.innerHTML = `
+    <div class="tmpl-main">
+      <div class="tmpl-name">${esc(critText(f.criteria))} ${ruleChip}</div>
+      <div class="tmpl-sub">${acts.map(esc).join(" · ") || "(no actions)"}</div>
+    </div>
+    <div class="tmpl-actions">
+      <button class="f-del icon-btn" title="Delete filter"><i class="material-icons">delete_outline</i></button>
+    </div>`;
+  el.querySelector(".f-del").onclick = async () => {
+    if (!confirm("Delete this filter?" + (f.rule ? " Its send-template rule is removed too." : ""))) return;
+    const r = await post("/api/filter_delete", { gmail_filter_id: f.id });
+    if (r.ok) { toast("Filter deleted"); loadFilters(); } else toast(r.error || "Failed");
+  };
+  return el;
+}
+function ruleRowEl(r) {
+  const el = document.createElement("div");
+  el.className = "tmpl-row" + (r.enabled ? "" : " expired");
+  const chip = r.template_expired ? '<span class="tmpl-chip dead">template expired</span>' : "";
+  el.innerHTML = `
+    <div class="tmpl-main">
+      <div class="tmpl-name">${esc(critText({ from: r.from_q, subject: r.subject_q, query: r.query }))} ${chip}</div>
+      <div class="tmpl-sub">Send template: ${esc(r.template_name)}${r.once_per_sender ? " · once per sender" : ""} · app rule</div>
+    </div>
+    <div class="tmpl-actions">
+      <button class="r-toggle icon-btn" title="${r.enabled ? "Active — click to pause" : "Paused — click to activate"}"><i class="material-icons">${r.enabled ? "toggle_on" : "toggle_off"}</i></button>
+      <button class="r-del icon-btn" title="Delete rule"><i class="material-icons">delete_outline</i></button>
+    </div>`;
+  el.querySelector(".r-toggle").onclick = async () => {
+    const res = await post("/api/filter_toggle", { rule_id: r.id, enabled: !r.enabled });
+    if (res.ok) loadFilters(); else toast(res.error || "Failed");
+  };
+  el.querySelector(".r-del").onclick = async () => {
+    if (!confirm("Delete this send-template rule?")) return;
+    const res = await post("/api/filter_delete", { rule_id: r.id });
+    if (res.ok) { toast("Rule deleted"); loadFilters(); } else toast(res.error || "Failed");
+  };
+  return el;
+}
+function fillLabelSelect() {
+  const sel = $("#aLabel");
+  sel.innerHTML = '<option value="">— none —</option>';
+  STATE.filterLabels.forEach((l) => {
+    const o = document.createElement("option");
+    o.value = l.id; o.textContent = l.name;
+    sel.appendChild(o);
+  });
+}
+async function fillFilterTemplateSelect() {
+  const d = await api("/api/templates?active=1");
+  const sel = $("#aTemplate");
+  sel.innerHTML = '<option value="">— none —</option>';
+  ((d && d.templates) || []).forEach((t) => {
+    const o = document.createElement("option");
+    o.value = t.id; o.textContent = t.name;
+    sel.appendChild(o);
+  });
+}
+function openFilterEditor() {
+  ["feFrom", "feTo", "feSubject", "feQuery", "feNot", "aForward"].forEach((id) => ($("#" + id).value = ""));
+  ["feHasAttach", "aArchive", "aMarkRead", "aStar", "aDelete", "aImportant", "aNeverSpam"].forEach((id) => ($("#" + id).checked = false));
+  $("#aLabel").value = ""; $("#aTemplate").value = "";
+  $("#aOncePerSender").checked = true; $("#aEnabled").checked = true;
+  $("#feSendWarn").hidden = true;
+  $("#filterEditor").hidden = false;
+  $("#filterEditor").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  $("#feFrom").focus();
+}
+$("#filterNew").onclick = openFilterEditor;
+$("#feCancel").onclick = () => ($("#filterEditor").hidden = true);
+$("#aTemplate").onchange = () => ($("#feSendWarn").hidden = !$("#aTemplate").value);
+$("#filterClose").onclick = () => ($("#filterOverlay").hidden = true);
+$("#filterOverlay").addEventListener("click", (e) => { if (e.target.id === "filterOverlay") $("#filterOverlay").hidden = true; });
+$("#feSave").onclick = async () => {
+  const actions = [];
+  if ($("#aArchive").checked) actions.push("archive");
+  if ($("#aMarkRead").checked) actions.push("mark_read");
+  if ($("#aStar").checked) actions.push("star");
+  if ($("#aDelete").checked) actions.push("delete");
+  if ($("#aImportant").checked) actions.push("important");
+  if ($("#aNeverSpam").checked) actions.push("never_spam");
+  const payload = {
+    criteria: {
+      from: $("#feFrom").value, to: $("#feTo").value, subject: $("#feSubject").value,
+      query: $("#feQuery").value, negatedQuery: $("#feNot").value,
+      hasAttachment: $("#feHasAttach").checked,
+    },
+    actions,
+    label_id: $("#aLabel").value,
+    forward: $("#aForward").value,
+    template_id: $("#aTemplate").value,
+    once_per_sender: $("#aOncePerSender").checked,
+    enabled: $("#aEnabled").checked,
+  };
+  $("#feSave").disabled = true;
+  const r = await post("/api/filters", payload);
+  $("#feSave").disabled = false;
+  if (r.ok) { toast("Filter created"); $("#filterEditor").hidden = true; loadFilters(); }
+  else toast(r.error || "Failed");
+};
+
 // ---------- Keyboard help ----------
 const HELP_ROWS = [
   ["j / k", "Move down / up"], ["Enter or o", "Open conversation"],
@@ -1854,6 +2006,7 @@ const COMMANDS = [
   { label: "Refresh", icon: "refresh", run: () => load() },
   { label: "Email aliases", icon: "alternate_email", run: () => openAliases() },
   { label: "Templates & auto-reply", icon: "article", run: () => openTemplates() },
+  { label: "Filters & send-template rules", icon: "filter_alt", run: () => openFilters() },
   { label: "Open settings", icon: "settings", run: () => openSettings() },
   { label: "Toggle pinned only", icon: "push_pin", run: () => { $("#pinnedOnly").checked = !$("#pinnedOnly").checked; render(); } },
   { label: "Keyboard shortcuts", icon: "keyboard", run: () => openHelp() },

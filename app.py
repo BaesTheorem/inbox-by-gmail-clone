@@ -870,6 +870,28 @@ def migrate_db():
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     )""")
+    # App-native filter rules: the "send template" action Gmail's filter API can't
+    # express. When new mail matches the criteria, the app itself auto-replies with the
+    # template. gmail_filter_id links the optional Gmail-side filter (label/archive/etc.)
+    # created alongside, so one row in the UI = both halves.
+    conn.execute("""CREATE TABLE IF NOT EXISTS filter_rules (
+        id              TEXT PRIMARY KEY,
+        from_q          TEXT NOT NULL DEFAULT '',
+        subject_q       TEXT NOT NULL DEFAULT '',
+        query           TEXT NOT NULL DEFAULT '',
+        template_id     TEXT,
+        enabled         INTEGER NOT NULL DEFAULT 1,
+        once_per_sender INTEGER NOT NULL DEFAULT 1,
+        gmail_filter_id TEXT NOT NULL DEFAULT '',
+        created_at      INTEGER NOT NULL
+    )""")
+    # Dedupe ledger so once_per_sender holds across restarts.
+    conn.execute("""CREATE TABLE IF NOT EXISTS filter_rule_fires (
+        rule_id  TEXT NOT NULL,
+        sender   TEXT NOT NULL,
+        fired_at INTEGER NOT NULL,
+        PRIMARY KEY (rule_id, sender)
+    )""")
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     if "snoozed" in tables:
         now = int(time.time())
@@ -979,6 +1001,164 @@ def _disable_vacation_if_driven_by(template_id):
     except Exception:
         log.exception("failed to disable expired-template auto-reply")
     return False
+
+
+# ---------- Filter rules (app-native "send template" action) ----------
+# Gmail's filter API supports only addLabelIds / removeLabelIds / forward. The
+# "send template" action is web-UI-only and invisible to the API, so the app runs
+# it itself: the history poller matches new mail against enabled rules and replies
+# with the chosen template. Loop protection is non-negotiable — see _maybe_autoreply.
+_AUTOREPLY_MAX_PER_HOUR = 20        # global safety cap against any runaway
+_autoreply_times = []              # epoch secs of recent auto-sends (in-memory)
+_NOREPLY_RE = re.compile(
+    r"(no[-_.]?reply|do[-_.]?not[-_.]?reply|mailer-daemon|postmaster|bounce|notifications?@)",
+    re.I)
+
+
+def _rule_row(r):
+    (rid, from_q, subject_q, query, template_id, enabled,
+     once, gmail_filter_id, created_at) = r
+    return {"id": rid, "from_q": from_q, "subject_q": subject_q, "query": query,
+            "template_id": template_id, "enabled": bool(enabled),
+            "once_per_sender": bool(once), "gmail_filter_id": gmail_filter_id,
+            "created_at": created_at}
+
+
+def _list_rules(enabled_only=False):
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, from_q, subject_q, query, template_id, enabled, once_per_sender, "
+        "gmail_filter_id, created_at FROM filter_rules ORDER BY created_at DESC").fetchall()
+    conn.close()
+    out = [_rule_row(r) for r in rows]
+    if enabled_only:
+        out = [r for r in out if r["enabled"] and r["template_id"]]
+    return out
+
+
+def _rule_matches(rule, frm, subject, snippet):
+    """All specified criteria must hold (AND); a comma list in from_q is OR. A rule
+    with no criteria never matches — auto-replying to everything would be a disaster."""
+    frm, subject, snippet = frm.lower(), (subject or "").lower(), (snippet or "").lower()
+    has_any = False
+    if rule["from_q"].strip():
+        has_any = True
+        toks = [t.strip().lower() for t in rule["from_q"].split(",") if t.strip()]
+        if not any(t in frm for t in toks):
+            return False
+    if rule["subject_q"].strip():
+        has_any = True
+        if rule["subject_q"].strip().lower() not in subject:
+            return False
+    if rule["query"].strip():
+        has_any = True
+        if rule["query"].strip().lower() not in (subject + " " + snippet):
+            return False
+    return has_any
+
+
+def _already_fired(rule_id, sender):
+    conn = db()
+    row = conn.execute("SELECT 1 FROM filter_rule_fires WHERE rule_id=? AND sender=?",
+                       (rule_id, sender.lower())).fetchone()
+    conn.close()
+    return bool(row)
+
+
+def _record_fire(rule_id, sender):
+    with _DAE_LOCK:
+        conn = db()
+        conn.execute("INSERT OR REPLACE INTO filter_rule_fires (rule_id, sender, fired_at) "
+                     "VALUES (?,?,?)", (rule_id, sender.lower(), int(time.time())))
+        conn.commit()
+        conn.close()
+
+
+def _autoreply_rate_ok():
+    now = time.time()
+    _autoreply_times[:] = [t for t in _autoreply_times if now - t < 3600]
+    return len(_autoreply_times) < _AUTOREPLY_MAX_PER_HOUR
+
+
+def _maybe_autoreply(msg_id):
+    """Evaluate one newly-arrived message against enabled rules and fire templates.
+    Every guard here exists to prevent a mail loop or a reply to a robot/list."""
+    rules = _list_rules(enabled_only=True)
+    if not rules:
+        return
+    try:
+        msg = gget(f"/messages/{msg_id}", format="metadata", metadataHeaders=[
+            "From", "Subject", "Message-Id", "References", "Auto-Submitted",
+            "Precedence", "List-Id", "List-Unsubscribe", "X-Autoreply", "X-Autorespond"])
+    except Exception:
+        return
+    labels = msg.get("labelIds", [])
+    if "SENT" in labels or "DRAFT" in labels or "CHAT" in labels:
+        return  # never react to our own outgoing mail (loop guard #1)
+    hdrs = msg.get("payload", {}).get("headers", [])
+    frm_raw = _header(hdrs, "From") or ""
+    _, sender = _parse_addr(frm_raw)
+    if not sender or "@" not in sender:
+        return
+    if _user_email and sender.lower() == _user_email.lower():
+        return  # don't reply to ourselves (loop guard #2)
+    if _NOREPLY_RE.search(frm_raw):
+        return  # no-reply / daemon / bounce address (loop guard #3)
+    # Automated/bulk mail: replying invites mail loops and spams lists (loop guard #4).
+    if (_header(hdrs, "List-Id") or _header(hdrs, "List-Unsubscribe")
+            or _header(hdrs, "X-Autoreply") or _header(hdrs, "X-Autorespond")):
+        return
+    auto = (_header(hdrs, "Auto-Submitted") or "").lower()
+    if auto and auto != "no":
+        return
+    prec = (_header(hdrs, "Precedence") or "").lower()
+    if prec in ("bulk", "list", "junk"):
+        return
+
+    subject = _header(hdrs, "Subject") or ""
+    snippet = msg.get("snippet", "") or ""
+    msgid = _header(hdrs, "Message-Id")
+    refs = _header(hdrs, "References")
+    thread_id = msg.get("threadId")
+
+    for rule in rules:
+        if not _rule_matches(rule, sender, subject, snippet):
+            continue
+        if rule["once_per_sender"] and _already_fired(rule["id"], sender):
+            continue
+        t = _get_template(rule["template_id"])
+        if not t or t["expired"]:
+            continue  # expired template stops firing — same rule as the auto-reply
+        if not _autoreply_rate_ok():
+            log.warning("auto-reply rate cap hit; skipping rule %s for %s", rule["id"], sender)
+            break
+        re_subj = t["subject"] or (subject if subject.lower().startswith("re:")
+                                   else "Re: " + subject)
+        html = t["body_html"]
+        plain = re.sub(r"<[^>]+>", " ", html)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        try:
+            raw = _build_raw_message(sender, re_subj, plain, body_html=html,
+                                     in_reply_to=msgid, references=refs or msgid)
+            _send_raw(raw, thread_id=thread_id)
+            _autoreply_times.append(time.time())
+            _record_fire(rule["id"], sender)
+            log.info("auto-replied to %s via rule %s (template %s)",
+                     sender, rule["id"], t["name"])
+        except Exception:
+            log.exception("auto-reply send failed (rule %s)", rule["id"])
+        if rule["once_per_sender"]:
+            continue  # a sender gets at most one template per rule
+
+
+def _evaluate_rules_for(msg_ids):
+    if not msg_ids or not _list_rules(enabled_only=True):
+        return
+    for mid in msg_ids:
+        try:
+            _maybe_autoreply(mid)
+        except Exception:
+            log.exception("rule eval failed for %s", mid)
 
 
 # ---------- Deferred Action Engine ----------
@@ -1157,6 +1337,14 @@ def _history_loop():
                                  if "INBOX" in (ma.get("message", {}).get("labelIds") or [])]
                         if added:
                             enqueue_unsub_scan(added)
+                        # Auto-reply rules evaluate ALL new mail, not just INBOX: a Gmail
+                        # filter may strip INBOX (archive/delete) before we see it, but the
+                        # "send template" half still needs to fire.
+                        added_all = [ma["message"]["id"]
+                                     for h in resp["history"]
+                                     for ma in h.get("messagesAdded", [])]
+                        if added_all:
+                            _evaluate_rules_for(added_all)
                     SYNC["history_id"] = resp.get("historyId", SYNC["history_id"])
                 except GmailHTTPError as he:
                     # 404 = startHistoryId too old; reset cursor and force a refresh
@@ -1934,6 +2122,203 @@ def api_vacation_post():
         return jsonify({"ok": False, "error": str(exc)}), 502
     _set_setting("autoreply_template_id", template_id)
     return jsonify({"ok": True, "end": end})
+
+
+# ----------------------------------------------------------------------------
+# Filters — real Gmail filters (label/archive/delete/forward) PLUS the app-native
+# "send template" action Gmail's API can't express.
+# ----------------------------------------------------------------------------
+# Maps the Gmail "system" label ids a filter touches to friendly action labels, so
+# the panel reads like Gmail's own filter list instead of raw label ids.
+_FILTER_ADD_NAMES = {"TRASH": "Delete it", "STARRED": "Star it",
+                     "IMPORTANT": "Mark important", "UNREAD": "Mark unread",
+                     "SPAM": "Mark as spam"}
+_FILTER_REMOVE_NAMES = {"INBOX": "Skip inbox (archive)", "UNREAD": "Mark as read",
+                        "IMPORTANT": "Never mark important", "SPAM": "Never send to spam"}
+_CATEGORY_NAMES = {"CATEGORY_PERSONAL": "Primary", "CATEGORY_SOCIAL": "Social",
+                   "CATEGORY_PROMOTIONS": "Promotions", "CATEGORY_UPDATES": "Updates",
+                   "CATEGORY_FORUMS": "Forums"}
+
+
+def _label_name_map():
+    out = {}
+    for l in gget("/labels").get("labels", []):
+        out[l["id"]] = l["name"]
+    return out
+
+
+def _decode_filter(f, names):
+    """Turn a raw Gmail filter into {criteria, actions[]} for display."""
+    crit = f.get("criteria", {})
+    act = f.get("action", {})
+    actions = []
+    for lid in act.get("addLabelIds", []):
+        if lid in _FILTER_ADD_NAMES:
+            actions.append(_FILTER_ADD_NAMES[lid])
+        elif lid in _CATEGORY_NAMES:
+            actions.append("Categorize: " + _CATEGORY_NAMES[lid])
+        else:
+            actions.append("Label: " + names.get(lid, lid))
+    for lid in act.get("removeLabelIds", []):
+        actions.append(_FILTER_REMOVE_NAMES.get(lid, "Remove label: " + names.get(lid, lid)))
+    if act.get("forward"):
+        actions.append("Forward to " + act["forward"])
+    return {"id": f.get("id"), "criteria": crit, "actions": actions, "source": "gmail"}
+
+
+@app.route("/api/filters", methods=["GET"])
+def api_filters_get():
+    """Gmail filters (decoded) merged with the app's send-template rules."""
+    try:
+        names = _label_name_map()
+        raw = gget("/settings/filters").get("filter", [])
+    except Exception as exc:
+        log.exception("filters list failed")
+        return jsonify({"ok": False, "error": str(exc)}), 502
+    gmail = [_decode_filter(f, names) for f in raw]
+    linked = {r["gmail_filter_id"] for r in _list_rules() if r["gmail_filter_id"]}
+    tmap = {t["id"]: t for t in _list_templates()}
+    rules = []
+    for r in _list_rules():
+        t = tmap.get(r["template_id"])
+        rules.append({**r, "template_name": t["name"] if t else "(missing template)",
+                      "template_expired": bool(t and t["expired"])})
+    # Attach each rule's template action onto its linked Gmail filter row when present.
+    for g in gmail:
+        g["rule"] = next((r for r in rules if r["gmail_filter_id"] == g["id"]), None)
+    standalone = [r for r in rules if r["gmail_filter_id"] not in {g["id"] for g in gmail}]
+    return jsonify({"ok": True, "filters": gmail, "standalone_rules": standalone,
+                    "labels": [{"id": i, "name": n} for i, n in names.items()
+                               if not n.startswith("Bundle/")]})
+
+
+# Action keyword -> (add_label_ids, remove_label_ids) for filter creation.
+_ACTION_MAP = {
+    "archive":       ([], ["INBOX"]),
+    "mark_read":     ([], ["UNREAD"]),
+    "star":          (["STARRED"], []),
+    "delete":        (["TRASH"], []),
+    "important":     (["IMPORTANT"], []),
+    "not_important": ([], ["IMPORTANT"]),
+    "never_spam":    ([], ["SPAM"]),
+}
+
+
+@app.route("/api/filters", methods=["POST"])
+def api_filters_post():
+    """Create a filter. Builds the Gmail-side filter (if any label/archive/etc. action
+    or forward is chosen) AND/OR an app-native send-template rule, linked together."""
+    d = request.json or {}
+    crit_in = d.get("criteria") or {}
+    criteria = {k: v for k, v in {
+        "from": (crit_in.get("from") or "").strip(),
+        "to": (crit_in.get("to") or "").strip(),
+        "subject": (crit_in.get("subject") or "").strip(),
+        "query": (crit_in.get("query") or "").strip(),
+        "negatedQuery": (crit_in.get("negatedQuery") or "").strip(),
+    }.items() if v}
+    if crit_in.get("hasAttachment"):
+        criteria["hasAttachment"] = True
+    if not criteria:
+        return jsonify({"ok": False, "error": "Add at least one matching condition"}), 400
+
+    actions = d.get("actions") or []
+    label_id = (d.get("label_id") or "").strip()
+    forward = (d.get("forward") or "").strip()
+    template_id = (d.get("template_id") or "").strip()
+
+    add, remove = [], []
+    for a in actions:
+        if a in _ACTION_MAP:
+            ai, ri = _ACTION_MAP[a]
+            add += ai; remove += ri
+    if label_id:
+        add.append(label_id)
+
+    if template_id:
+        t = _get_template(template_id)
+        if not t:
+            return jsonify({"ok": False, "error": "Template not found"}), 400
+        if t["expired"]:
+            return jsonify({"ok": False, "error": "That template has expired"}), 400
+
+    gmail_filter_id = ""
+    if add or remove or forward:
+        body = {"criteria": criteria, "action": {}}
+        if add:
+            body["action"]["addLabelIds"] = list(dict.fromkeys(add))
+        if remove:
+            body["action"]["removeLabelIds"] = list(dict.fromkeys(remove))
+        if forward:
+            body["action"]["forward"] = forward
+        try:
+            created = gpost("/settings/filters", json=body)
+            gmail_filter_id = created.get("id", "")
+        except Exception as exc:
+            log.exception("gmail filter create failed")
+            # A common cause: forwarding address isn't a verified Gmail forwarder.
+            return jsonify({"ok": False, "error":
+                            "Gmail rejected the filter: " + str(exc)}), 502
+
+    if template_id:
+        rid = secrets.token_hex(8)
+        with _DAE_LOCK:
+            conn = db()
+            conn.execute(
+                "INSERT INTO filter_rules (id, from_q, subject_q, query, template_id, "
+                "enabled, once_per_sender, gmail_filter_id, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (rid, criteria.get("from", ""), criteria.get("subject", ""),
+                 criteria.get("query", ""), template_id,
+                 1 if d.get("enabled", True) else 0,
+                 1 if d.get("once_per_sender", True) else 0,
+                 gmail_filter_id, int(time.time())))
+            conn.commit()
+            conn.close()
+    elif not gmail_filter_id:
+        return jsonify({"ok": False, "error": "Pick at least one action"}), 400
+
+    return jsonify({"ok": True, "gmail_filter_id": gmail_filter_id})
+
+
+@app.route("/api/filter_toggle", methods=["POST"])
+def api_filter_toggle():
+    d = request.json or {}
+    rid = d.get("rule_id")
+    if not rid:
+        return jsonify({"ok": False, "error": "Missing rule_id"}), 400
+    with _DAE_LOCK:
+        conn = db()
+        conn.execute("UPDATE filter_rules SET enabled=? WHERE id=?",
+                     (1 if d.get("enabled") else 0, rid))
+        conn.commit()
+        conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/filter_delete", methods=["POST"])
+def api_filter_delete():
+    """Remove the Gmail filter and/or the app rule. Either id may be supplied."""
+    d = request.json or {}
+    gmail_filter_id = d.get("gmail_filter_id")
+    rule_id = d.get("rule_id")
+    if gmail_filter_id:
+        try:
+            gdelete(f"/settings/filters/{gmail_filter_id}")
+        except Exception as exc:
+            log.exception("gmail filter delete failed")
+            return jsonify({"ok": False, "error": str(exc)}), 502
+    with _DAE_LOCK:
+        conn = db()
+        if rule_id:
+            conn.execute("DELETE FROM filter_rules WHERE id=?", (rule_id,))
+            conn.execute("DELETE FROM filter_rule_fires WHERE rule_id=?", (rule_id,))
+        elif gmail_filter_id:
+            # Deleting the Gmail filter also unlinks any rule that rode along with it.
+            conn.execute("DELETE FROM filter_rules WHERE gmail_filter_id=?", (gmail_filter_id,))
+        conn.commit()
+        conn.close()
+    return jsonify({"ok": True})
 
 
 # Contact autocomplete — mined from sent-mail headers (covered by gmail.modify; no
