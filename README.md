@@ -117,23 +117,6 @@ External links *inside emails* are routed to the default browser via pywebview's
   responder's "last day" — the auto-reply can never outlive the template behind it. State lives
   in the `templates` table in `snooze.db`; the picker hits `GET /api/templates?active=1`.
 
-- **Filters** (drawer **Filters**, ⌘K, or Settings → Advanced) — manage real Gmail
-  filters over `gmail.settings.basic` (`/settings/filters`): criteria (from / to / subject /
-  has-words / doesn't-have / has-attachment) and the actions the API supports — skip inbox,
-  mark read, star, delete, mark important, never-spam, apply label, forward. Existing Gmail
-  filters are listed with their actions decoded to friendly names.
-  **Send-template action:** Gmail's filter API only exposes `addLabelIds` / `removeLabelIds` /
-  `forward` — the web UI's "send template" action is invisible to it and cannot be set or read.
-  So the app runs that action itself: a filter can carry an app-native **send-template rule**
-  that auto-replies with a chosen template when matching mail arrives, evaluated by the History
-  poller (so it fires even when a Gmail-side action archived/deleted the message first). Rules
-  live in `filter_rules` in `snooze.db`; one UI row links the Gmail filter and its rule.
-  Loop protection is strict and non-negotiable: never replies to itself, to no-reply/daemon/
-  bounce addresses, to mailing lists (`List-Id`/`List-Unsubscribe`), or to automated mail
-  (`Auto-Submitted`, `Precedence: bulk`); at most once per sender per rule (a persistent
-  `filter_rule_fires` ledger); a global cap of 20 auto-sends/hour; an empty-criteria rule
-  never matches; and an expired driving template stops the rule. Rules can be paused per-row.
-
 ## Not yet built
 - Snooze-by-location (geofencing isn't feasible from a local web app; Inbox itself
   retired it in 2018 — replaced here by Pick date & time + Someday)
