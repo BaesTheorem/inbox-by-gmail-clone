@@ -22,6 +22,11 @@ Send-to-Things builds a things:///add deep link whose notes carry a backlink
 that reopens the exact thread in this app (inboxclone://thread/<id>), with a
 Gmail web permalink as the fallback.
 """
+try:
+    import setproctitle
+    setproctitle.setproctitle("Inbox Server")
+except ImportError:
+    pass  # cosmetic process name only; never block startup on it
 import base64
 import html as _htmlmod
 import ipaddress

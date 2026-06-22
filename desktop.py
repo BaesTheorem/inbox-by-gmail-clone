@@ -17,6 +17,11 @@ macOS WKWebView window (via pywebview). No Chromium, far less RAM than a browser
 Deep links (inboxclone://thread/<id>) are delivered by the separate AppleScript
 scheme handler, which POSTs /api/open_thread; the SPA picks it up over SSE.
 """
+try:
+    import setproctitle
+    setproctitle.setproctitle("Inbox")
+except ImportError:
+    pass  # cosmetic process name only; never block startup on it
 import threading
 import time
 import urllib.request
@@ -72,6 +77,7 @@ class Api:
         # URL to the default browser AND activates it (plain `open <url>` would land in
         # a background tab the user never sees).
         import subprocess
+        print(f"[open_external] {url}", flush=True)
         bid = _default_browser_bid()
         try:
             args = ["/usr/bin/open"] + (["-b", bid] if bid else []) + [url]
