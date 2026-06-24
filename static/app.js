@@ -314,13 +314,48 @@ function refreshFooter() {
   const f = footerNode();
   if (f) list.appendChild(f);
 }
-// Full re-render that keeps the scroll position (used when backfill changes structure,
+// ---------- Scroll anchoring (keep the viewport pinned across a re-render) ----------
+// Restoring a raw scrollTop is wrong whenever content height changes ABOVE the fold
+// (new mail arrives at the top, an item disappears above you): the same pixel offset
+// then points at a different conversation and the viewport snaps. Instead we anchor on
+// the topmost conversation currently in view and re-pin it to the same screen position
+// after the render, so whatever you're looking at stays put — no jerk, ever.
+const APPBAR_H = 56; // sticky app bar height; cards above this line are scrolled away
+function captureScrollAnchor() {
+  const sc = document.scrollingElement || document.documentElement;
+  // At the very top: don't anchor, so freshly arrived mail can reveal itself naturally.
+  if (sc.scrollTop < 4) return null;
+  for (const c of document.querySelectorAll('#list .card[data-tid]')) {
+    const r = c.getBoundingClientRect();
+    if (r.bottom > APPBAR_H + 8) return { tid: c.dataset.tid, top: r.top };
+  }
+  return null;
+}
+function restoreScrollAnchor(anchor) {
+  if (!anchor) return;
+  const sel = window.CSS && CSS.escape ? CSS.escape(anchor.tid) : anchor.tid;
+  const el = document.querySelector(`#list .card[data-tid="${sel}"]`);
+  if (!el) return; // the anchored conversation is gone — leave scroll where it is
+  const delta = el.getBoundingClientRect().top - anchor.top;
+  if (delta) (document.scrollingElement || document.documentElement).scrollBy(0, delta);
+}
+// Full re-render that keeps the viewport pinned (used when backfill changes structure,
 // e.g. a new bundle category appears, where an incremental append can't place it).
 function scrollPreservingRender() {
-  const sc = document.scrollingElement || document.documentElement;
-  const y = sc.scrollTop;
+  const a = captureScrollAnchor();
   render();
-  try { sc.scrollTop = y; } catch (e) {}
+  restoreScrollAnchor(a);
+}
+// Tag conversations that weren't on screen before this render so CSS can fade them in
+// gently instead of popping. `prev` is the set of tids present before render().
+function markArrivals(prev) {
+  if (!prev) return;
+  document.querySelectorAll('#list .card[data-tid]').forEach((c) => {
+    if (!prev.has(c.dataset.tid)) c.classList.add("arriving");
+  });
+}
+function visibleTidSet() {
+  return new Set([...document.querySelectorAll('#list .card[data-tid]')].map((c) => c.dataset.tid));
 }
 function label(t) { const e = document.createElement("div"); e.className = "section-label"; e.textContent = t; return e; }
 function dateBucket(ts) {
@@ -1732,9 +1767,17 @@ function toast(msg, undo) {
 
 // ---------- Load ----------
 // Fresh load: fetch the first page (PAGE items) and REPLACE the current view.
-async function load() {
-  $("#loading").hidden = false;
-  $("#loading").textContent = "Loading…";
+// opts.silent — a background refresh (live-sync): no "Loading…" flash, and the
+// viewport is pinned via scroll anchoring so an arriving/disappearing message
+// never yanks what you're reading.
+async function load(opts = {}) {
+  const silent = !!opts.silent;
+  const anchor = silent ? captureScrollAnchor() : null;
+  const prevTids = silent ? visibleTidSet() : null;
+  if (!silent) {
+    $("#loading").hidden = false;
+    $("#loading").textContent = "Loading…";
+  }
   const v = STATE.view;
   const lim = "limit=" + PAGE;
   let d;
@@ -1778,8 +1821,12 @@ async function load() {
   if (d.email) $("#acctEmail").textContent = d.email;
   if (v === "inbox") renderNavBundles();
   render();
+  if (silent) { markArrivals(prevTids); restoreScrollAnchor(anchor); }
   enrichDocLinks();
-  ensureFilled();
+  // Top the list up, then re-pin once more: ensureFilled() only appends below the fold,
+  // but the grew-pinned / new-bundle branch can re-render structure above it.
+  try { await ensureFilled(); } catch (e) { /* a fill error must not reject load() */ }
+  if (silent) restoreScrollAnchor(anchor);
 }
 
 // ---------- Lazy Docs/Drive link chips on cards ----------
@@ -2017,12 +2064,12 @@ function startStream() {
       try { msg = JSON.parse(e.data); } catch (_) {}
       // Deep link asked us to surface a specific thread (from the inboxclone:// handler)
       if (msg.focus) { openThread(msg.focus); return; }
-      // Mailbox changed server-side (new mail / label change). Refresh the current view;
-      // overlays sit on top and are untouched. Preserve scroll so it doesn't yank.
-      const scroller = document.scrollingElement || document.documentElement;
-      const y = scroller.scrollTop;
+      // Mailbox changed server-side (new mail / label change). Refresh the current view
+      // silently: no loading flash, and scroll anchoring keeps the conversation you're
+      // looking at pinned in place so arriving/vanishing mail never jerks the viewport.
+      // Overlays (reader, compose) sit on top and are untouched.
       STATE.inboxCache = null;
-      load().then(() => { try { scroller.scrollTop = y; } catch (e) {} });
+      load({ silent: true });
     };
     // EventSource reconnects automatically on error — nothing to handle.
   } catch (e) { /* SSE unsupported */ }
