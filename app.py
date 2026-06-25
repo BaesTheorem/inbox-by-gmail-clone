@@ -677,6 +677,42 @@ def fetch_inbox(max_results=60):
     return summarize_ids(list_ids(label_ids=["INBOX"], max_results=max_results))
 
 
+# Container markers every major client wraps quoted reply history in. We cut a message
+# body at the earliest one so the reader shows only the new content, with the trimmed
+# history behind a toggle. Conservative on purpose: we split only on these explicit
+# markers (never on plain-text "On … wrote:" guesses) and only when real content
+# survives above the cut — over-trimming would hide real mail.
+_QUOTE_MARKERS = [
+    re.compile(r'<div[^>]+class="[^"]*gmail_quote', re.I),         # Gmail
+    re.compile(r'<blockquote[^>]+type="cite"', re.I),             # Apple Mail / Gmail
+    re.compile(r'<blockquote[^>]+class="[^"]*gmail_quote', re.I),
+    re.compile(r'<div[^>]+id="appendonsend"', re.I),             # Outlook (new)
+    re.compile(r'<div[^>]+id="divRplyFwdMsg"', re.I),            # Outlook desktop
+    re.compile(r'<div[^>]+id="mail-editor-reference-message-container"', re.I),  # Outlook web
+    re.compile(r'<div[^>]+id="ymail_android_signature"', re.I),  # Yahoo
+]
+
+
+def split_quoted_html(html):
+    """(visible, quoted) — split a body at the start of its quoted reply history.
+    `quoted` is None when there's nothing to trim. Never cuts away all visible content."""
+    if not html:
+        return html, None
+    cut = None
+    for pat in _QUOTE_MARKERS:
+        m = pat.search(html)
+        if m and (cut is None or m.start() < cut):
+            cut = m.start()
+    if cut is None:
+        return html, None
+    visible, quoted = html[:cut], html[cut:]
+    # Bail on a quote-only body (pure forward, or a reply with no new text + no image),
+    # so the reader never hides everything behind the toggle.
+    if not re.sub(r"<[^>]+>", "", visible).strip() and "<img" not in visible.lower():
+        return html, None
+    return visible, quoted
+
+
 def fetch_thread(thread_id):
     thread = gget(f"/threads/{thread_id}", format="full")
     messages = []
@@ -699,6 +735,7 @@ def fetch_thread(thread_id):
         name, email_addr = _parse_addr(_header(headers, "From"))
         subject = subject or _header(headers, "Subject")
         text, html = _decode_body(m.get("payload", {}))
+        vis_html, quoted_html = split_quoted_html(html)
         rfc_id = _header(headers, "Message-ID")
         if rfc_id:
             last_rfc_id = rfc_id
@@ -716,7 +753,8 @@ def fetch_thread(thread_id):
             "cc": _header(headers, "Cc"),   # needed for reply-all
             "date": _fmt_time(_header(headers, "Date")),
             "text": text,
-            "html": html,
+            "html": vis_html,            # new content only; quoted history split out below
+            "quotedHtml": quoted_html,   # trimmed reply chain, revealed by the reader's toggle
             "attachments": _collect_attachments(m.get("payload", {})),
             "docLinks": extract_doc_links(html),
             "unread": "UNREAD" in m.get("labelIds", []),
@@ -725,7 +763,7 @@ def fetch_thread(thread_id):
     # message first — so senders that hide unsubscribe in the body still get the banner.
     if not unsub:
         for m in reversed(messages):
-            bu = find_body_unsubscribe(m.get("html"))
+            bu = find_body_unsubscribe((m.get("html") or "") + (m.get("quotedHtml") or ""))
             if bu:
                 unsub, unsub_mid = bu, m.get("id")
                 break
