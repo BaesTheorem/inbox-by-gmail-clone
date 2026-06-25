@@ -104,6 +104,13 @@ External links *inside emails* are routed to the default browser via pywebview's
   expanded bundles + selection). No manual Refresh needed. Requires `threaded=True` on the
   Flask server. (Chosen over Gmail Pub/Sub push, which needs a public HTTPS endpoint
   a 127.0.0.1 app can't provide without a tunnel.)
+- **Desktop notifications** — when the live-sync poller sees new *unread* inbox mail it
+  fires an Inbox-branded macOS banner (sender as title, subject as body, the favicon as
+  the icon); clicking opens that thread via `inboxclone://`. A burst collapses into one
+  summary banner. Toggle in Settings → "Desktop notifications for new mail". Requires
+  `terminal-notifier` (`brew install terminal-notifier`) and a one-time grant in System
+  Settings → Notifications. Optionally `export INBOX_NOTIFY_SENDER=<app-bundle-id>` before
+  launch to also show the host app's name + grouping in Notification Center.
 
 ## Not yet built
 - Snooze-by-location (geofencing isn't feasible from a local web app; Inbox itself

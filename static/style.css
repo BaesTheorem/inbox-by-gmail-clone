@@ -9,6 +9,7 @@
   --divider:#DDDDDD;
   --text-primary:#212121;
   --text-secondary:#5F6368;
+  --unread-bg:#F4F8FE;
   --shadow-card:0 1px 2px 0 rgba(0,0,0,.10),0 1px 3px 0 rgba(0,0,0,.08);
   --shadow-fab:0 6px 10px 0 rgba(0,0,0,.14),0 1px 18px 0 rgba(0,0,0,.12),0 3px 5px -1px rgba(0,0,0,.2);
 }
@@ -149,10 +150,20 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .card .body{flex:1;min-width:0}
 .card .row1{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
 .card .sender{font-size:14px;color:var(--text-primary)}
-.card.unread .sender,.card.unread .subject{font-weight:500}
 .card .time{font-size:12px;color:var(--text-secondary);flex-shrink:0}
 .card .subject{font-size:14px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .card .snippet{font-size:13px;color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* Read mail recedes so unread mail pops: muted text, plain weight. */
+.card:not(.unread) .sender,.card:not(.unread) .subject{color:var(--text-secondary)}
+/* Unread mail: tinted card, bold sender/subject, brighter snippet, blue dot + accent. */
+.card.unread{background:var(--unread-bg)}
+.card.unread .sender{font-weight:700;color:var(--text-primary)}
+.card.unread .subject{font-weight:600;color:var(--text-primary)}
+.card.unread .snippet{color:var(--text-primary)}
+.card .row1-end{display:flex;align-items:center;gap:7px;flex-shrink:0}
+.card .unread-dot{display:none}
+.card.unread .unread-dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+  background:var(--inbox-blue);flex-shrink:0;box-shadow:0 0 0 2px rgba(66,133,244,.18)}
 .card .chips{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
 .doc-chip{cursor:pointer}
 .doc-chip:hover{background:#E8F0FE;border-color:#c6dafc}
@@ -165,7 +176,7 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .card .actions{position:absolute;right:10px;top:8px;display:none;gap:2px;background:var(--bg-card);padding-left:6px}
 .card:hover .actions{display:flex}
 .card .actions .icon-btn{width:34px;height:34px}
-.card.unread::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--inbox-blue);border-radius:8px 0 0 8px}
+.card.unread::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--inbox-blue);border-radius:8px 0 0 8px}
 .pin-dot{color:#F4B400;font-size:18px}
 .unsub-link{background:none;border:0;color:var(--inbox-blue);font:inherit;font-size:12px;cursor:pointer;padding:0 4px;margin-left:6px;vertical-align:middle}
 .unsub-link:hover{text-decoration:underline}
@@ -346,6 +357,7 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 :root[data-theme="dark"]{
   --bg-page:#1b1c1d;--bg-card:#26282a;--divider:#3c4043;
   --text-primary:#e8eaed;--text-secondary:#9aa0a6;
+  --unread-bg:#2c333f;
   --shadow-card:0 1px 2px rgba(0,0,0,.5);--shadow-fab:0 6px 12px rgba(0,0,0,.6);
 }
 :root[data-theme="dark"] .chip,:root[data-theme="dark"] .attach-chip{background:#33363a;border-color:#44474b;color:#cfd2d6}
