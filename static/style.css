@@ -223,6 +223,14 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .msg .mfrom{color:var(--text-primary);font-weight:500}
 .msg .mbody{font-size:14px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}
 .msg .mbody iframe{width:100%;border:0}
+/* Gmail-style toggle for the trimmed quote history. */
+.quote-toggle{display:inline-flex;align-items:center;gap:5px;margin-top:6px;padding:1px 10px;
+  background:var(--divider);border:0;border-radius:12px;cursor:pointer;color:var(--text-secondary);
+  font:inherit;font-size:13px;line-height:1.7;vertical-align:middle}
+.quote-toggle:hover{filter:brightness(.95)}
+.quote-toggle .quote-dots{font-weight:700;letter-spacing:1.5px}
+.quote-toggle .material-icons{font-size:16px}
+.quote-toggle.open{margin-bottom:4px}
 .msg-attachments{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--divider)}
 .msg-attachments .attach-chip{cursor:pointer}
 .msg-attachments .attach-chip small{color:#80868b;margin-left:2px}

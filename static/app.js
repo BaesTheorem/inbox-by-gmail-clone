@@ -680,17 +680,22 @@ const HAS_REMOTE_IMG = /<img[^>]+src=["']?https?:/i;
 // would just navigate the app in-place. See stripIframeLinkTargets for the full mechanism.
 const BASE_BLANK = '<base target="_blank">';
 
-function renderMsgBody(mb, m, forceImages) {
-  if (mb.dataset.rendered && !forceImages) return;
+function renderMsgBody(mb, m, forceImages, showQuoted) {
+  if (mb.dataset.rendered && !forceImages && !showQuoted) return;
   mb.dataset.rendered = "1";
   mb.innerHTML = "";
-  if (!m.html) { mb.textContent = m.text || "(no content)"; return; }
+  // Default view shows only the new content; the quoted reply history (m.quotedHtml)
+  // is appended back in when the reader toggles it open. This keeps the last message in
+  // a long thread from dragging its entire nested history along behind it.
+  const visible = m.html || "";
+  const htmlContent = showQuoted ? visible + (m.quotedHtml || "") : visible;
+  if (!htmlContent) { mb.textContent = m.text || "(no content)"; return; }
   const blocked = STATE.imageBlock && !forceImages;
-  if (blocked && HAS_REMOTE_IMG.test(m.html)) {
+  if (blocked && HAS_REMOTE_IMG.test(htmlContent)) {
     const banner = document.createElement("div");
     banner.className = "img-banner";
     banner.innerHTML = `<i class="material-icons">visibility_off</i><span>Remote images blocked.</span><button class="img-load">Load images</button>`;
-    banner.querySelector(".img-load").onclick = () => renderMsgBody(mb, m, true);
+    banner.querySelector(".img-load").onclick = () => renderMsgBody(mb, m, true, showQuoted);
     mb.appendChild(banner);
   }
   const f = document.createElement("iframe");
@@ -729,8 +734,23 @@ function renderMsgBody(mb, m, forceImages) {
   };
   f.onload = routeWhenReady;
   mb.appendChild(f);
-  f.srcdoc = BASE_BLANK + (blocked ? IMG_CSP : "") + m.html;
+  f.srcdoc = BASE_BLANK + (blocked ? IMG_CSP : "") + htmlContent;
   routeWhenReady();
+  // Gmail-style "•••" control to reveal (or re-hide) the trimmed quote history.
+  if (m.quotedHtml) {
+    const toggle = document.createElement("button");
+    toggle.className = "quote-toggle" + (showQuoted ? " open" : "");
+    toggle.title = showQuoted ? "Hide trimmed content" : "Show trimmed content";
+    toggle.innerHTML = showQuoted
+      ? '<i class="material-icons">unfold_less</i><span>Hide trimmed content</span>'
+      : '<span class="quote-dots">•••</span>';
+    toggle.onclick = (e) => {
+      e.stopPropagation();
+      mb.dataset.rendered = "";
+      renderMsgBody(mb, m, forceImages, !showQuoted);
+    };
+    mb.appendChild(toggle);
+  }
 }
 // Email links open in the system browser entirely through pywebview's NATIVE handler:
 // BASE_BLANK makes every link target a new browsing context, allow-popups lets that click
