@@ -150,7 +150,7 @@ function cardEl(row) {
     <div class="body">
       <div class="row1">
         <span class="sender">${esc(row.sender)} ${row.pinned ? '<i class="material-icons pin-dot">push_pin</i>' : ""}${row.unsub ? '<button class="unsub-link" title="Unsubscribe from this sender">Unsubscribe</button>' : ""}</span>
-        <span class="time">${esc(row.time)}</span>
+        <span class="row1-end"><span class="unread-dot" title="Unread"></span><span class="time">${esc(row.time)}</span></span>
       </div>
       <div class="subject">${esc(row.subject)}</div>
       <div class="snippet">${esc(row.snippet)}</div>
@@ -1542,6 +1542,7 @@ function openSettings() {
   $("#setUndoWindow").value = String(s.undo_send_window ?? 10);
   $("#setDarkMode").value = s.dark_mode || "auto";
   $("#setImageBlock").checked = s.image_block ?? false;
+  $("#setNotifications").checked = s.notifications ?? true;
   $("#setFollowupDays").value = String(s.followup_default_days ?? 3);
   $("#settingsOverlay").hidden = false;
 }
@@ -1554,6 +1555,7 @@ $("#settingsSave").onclick = async () => {
     undo_send_window: +$("#setUndoWindow").value,
     dark_mode: $("#setDarkMode").value,
     image_block: $("#setImageBlock").checked,
+    notifications: $("#setNotifications").checked,
     followup_default_days: +$("#setFollowupDays").value,
   };
   STATE.settings = Object.assign(STATE.settings || {}, upd);

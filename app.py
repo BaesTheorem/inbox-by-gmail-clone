@@ -37,6 +37,7 @@ import os
 import re
 import secrets
 import queue
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -890,6 +891,7 @@ SETTINGS_DEFAULTS = {
     "image_block": False,          # show remote images by default (toggle in Settings to block)
     "page_size": 50,
     "followup_default_days": 3,
+    "notifications": True,         # Inbox-branded macOS banners on new unread mail
 }
 
 
@@ -1050,6 +1052,78 @@ def _scheduler_loop():
 
 
 # ----------------------------------------------------------------------------
+# Native push notifications — Inbox-branded macOS banners on new unread mail
+# ----------------------------------------------------------------------------
+# Fired by the history poller below. Uses terminal-notifier with the bundled favicon
+# as -appIcon so every banner carries the Inbox glyph. Clicking opens the exact thread
+# via the inboxclone:// scheme the link handler already serves. Honors the Settings toggle.
+#
+# Optional: set INBOX_NOTIFY_SENDER to a local app's bundle id (e.g. the Inbox.app
+# launcher's) to also have the banner show that app's name and group under it in
+# Notification Center. Left unset in the repo on purpose — a bundle id is machine-
+# specific and can embed a real name, which must never land in this public repo.
+_NOTIFIER = shutil.which("terminal-notifier")
+_NOTIFY_SENDER = os.environ.get("INBOX_NOTIFY_SENDER")  # bundle id; favicon is the fallback brand
+_NOTIFY_ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "favicon.png")
+_notified_ids = set()   # message ids already pushed, so a re-poll never double-fires
+_NOTIFIED_CAP = 500
+
+
+def _notify(title, message, thread_id=None):
+    """Fire one Inbox-branded macOS notification. Fire-and-forget; never blocks the
+    poller. No-op if terminal-notifier isn't installed."""
+    if not _NOTIFIER:
+        return
+    cmd = [_NOTIFIER, "-title", title, "-message", message]
+    if _NOTIFY_SENDER:
+        cmd += ["-sender", _NOTIFY_SENDER]   # show + group under that app (incl. its icon)
+    if os.path.exists(_NOTIFY_ICON):
+        cmd += ["-appIcon", _NOTIFY_ICON]    # bundled Inbox glyph — the default branding
+    if thread_id:
+        # -execute wins over -sender for the click action: deep-link to the thread.
+        cmd += ["-execute", f'open "inboxclone://thread/{thread_id}"']
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        log.exception("notify failed")
+
+
+def _notify_new_mail(message_ids):
+    """Push a banner for genuinely-new unread inbox mail. Collapses a burst into one
+    summary so a bulk sync never floods the screen."""
+    if not _NOTIFIER or not _get_setting("notifications", True):
+        return
+    fresh = [mid for mid in message_ids if mid not in _notified_ids]
+    if not fresh:
+        return
+    cards = []
+    for mid in fresh:
+        _notified_ids.add(mid)
+        m = _get_meta(mid)
+        if not m:
+            continue
+        labels = m.get("labelIds", []) or []
+        if "UNREAD" not in labels or "SENT" in labels:
+            continue   # already read, or it's my own outgoing mail
+        headers = m.get("payload", {}).get("headers", [])
+        name, addr = _parse_addr(_header(headers, "From"))
+        subject = _header(headers, "Subject") or "(no subject)"
+        cards.append((name or addr or "New message", subject, m.get("threadId")))
+    # Bound the dedupe set so it can't grow without limit on a long-running process.
+    if len(_notified_ids) > _NOTIFIED_CAP:
+        for mid in list(_notified_ids)[:-_NOTIFIED_CAP]:
+            _notified_ids.discard(mid)
+    if not cards:
+        return
+    if len(cards) == 1:
+        sender, subject, tid = cards[0]
+        _notify(sender, subject, tid)
+    else:
+        senders = ", ".join(dict.fromkeys(c[0] for c in cards))
+        _notify(f"{len(cards)} new messages", senders[:120])
+
+
+# ----------------------------------------------------------------------------
 # Live sync — poll Gmail's History API for deltas, push to browsers via SSE
 # ----------------------------------------------------------------------------
 POLL_INTERVAL = 8  # seconds
@@ -1076,6 +1150,7 @@ def _history_loop():
                                  if "INBOX" in (ma.get("message", {}).get("labelIds") or [])]
                         if added:
                             enqueue_unsub_scan(added)
+                            _notify_new_mail(added)
                     SYNC["history_id"] = resp.get("historyId", SYNC["history_id"])
                 except GmailHTTPError as he:
                     # 404 = startHistoryId too old; reset cursor and force a refresh
