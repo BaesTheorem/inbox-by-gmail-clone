@@ -161,11 +161,37 @@ class GmailHTTPError(Exception):
         super().__init__(f"Gmail {status}: {self.body[:200]}")
 
 
+def _persist_creds(creds):
+    """Atomic 0600 write of creds to TOKEN_PATH: create with restrictive perms from
+    the start (no world-readable window between open() and chmod), then rename into
+    place."""
+    tmp = TOKEN_PATH + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(creds.to_json())
+    os.replace(tmp, TOKEN_PATH)
+
+
+class _PersistingCredentials(Credentials):
+    """Credentials that write themselves back to disk after every refresh. The app is
+    a long-running server, so google-auth silently refreshes the access token in
+    memory roughly hourly; without this, those refreshes never reach token.json,
+    leaving the on-disk token perpetually stale and forcing every cold start to hit
+    the network to refresh before it can serve a single request (fragile if the
+    network blips at startup)."""
+    def refresh(self, request):
+        super().refresh(request)
+        try:
+            _persist_creds(self)
+        except Exception:
+            log.warning("could not persist refreshed token", exc_info=True)
+
+
 def _load_or_consent_creds():
     creds = None
     granted = []
     if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        creds = _PersistingCredentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
         try:
             granted = json.load(open(TOKEN_PATH)).get("scopes") or []
         except Exception:
@@ -175,17 +201,14 @@ def _load_or_consent_creds():
     have_scopes = bool(creds) and set(SCOPES).issubset(set(granted))
     if not (creds and creds.valid and have_scopes):
         if creds and creds.expired and creds.refresh_token and have_scopes:
-            creds.refresh(Request())
+            creds.refresh(Request())  # _PersistingCredentials.refresh writes it back
         else:
             flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET, SCOPES)
-            creds = flow.run_local_server(port=0, prompt="consent")
-        # Atomic 0600 write: create with restrictive perms from the start (no
-        # world-readable window between open() and chmod), then rename into place.
-        tmp = TOKEN_PATH + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(creds.to_json())
-        os.replace(tmp, TOKEN_PATH)
+            base = flow.run_local_server(port=0, prompt="consent")
+            # Re-wrap so this session's future auto-refreshes also persist.
+            creds = _PersistingCredentials.from_authorized_user_info(
+                json.loads(base.to_json()), SCOPES)
+            _persist_creds(creds)
     return creds
 
 
