@@ -809,7 +809,14 @@ async function openThread(tid) {
   const parseAddrs = (s) => (s || "").split(/,\s*/).map((a) => {
     const m = a.match(/<([^>]+)>/); return (m ? m[1] : a).trim();
   }).filter(Boolean);
-  reader.dataset.to = last.senderEmail || "";
+  // Normally reply to whoever sent the last message. But if that last message was
+  // one *I* sent (I'm the most recent writer in the thread), replying to its sender
+  // addresses the mail back to myself and the real correspondent never receives it,
+  // silently and with no bounce. In that case reply to whoever I last wrote to.
+  const lastFromMe = last.senderEmail && last.senderEmail.toLowerCase() === me;
+  const counterparties = [...parseAddrs(last.to), ...parseAddrs(last.cc)]
+    .filter((a) => a.toLowerCase() !== me);
+  reader.dataset.to = (lastFromMe ? counterparties[0] : last.senderEmail) || counterparties[0] || "";
   const all = new Set([last.senderEmail, ...parseAddrs(last.to), ...parseAddrs(last.cc)]);
   [...all].forEach((a) => { if (a && a.toLowerCase() === me) all.delete(a); });
   all.delete("");
