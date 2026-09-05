@@ -12,12 +12,12 @@ Reverse-engineered from a detailed UX spec of the original product; see
 **[docs/DESIGN.md](docs/DESIGN.md)** for the full design document (colors, typography,
 components, interactions, and history).
 
-> 📌 **Planned:** a standalone iPhone PWA (Mac-independent). See **[docs/ROADMAP.md](docs/ROADMAP.md)**.
+> 📱 **iPhone:** a native SwiftUI app lives in **[ios/](ios/README.md)**. Mac-independent (talks to Gmail directly), same triage model, same Send to Things backlinks. It replaced the PWA plan in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Architecture
 - **Backend:** `app.py`: Flask + Gmail API (`uv run --script`, deps inline via PEP 723).
 - **Frontend:** `templates/index.html` + `static/{style.css,app.js}`: vanilla SPA styled to the Inbox spec.
-- **Launcher:** `~/Desktop/Apps/Inbox.app`: starts the server, opens the browser, and handles `inboxclone://` deep links.
+- **Launcher:** `/Applications/Inbox.app`: starts the server, opens the browser, and handles `inboxclone://` deep links.
 - **Port:** `http://127.0.0.1:5008`
 
 ## Triage model (maps Inbox semantics onto native Gmail labels)
@@ -27,6 +27,8 @@ components, interactions, and history).
 | Pin | `STARRED` label |
 | Snooze | remove `INBOX` + add `Snoozed`; background scheduler re-adds `INBOX` at wake time (state in `snooze.db`) |
 | Bundles | native categories (Promos/Social/Updates/Forums) + keyword classifier for Travel/Purchases/Finance |
+| Report spam | add `SPAM` + remove `INBOX`/`UNREAD` (undo re-adds `INBOX`, drops `SPAM`) |
+| Block sender | Gmail filter on `from:` whose action is `TRASH`, plus trashing the thread in hand |
 
 ## Send to Things 3
 Each thread/card has a **Send to Things** action. It fires:
@@ -62,17 +64,19 @@ uv pip install --python .venv/bin/python flask google-auth google-auth-oauthlib 
 ~2.3x lighter than Chrome).
 
 ## Run
-- **Native desktop app (default):** double-click `~/Desktop/Apps/Inbox.app` → native macOS
+- **Native desktop app (default):** double-click `/Applications/Inbox.app` → native macOS
   **WKWebView** window (system WebKit, no Chromium). Starts the server in-process; quitting
   the window stops everything. Singleton: a second launch no-ops if one is running.
 - **Browser fallback:** `cd ~/Documents/inbox-clone && uv run --script app.py`, then open
   `http://127.0.0.1:5008` in any browser.
 
 ## Deep links with the native window
-`inboxclone://` is owned by a hidden helper, **`~/Desktop/Apps/Inbox Link Handler.app`**
-(`link_handler.applescript`, `LSUIElement`). On a Things backlink it ensures Inbox.app is
-running, then `POST /api/open_thread`; the SPA receives a `focus` event over SSE and opens
-that thread (falls back to the Gmail web permalink if the app can't start).
+`inboxclone://` is owned by a hidden helper, **`~/Library/Application Support/Inbox/Inbox
+Link Handler.app`** (`link_handler.applescript`, `LSUIElement`). On a Things backlink it
+ensures Inbox.app is running, then `POST /api/open_thread`; the SPA receives a `focus`
+event over SSE and opens that thread (falls back to the Gmail web permalink if the app
+can't start). A bare `inboxclone://` just opens/raises the app (used by summary
+notifications).
 External links *inside emails* are routed to the default browser via pywebview's
 `js_api.open_external` (WKWebView can't open new tabs itself).
 
@@ -99,18 +103,39 @@ External links *inside emails* are routed to the default browser via pywebview's
   re-reads headers at action time and: (1) one-click → `POST List-Unsubscribe=One-Click`
   to the https URI; (2) mailto → sends an unsubscribe email from your account; (3) plain
   https link → opens in the browser. Confirmation prompt guards accidental clicks.
+- **Report spam**: card action, reader action, bulk-bar action, and Gmail's own `!` key.
+  Undo ("not spam") is on the snackbar, and it both restores `INBOX` and clears `SPAM` so
+  Gmail stops re-filing the thread.
+- **Block sender**: reader action (and a Settings field to block an address by hand). Creates
+  the same object Gmail's own Block does, a `from:` filter whose action is Trash, so blocks
+  made here show up in Gmail's Settings → Filters and unblocking in either place works.
+  Filters only apply to mail that arrives after they exist, so the open thread is trashed
+  too; undo deletes the filter and un-trashes it. Settings lists every blocked sender with
+  an Unblock button, read live from the account.
+- **Embedded images**: `<img src="cid:…">` parts are rewritten server-side to an
+  `/api/inline/<msg>/<att>` proxy, so images attached to a message actually render instead
+  of showing as broken. These bytes arrived with the mail, so they display even when remote
+  images are blocked; the blocking CSP allows `data:` + same-origin only, which still cuts
+  off remote tracking pixels. Remote images load by default (Settings → "Block remote
+  images" turns tracker-blocking on).
 - **Live sync**: a background thread polls Gmail's History API for deltas and pushes
   them to the browser over SSE (`/api/stream`); the UI auto-refreshes (preserving scroll +
   expanded bundles + selection). No manual Refresh needed. Requires `threaded=True` on the
   Flask server. (Chosen over Gmail Pub/Sub push, which needs a public HTTPS endpoint
   a 127.0.0.1 app can't provide without a tunnel.)
 - **Desktop notifications**: when the live-sync poller sees new *unread* inbox mail it
-  fires an Inbox-branded macOS banner (sender as title, subject as body, the favicon as
-  the icon); clicking opens that thread via `inboxclone://`. A burst collapses into one
-  summary banner. Toggle in Settings → "Desktop notifications for new mail". Requires
-  `terminal-notifier` (`brew install terminal-notifier`) and a one-time grant in System
-  Settings → Notifications. Optionally `export INBOX_NOTIFY_SENDER=<app-bundle-id>` before
-  launch to also show the host app's name + grouping in Notification Center.
+  fires a full macOS banner attributed to **Inbox** (sender as title, subject as subtitle,
+  body snippet as the message, real app icon, optional sound); clicking opens that exact
+  thread via `inboxclone://`. Repeated mail on one thread replaces its stale banner
+  (`-group`), and a burst collapses into one summary banner whose click raises the app.
+  Toggles in Settings → "Desktop notifications for new mail" / "Play sound with
+  notifications". Requires `terminal-notifier` (`brew install terminal-notifier`) plus a
+  one-time `./setup_notifier.sh`, which builds **Inbox Notifier.app** (a rebranded
+  terminal-notifier copy in `~/Library/Application Support/Inbox/`) so Notification Center
+  shows the Inbox name/icon and gives the app its own row in System Settings →
+  Notifications. Without that bundle it falls back to plain terminal-notifier with the
+  favicon pasted in (attributed to Terminal); `export INBOX_NOTIFY_SENDER=<app-bundle-id>`
+  can dress up that fallback.
 
 ## Not yet built
 - Snooze-by-location (geofencing isn't feasible from a local web app; Inbox itself

@@ -9,7 +9,7 @@
 <link rel="apple-touch-icon" href="/static/favicon.png">
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css?v=59">
+<link rel="stylesheet" href="/static/style.css?v=60">
 </head>
 <body>
 <header class="appbar">
@@ -82,6 +82,7 @@
   <span class="spacer"></span>
   <button class="icon-btn" id="selPin" title="Pin"><i class="material-icons">push_pin</i></button>
   <button class="icon-btn" id="selSnooze" title="Snooze"><i class="material-icons">schedule</i></button>
+  <button class="icon-btn" id="selSpam" title="Report spam"><i class="material-icons">report</i></button>
   <button class="icon-btn" id="selDone" title="Done"><i class="material-icons">playlist_add_check</i></button>
   <button class="icon-btn" id="selThings" title="Send to Things 3"><img class="things-icon" src="/static/things-icon.png?v=37" alt="Send to Things 3"></button>
 </div>
@@ -126,6 +127,8 @@
     <button class="icon-btn" id="readerForward" title="Forward"><i class="material-icons">forward</i></button>
     <button class="icon-btn" id="readerMarkUnread" title="Mark unread"><i class="material-icons">markunread</i></button>
     <button class="icon-btn" id="readerMute" title="Mute thread"><i class="material-icons">volume_off</i></button>
+    <button class="icon-btn" id="readerSpam" title="Report spam"><i class="material-icons">report</i></button>
+    <button class="icon-btn" id="readerBlock" title="Block sender"><i class="material-icons">block</i></button>
     <button class="icon-btn" id="readerFollowup" title="Remind me if no reply"><i class="material-icons">alarm_add</i></button>
     <button class="icon-btn" id="readerDone" title="Done"><i class="material-icons" style="color:var(--done-green)">playlist_add_check</i></button>
     <button class="icon-btn" id="readerThings" title="Send to Things 3"><img class="things-icon" src="/static/things-icon.png?v=37" alt="Send to Things 3"></button>
@@ -134,10 +137,15 @@
   <div class="reader-reply">
     <div class="reply-editor">
       <div class="compose-toolbar reply-toolbar">
-        <button type="button" class="tb-btn" data-cmd="bold" title="Bold"><i class="material-icons">format_bold</i></button>
-        <button type="button" class="tb-btn" data-cmd="italic" title="Italic"><i class="material-icons">format_italic</i></button>
-        <button type="button" class="tb-btn" data-cmd="underline" title="Underline"><i class="material-icons">format_underlined</i></button>
-        <button type="button" class="tb-btn tb-link" title="Insert link"><i class="material-icons">link</i></button>
+        <button type="button" class="tb-btn" data-cmd="bold" title="Bold (⌘B)"><i class="material-icons">format_bold</i></button>
+        <button type="button" class="tb-btn" data-cmd="italic" title="Italic (⌘I)"><i class="material-icons">format_italic</i></button>
+        <button type="button" class="tb-btn" data-cmd="underline" title="Underline (⌘U)"><i class="material-icons">format_underlined</i></button>
+        <button type="button" class="tb-btn" data-cmd="strikeThrough" title="Strikethrough"><i class="material-icons">strikethrough_s</i></button>
+        <button type="button" class="tb-btn tb-link" title="Insert link (⌘K)"><i class="material-icons">link</i></button>
+        <span class="tb-sep"></span>
+        <button type="button" class="tb-btn" data-cmd="insertUnorderedList" title="Bulleted list"><i class="material-icons">format_list_bulleted</i></button>
+        <button type="button" class="tb-btn" data-cmd="insertOrderedList" title="Numbered list"><i class="material-icons">format_list_numbered</i></button>
+        <button type="button" class="tb-btn" data-cmd="removeFormat" title="Clear formatting"><i class="material-icons">format_clear</i></button>
         <span class="tb-sep"></span>
         <button type="button" class="tb-btn" id="rAttach" title="Attach files"><i class="material-icons">attach_file</i></button>
         <span id="replySaveStatus" class="save-status"></span>
@@ -174,14 +182,16 @@
     <input id="cBcc" class="addr-extra" placeholder="Bcc" autocomplete="off" hidden>
     <input id="cSubject" placeholder="Subject">
     <div class="compose-toolbar">
-      <button type="button" class="tb-btn" data-cmd="bold" title="Bold"><i class="material-icons">format_bold</i></button>
-      <button type="button" class="tb-btn" data-cmd="italic" title="Italic"><i class="material-icons">format_italic</i></button>
-      <button type="button" class="tb-btn" data-cmd="underline" title="Underline"><i class="material-icons">format_underlined</i></button>
+      <button type="button" class="tb-btn" data-cmd="bold" title="Bold (⌘B)"><i class="material-icons">format_bold</i></button>
+      <button type="button" class="tb-btn" data-cmd="italic" title="Italic (⌘I)"><i class="material-icons">format_italic</i></button>
+      <button type="button" class="tb-btn" data-cmd="underline" title="Underline (⌘U)"><i class="material-icons">format_underlined</i></button>
       <button type="button" class="tb-btn" data-cmd="strikeThrough" title="Strikethrough"><i class="material-icons">strikethrough_s</i></button>
-      <button type="button" class="tb-btn tb-link" id="cLink" title="Insert link"><i class="material-icons">link</i></button>
+      <button type="button" class="tb-btn tb-link" id="cLink" title="Insert link (⌘K)"><i class="material-icons">link</i></button>
       <span class="tb-sep"></span>
-      <button type="button" class="tb-btn" data-cmd="insertUnorderedList" title="Bulleted list"><i class="material-icons">format_list_bulleted</i></button>
-      <button type="button" class="tb-btn" data-cmd="insertOrderedList" title="Numbered list"><i class="material-icons">format_list_numbered</i></button>
+      <button type="button" class="tb-btn" data-cmd="insertUnorderedList" title="Bulleted list (⌘⇧8)"><i class="material-icons">format_list_bulleted</i></button>
+      <button type="button" class="tb-btn" data-cmd="insertOrderedList" title="Numbered list (⌘⇧7)"><i class="material-icons">format_list_numbered</i></button>
+      <button type="button" class="tb-btn" data-cmd="indent" title="Indent"><i class="material-icons">format_indent_increase</i></button>
+      <button type="button" class="tb-btn" data-cmd="outdent" title="Outdent"><i class="material-icons">format_indent_decrease</i></button>
       <button type="button" class="tb-btn" data-cmd="removeFormat" title="Clear formatting"><i class="material-icons">format_clear</i></button>
       <span class="tb-sep"></span>
       <button type="button" class="tb-btn" id="cAttach" title="Attach files"><i class="material-icons">attach_file</i></button>
@@ -199,6 +209,19 @@
       <button class="discard-btn" id="composeDiscard" style="display:none"><i class="material-icons">delete</i> Discard</button>
       <span id="composeSaveStatus" class="save-status"></span>
     </div>
+  </div>
+</div>
+
+<!-- Link bubble: insert a link, or edit/open/remove one you clicked in an editor -->
+<div class="link-pop" id="linkPop" hidden>
+  <label class="lp-field"><span>Text</span><input id="lpText" placeholder="Text to display" autocomplete="off"></label>
+  <label class="lp-field"><span>Link</span><input id="lpUrl" placeholder="https://example.com" autocomplete="off" spellcheck="false"></label>
+  <div class="lp-actions">
+    <button type="button" class="lp-btn" id="lpOpen"><i class="material-icons">open_in_new</i> Open</button>
+    <button type="button" class="lp-btn danger" id="lpRemove"><i class="material-icons">link_off</i> Remove</button>
+    <span class="spacer"></span>
+    <button type="button" class="lp-btn" id="lpCancel">Cancel</button>
+    <button type="button" class="lp-btn primary" id="lpApply">Apply</button>
   </div>
 </div>
 
@@ -263,6 +286,10 @@
         <input type="checkbox" id="setNotifications">
         <span>Desktop notifications for new mail</span>
       </label>
+      <label class="set-field row">
+        <input type="checkbox" id="setNotifSound">
+        <span>Play sound with notifications</span>
+      </label>
       <label class="set-field">
         <span>Follow-up nudge default</span>
         <select id="setFollowupDays">
@@ -272,6 +299,14 @@
           <option value="7">1 week</option>
         </select>
       </label>
+      <div class="set-field">
+        <span>Blocked senders</span>
+        <div class="blocked-list" id="blockedList"></div>
+        <div class="blocked-add">
+          <input type="email" id="blockAddInput" placeholder="name@example.com">
+          <button type="button" class="ghost-btn" id="blockAddBtn">Block</button>
+        </div>
+      </div>
     </div>
     <div class="compose-foot"><button class="send-btn wide" id="settingsSave"><i class="material-icons">check</i> Save</button></div>
   </div>
@@ -315,6 +350,6 @@
 <div class="snackbar" id="snackbar" hidden><span id="snackText"></span><button id="snackUndo">UNDO</button></div>
 
 <script>window.OPEN_THREAD = {{ open_thread|tojson }};</script>
-<script src="/static/app.js?v=63"></script>
+<script src="/static/app.js?v=64"></script>
 </body>
 </html>

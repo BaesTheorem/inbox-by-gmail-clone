@@ -1,6 +1,16 @@
 # Roadmap
 
-## ⏳ iPhone app — standalone PWA (deferred)
+## ✅ iPhone app: shipped native instead (2026-08-23)
+
+The PWA plan below was superseded. A native SwiftUI app now lives in
+[ios/](../ios/README.md); it reuses the Desktop OAuth client's refresh token,
+so the "new Web OAuth client + hosted frontend" work the PWA needed never
+happened, and native gets the two things the PWA couldn't do: scheduled snooze
+wake notifications and owning the `inboxclone://` scheme for Things backlinks.
+The 7-day free-signing expiry the PWA route was avoiding is real; the re-push
+is one script run (`ios/scripts/build-install.sh`).
+
+## ⏳ iPhone app — standalone PWA (superseded, kept for the reasoning)
 
 **Goal:** use this on iPhone as a real home-screen app, **independent of the Mac**
 (Mac may be off). Decided direction: **client-side PWA** (not a native SwiftUI rewrite —

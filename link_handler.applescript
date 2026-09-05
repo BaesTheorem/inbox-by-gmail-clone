@@ -1,7 +1,7 @@
 -- inboxclone:// scheme handler for the native (pywebview) Inbox app.
 -- Ensures the desktop app is running, then asks its window to surface the thread
 -- via POST /api/open_thread (the SPA picks it up over SSE). Falls back to Gmail.
-property appPath : (POSIX path of (path to home folder)) & "Desktop/Apps/Inbox.app"
+property appPath : "/Applications/Inbox.app"
 property serverURL : "http://127.0.0.1:5008"
 
 on serverUp()
@@ -32,6 +32,12 @@ on open location this_URL
 			set threadId to afterScheme
 		end if
 	end try
+	if threadId is "" then
+		-- Bare inboxclone:// (e.g. clicking a burst-summary notification):
+		-- just open/raise the app.
+		launchApp()
+		return
+	end if
 	try
 		if this_URL contains "gmail=" then
 			set rawGmail to text ((offset of "gmail=" in this_URL) + 6) thru -1 of this_URL

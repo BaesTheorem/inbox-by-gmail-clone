@@ -18,10 +18,14 @@
    otherwise reader/compose/snackbar render on every load. */
 [hidden]{display:none!important}
 html,body{margin:0;height:100%}
-/* Let the browser keep the viewport pinned when content height changes above the fold
-   (a belt-and-suspenders alongside the JS scroll anchoring in load()). */
+/* Ask the browser to keep the viewport pinned when content height changes above the fold.
+   WebKit (so: the desktop app's WKWebView) doesn't implement overflow-anchor at all, which
+   is why render() anchors by hand — this only helps in Chrome/Firefox. */
 html{overflow-anchor:auto}
 body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--text-primary);font-size:14px;overflow-x:hidden}
+/* Page scroll frozen while an overlay is up (see syncScrollLock). The body is parked at
+   -scrollLockY so nothing moves, and no wheel event can chain through to the inbox. */
+body.scroll-locked{position:fixed;left:0;right:0;width:100%;overflow:hidden}
 
 /* App bar */
 .appbar{height:56px;background:var(--inbox-blue);color:#fff;display:flex;align-items:center;
@@ -88,7 +92,7 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 
 /* Layout */
 .layout{display:flex;align-items:flex-start}
-.drawer{width:256px;flex-shrink:0;padding:8px 0;position:sticky;top:56px;height:calc(100vh - 56px);overflow:auto;transition:margin-left .22s ease}
+.drawer{width:256px;flex-shrink:0;padding:8px 0;position:sticky;top:56px;height:calc(100vh - 56px);overflow:auto;overscroll-behavior:contain;transition:margin-left .22s ease}
 .layout.nav-collapsed .drawer{margin-left:-256px}
 .drawer-acct{padding:8px 24px 16px;color:var(--text-secondary);font-size:13px;word-break:break-all}
 .nav-item{display:flex;align-items:center;gap:18px;height:44px;padding:0 24px;cursor:pointer;
@@ -118,7 +122,9 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 /* Cards */
 .card{background:var(--bg-card);border:1px solid var(--divider);border-radius:8px;margin-bottom:8px;
   box-shadow:var(--shadow-card);display:flex;align-items:flex-start;padding:14px 16px;gap:12px;
-  cursor:pointer;position:relative;transition:transform .18s ease,opacity .18s ease}
+  cursor:pointer;position:relative;transition:transform .18s ease,opacity .18s ease;
+  /* j/k navigation scrolls cards into view; keep them clear of the sticky app bar. */
+  scroll-margin-top:66px;scroll-margin-bottom:20px}
 .card:hover{box-shadow:0 1px 3px rgba(0,0,0,.2),0 1px 8px rgba(0,0,0,.12)}
 .card.swiping{transition:none}
 /* Mail that arrived during a live-sync fades/eases in instead of popping. The element
@@ -217,10 +223,14 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .reader-bar{height:56px;background:#fff;border-bottom:1px solid var(--divider);display:flex;align-items:center;padding:0 8px;gap:4px}
 .reader-subject{font-size:18px;font-weight:400;margin-left:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .spacer{flex:1}
-.reader-body{flex:1;overflow:auto;padding:20px;max-width:840px;width:100%;margin:0 auto}
+/* overscroll-behavior:contain on every overlay scroller: hitting the end of one must not
+   hand the rest of the gesture to the page behind it. */
+.reader-body{flex:1;overflow:auto;overscroll-behavior:contain;padding:20px;max-width:840px;width:100%;margin:0 auto}
 .msg{background:#fff;border:1px solid var(--divider);border-radius:8px;padding:16px;margin-bottom:12px;box-shadow:var(--shadow-card)}
 .msg .mhead{display:flex;justify-content:space-between;color:var(--text-secondary);font-size:13px;margin-bottom:8px}
 .msg .mfrom{color:var(--text-primary);font-weight:500}
+.msg .mrcpt{color:var(--text-secondary);font-size:12px;margin:-4px 0 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.msg.collapsed .mrcpt{display:none}
 .msg .mbody{font-size:14px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}
 .msg .mbody iframe{width:100%;border:0}
 /* Gmail-style toggle for the trimmed quote history. */
@@ -237,7 +247,7 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .reader-reply{display:flex;gap:8px;padding:12px;background:#fff;border-top:1px solid var(--divider);align-items:flex-end}
 .reply-editor{flex:1;border:1px solid var(--divider);border-radius:8px;overflow:hidden;display:flex;flex-direction:column}
 .reply-toolbar{padding:2px 4px}
-.reply-body{min-height:44px;max-height:160px;overflow:auto;padding:10px 12px;font-family:inherit;font-size:14px;line-height:1.5;outline:none}
+.reply-body{min-height:44px;max-height:240px;overflow:auto;overscroll-behavior:contain;padding:10px 12px;font-family:inherit;font-size:14px;line-height:1.5;outline:none}
 .reply-body:empty:before{content:attr(data-placeholder);color:#9aa0a6}
 .reply-body a{color:var(--inbox-blue)}
 .send-btn{background:var(--inbox-blue);color:#fff;border:0;border-radius:8px;height:44px;width:44px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
@@ -260,11 +270,36 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .compose-toolbar{display:flex;align-items:center;gap:2px;padding:4px 8px;border-bottom:1px solid var(--divider)}
 .tb-btn{background:none;border:0;width:32px;height:32px;border-radius:4px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;color:var(--text-secondary)}
 .tb-btn:hover{background:rgba(0,0,0,.06)}
+/* Lit while the caret sits inside that formatting */
+.tb-btn.on{background:rgba(66,133,244,.14);color:var(--inbox-blue)}
+
+/* Link bubble (insert / edit a link in any editor) */
+.link-pop{position:fixed;z-index:95;width:330px;max-width:92vw;background:var(--bg-card);border:1px solid var(--divider);
+  border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.28);padding:12px}
+.link-pop .lp-field{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.link-pop .lp-field>span{width:34px;flex-shrink:0;font-size:12px;color:var(--text-secondary)}
+.link-pop input{flex:1;min-width:0;font:inherit;font-size:13px;padding:7px 9px;border:1px solid var(--divider);
+  border-radius:6px;background:var(--bg-card);color:var(--text-primary);outline:none}
+.link-pop input:focus{border-color:var(--inbox-blue)}
+.link-pop input:disabled{color:var(--text-secondary);background:var(--bg-page)}
+.lp-actions{display:flex;align-items:center;gap:6px;margin-top:4px}
+.lp-actions .spacer{flex:1}
+.lp-btn{display:inline-flex;align-items:center;gap:4px;font:inherit;font-size:13px;padding:6px 12px;border-radius:6px;
+  border:1px solid var(--divider);background:var(--bg-card);color:var(--text-primary);cursor:pointer}
+.lp-btn:hover{background:var(--bg-page)}
+.lp-btn .material-icons{font-size:16px}
+.lp-btn.primary{background:var(--inbox-blue);border-color:var(--inbox-blue);color:#fff;font-weight:500}
+.lp-btn.primary:hover{background:var(--inbox-blue-dark)}
+.lp-btn.danger:hover{color:var(--fab-red);border-color:var(--fab-red)}
 .tb-btn .material-icons{font-size:19px}
 .tb-sep{width:1px;height:20px;background:var(--divider);margin:0 4px}
-.compose-body{min-height:200px;max-height:340px;overflow:auto;padding:12px 14px;font-size:14px;line-height:1.5;outline:none}
+.compose-body{min-height:200px;max-height:340px;overflow:auto;overscroll-behavior:contain;padding:12px 14px;font-size:14px;line-height:1.5;outline:none}
 .compose-body:empty:before{content:attr(data-placeholder);color:#9aa0a6}
 .compose-body a{color:var(--inbox-blue)}
+/* Links inside an editor: clearly links, and clickable (click opens the link bubble). */
+.compose-body a,.reply-body a,.settings-sig a{text-decoration:underline;cursor:pointer}
+.compose-body ul,.compose-body ol,.reply-body ul,.reply-body ol{margin:6px 0;padding-left:26px}
+.compose-body blockquote,.reply-body blockquote{margin:6px 0 6px 8px;padding-left:10px;border-left:2px solid var(--divider);color:var(--text-secondary)}
 .attach-list{display:flex;flex-wrap:wrap;gap:6px;padding:0 14px}
 .attach-list:not(:empty){padding:8px 14px;border-top:1px solid var(--divider)}
 .attach-chip{display:inline-flex;align-items:center;gap:6px;background:#F1F3F4;border:1px solid #E0E0E0;border-radius:14px;padding:4px 6px 4px 10px;font-size:12px;color:#3c4043;max-width:220px}
@@ -283,7 +318,7 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .snooze-menu a{display:flex;align-items:center;gap:16px;padding:10px 16px;cursor:pointer;color:var(--text-primary);text-decoration:none}
 .snooze-menu a:hover{background:rgba(0,0,0,.05)}
 .snooze-menu .material-icons{color:var(--text-secondary);font-size:20px}
-.relabel-menu{min-width:260px;max-height:420px;overflow:auto}
+.relabel-menu{min-width:260px;max-height:420px;overflow:auto;overscroll-behavior:contain}
 .relabel-future{display:flex;align-items:center;gap:8px;padding:12px 16px;margin-top:4px;border-top:1px solid var(--divider);color:var(--text-secondary);font-size:13px;cursor:pointer}
 .relabel-future input{margin:0;flex-shrink:0}
 
@@ -318,7 +353,7 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .compose-drop-hint.show{display:flex}
 /* Contact autocomplete */
 .autocomplete{position:fixed;background:var(--bg-card);border:1px solid var(--divider);border-radius:6px;
-  box-shadow:0 4px 20px rgba(0,0,0,.2);z-index:75;max-height:260px;overflow:auto}
+  box-shadow:0 4px 20px rgba(0,0,0,.2);z-index:75;max-height:260px;overflow:auto;overscroll-behavior:contain}
 .ac-item{display:flex;flex-direction:column;padding:7px 12px;cursor:pointer}
 .ac-item:hover{background:rgba(66,133,244,.1)}
 .ac-name{font-size:14px;color:var(--text-primary)}
@@ -338,19 +373,28 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .cmdk-overlay{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:90;display:flex;align-items:flex-start;justify-content:center;padding-top:14vh}
 .cmdk{width:560px;max-width:92%;background:var(--bg-card);border-radius:10px;box-shadow:0 12px 40px rgba(0,0,0,.35);overflow:hidden}
 .cmdk input{width:100%;border:0;border-bottom:1px solid var(--divider);padding:16px 18px;font:inherit;font-size:16px;outline:none;background:var(--bg-card);color:var(--text-primary)}
-.cmdk-list{max-height:320px;overflow:auto}
+.cmdk-list{max-height:320px;overflow:auto;overscroll-behavior:contain}
 .cmdk-item{display:flex;align-items:center;gap:14px;padding:11px 18px;cursor:pointer;color:var(--text-primary)}
 .cmdk-item .material-icons{font-size:20px;color:var(--text-secondary)}
 .cmdk-item.sel{background:rgba(66,133,244,.12)}
 /* Settings + help cards (centered modal) */
 .modal-overlay.center{align-items:center;justify-content:center}
 .settings-card,.help-card{background:var(--bg-card);width:520px;max-width:94%;border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.3);display:flex;flex-direction:column;max-height:88vh;overflow:hidden}
-.settings-body{padding:8px 18px 4px;overflow:auto}
+.settings-body{padding:8px 18px 4px;overflow:auto;overscroll-behavior:contain}
 .set-field{display:flex;flex-direction:column;gap:6px;margin:14px 0;color:var(--text-primary);font-size:14px}
 .set-field.row{flex-direction:row;align-items:center;gap:10px}
 .set-field>span{font-weight:500;color:var(--text-secondary);font-size:13px}
 .set-field select{padding:8px;border:1px solid var(--divider);border-radius:6px;font:inherit;background:var(--bg-card);color:var(--text-primary)}
 .settings-sig{min-height:80px;border:1px solid var(--divider);border-radius:6px;padding:10px;outline:none;font-size:14px}
+.blocked-list{max-height:160px;overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--divider);border-radius:6px}
+.blocked-row{display:flex;align-items:center;gap:8px;padding:7px 10px;border-bottom:1px solid var(--divider);font-size:13px}
+.blocked-row:last-child{border-bottom:none}
+.blocked-addr{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-primary)}
+.blocked-empty{padding:10px;color:var(--text-secondary);font-size:13px}
+.blocked-add{display:flex;gap:8px}
+.blocked-add input{flex:1;padding:8px;border:1px solid var(--divider);border-radius:6px;font:inherit;background:var(--bg-card);color:var(--text-primary)}
+.ghost-btn{border:1px solid var(--divider);background:var(--bg-card);color:var(--text-primary);border-radius:6px;padding:6px 12px;font:inherit;font-size:13px;cursor:pointer}
+.ghost-btn:hover{background:var(--bg-page)}
 .settings-sig:empty:before{content:attr(data-placeholder);color:#9aa0a6}
 .help-body{padding:14px 20px 20px}
 .help-row{display:flex;justify-content:space-between;gap:16px;padding:7px 0;border-bottom:1px solid var(--divider);font-size:14px;color:var(--text-primary)}
@@ -387,7 +431,7 @@ body{font-family:Roboto,Arial,sans-serif;background:var(--bg-page);color:var(--t
 .alias-new input{flex:1;height:40px;padding:0 12px;border:1px solid var(--divider);background:var(--bg-card);color:var(--text-primary);font-size:14px}
 .alias-new .send-btn{height:40px}
 .alias-new .send-btn:disabled{opacity:.45;cursor:not-allowed}
-.alias-body{padding:0;overflow-y:auto}
+.alias-body{padding:0;overflow-y:auto;overscroll-behavior:contain}
 .alias-empty{padding:24px 16px;color:var(--text-secondary);text-align:center;font-size:13px}
 .alias-empty code{background:var(--bg-page);padding:1px 5px;border:1px solid var(--divider)}
 .alias-row{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--divider)}

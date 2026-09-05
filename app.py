@@ -41,11 +41,12 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+from collections import OrderedDict
 import threading
 import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from email.utils import parsedate_to_datetime
+from email.utils import formataddr, parsedate_to_datetime
 from urllib.parse import quote, urlparse
 
 import random
@@ -69,6 +70,9 @@ CLIENT_SECRET = os.path.join(CRED_DIR, "client_secret.json")
 TOKEN_PATH = os.path.join(CRED_DIR, "token.json")
 DB_PATH = os.path.join(HERE, "snooze.db")
 PORT = 5008
+# How many starred inbox messages the Pinned section pulls outside the normal page.
+# A pin list longer than this stopped being a shortlist, so the tail can page in.
+PINNED_MAX = 50
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",         # read, label, archive
@@ -142,6 +146,7 @@ app = Flask(__name__)
 # run stale code after an update. Combined with the ?v= query, this keeps it fresh.
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 _user_email = None
+_user_name = None    # display name from Gmail's "Send mail as" settings
 
 # ----------------------------------------------------------------------------
 # Gmail REST client (raw HTTPS via google-auth's AuthorizedSession — no
@@ -213,7 +218,7 @@ def _load_or_consent_creds():
 
 
 def get_session():
-    global _session, _user_email
+    global _session, _user_email, _user_name
     if _session is not None:
         return _session
     with _session_lock:
@@ -224,7 +229,38 @@ def get_session():
             _user_email = gget("/profile").get("emailAddress")
         except Exception:
             pass
+    if _user_name is None:
+        _user_name = os.environ.get("INBOX_FROM_NAME") or _lookup_display_name()
     return _session
+
+
+def _lookup_display_name():
+    """The name recipients see beside the address. /profile knows only the address,
+    so without this outgoing mail goes out as a bare "From: someone@gmail.com" and
+    every client renders the raw address.
+
+    Gmail's compose window uses the Google Account profile name, which the Gmail API
+    doesn't expose (it's People API, behind a second consent screen). Two sources
+    that need no extra scope: the "Send mail as" displayName, which Gmail fills in
+    only when it overrides the account name, and failing that the From header Gmail
+    itself wrote on already-sent mail. Returns "" if neither pans out — the send
+    still works, it just goes out unnamed as before."""
+    try:
+        for sa in gget("/settings/sendAs").get("sendAs", []):
+            if sa.get("isPrimary") and sa.get("displayName"):
+                return sa["displayName"]
+    except Exception:
+        pass
+    try:
+        for m in gget("/messages", labelIds="SENT", maxResults=5).get("messages", []):
+            msg = gget(f"/messages/{m['id']}", format="metadata", metadataHeaders=["From"])
+            name, _ = _parse_addr(_header(msg.get("payload", {}).get("headers", []), "From"))
+            # _parse_addr echoes the address back when there's no name phrase.
+            if name and "@" not in name:
+                return name
+    except Exception:
+        pass
+    return ""
 
 
 def get_service():  # back-compat: ensures auth is ready and returns the session
@@ -529,6 +565,55 @@ def _is_inline_part(part):
 # Inline images smaller than this are treated as decoration (logos/signatures/spacers).
 _INLINE_IMG_MAX = 30000
 
+# An embedded image rides in the MIME tree as an attachment part and is referenced from
+# the body as <img src="cid:some-content-id">. Nothing outside the message can resolve
+# that scheme, so left alone every embedded image renders broken.
+_CID_SRC = re.compile(r'(<img\b[^>]*?\bsrc\s*=\s*)(["\']?)cid:([^"\'\s>]+)\2', re.I)
+
+
+def _inline_cid_map(payload):
+    """{content-id -> (attachmentId, mimeType)} for every embedded part in the tree."""
+    out = {}
+
+    def walk(part):
+        aid = (part.get("body") or {}).get("attachmentId")
+        if aid:
+            for h in part.get("headers", []) or []:
+                if h.get("name", "").lower() == "content-id":
+                    cid = (h.get("value") or "").strip().strip("<>").strip()
+                    if cid:
+                        out[cid.lower()] = (aid, part.get("mimeType", "application/octet-stream"))
+            fn = (part.get("filename") or "").strip()
+            if fn:
+                # Some senders reference the part by filename rather than Content-ID.
+                out.setdefault(fn.lower(), (aid, part.get("mimeType", "application/octet-stream")))
+        for sub in part.get("parts", []) or []:
+            walk(sub)
+
+    walk(payload)
+    return out
+
+
+def _resolve_inline_images(html, message_id, payload):
+    """Repoint <img src="cid:…"> at our own attachment proxy so embedded images render.
+
+    These bytes already arrived with the message, so serving them tells the sender
+    nothing. Remote tracking pixels are the ones the image_block setting governs."""
+    if not html or "cid:" not in html.lower():
+        return html
+    cids = _inline_cid_map(payload)
+    if not cids:
+        return html
+
+    def sub(m):
+        hit = cids.get(_htmlmod.unescape(m.group(3)).strip().lower())
+        if not hit:
+            return m.group(0)
+        aid, mime = hit
+        return f'{m.group(1)}"/api/inline/{message_id}/{aid}?mime={quote(mime, safe="")}"'
+
+    return _CID_SRC.sub(sub, html)
+
 
 def _collect_attachments(payload, hide_inline_images=False):
     """Walk the MIME tree for real attachments. Hides embedded decoration (small inline
@@ -656,6 +741,44 @@ def ensure_filter(sender, label_id):
     return True
 
 
+def _bare_addr(value):
+    """'Jane Doe <jane@x.com>' -> 'jane@x.com', lowercased."""
+    return _parse_addr(value or "")[1].strip().lower()
+
+
+def find_block_filters(email):
+    """Filter ids that block `email`. A block is Gmail's own construct: a filter on the
+    sender whose action is TRASH (that's what the Gmail UI's Block creates, and what its
+    Settings > Filters page shows as 'Delete it'), so blocks made here and blocks made in
+    Gmail are the same object and unblocking in either place works."""
+    email = (email or "").strip().lower()
+    if not email:
+        return []
+    out = []
+    for f in gget("/settings/filters").get("filter", []) or []:
+        crit = f.get("criteria", {}) or {}
+        act = f.get("action", {}) or {}
+        if (crit.get("from", "").strip().lower() == email
+                and "TRASH" in (act.get("addLabelIds") or [])):
+            out.append(f["id"])
+    return out
+
+
+def list_blocked_senders():
+    out = []
+    for f in gget("/settings/filters").get("filter", []) or []:
+        crit = f.get("criteria", {}) or {}
+        act = f.get("action", {}) or {}
+        sender = (crit.get("from") or "").strip()
+        # Only surface plain single-sender blocks; a hand-built filter with extra
+        # criteria isn't ours to present as an unblockable row.
+        if (sender and "TRASH" in (act.get("addLabelIds") or [])
+                and not any(crit.get(k) for k in ("to", "subject", "query", "hasAttachment"))):
+            out.append({"id": f["id"], "email": sender})
+    out.sort(key=lambda r: r["email"].lower())
+    return out
+
+
 # format=full but a fields mask that returns headers + the attachment part tree
 # WITHOUT the body bytes — so list rows get attachments cheaply (no big body download).
 _PART = "partId,mimeType,filename,headers,body/attachmentId,body/size"
@@ -663,11 +786,68 @@ _LIST_FIELDS = ("id,threadId,internalDate,labelIds,snippet,"
                 f"payload(mimeType,headers,parts({_PART},parts({_PART},parts({_PART}))))")
 
 
+# Per-message metadata cache. A message's headers, snippet, date and part tree are
+# immutable once delivered; only its labelIds move (read, star, archive, bundle). So a
+# repaint does not need to re-download all 50 rows -- it needs to re-download the rows
+# whose labels actually changed. The history poller already knows exactly which ids
+# those are, and every local mutation funnels through modify_thread, so both evict here.
+# Before this cache every silent refresh cost 5 quota units per visible row, which is
+# what pushed the app past Gmail's 15,000-units-per-minute-per-user ceiling.
+_META_CAP = 3000
+_meta_cache = OrderedDict()      # mid -> message dict
+_meta_tids = {}                  # tid -> set(mid), so a thread mutation evicts its messages
+_meta_lock = threading.Lock()
+
+
+def _meta_evict(mids):
+    """Drop cached metadata for these message ids (their labels may have moved)."""
+    with _meta_lock:
+        for mid in mids:
+            msg = _meta_cache.pop(mid, None)
+            if msg:
+                tid = msg.get("threadId")
+                if tid in _meta_tids:
+                    _meta_tids[tid].discard(mid)
+                    if not _meta_tids[tid]:
+                        del _meta_tids[tid]
+
+
+def _meta_evict_thread(tid):
+    """Drop every cached message in a thread, after a local label change on it."""
+    with _meta_lock:
+        mids = list(_meta_tids.pop(tid, ()))
+    if mids:
+        _meta_evict(mids)
+
+
+def _meta_put(mid, msg):
+    with _meta_lock:
+        _meta_cache[mid] = msg
+        _meta_cache.move_to_end(mid)
+        tid = msg.get("threadId")
+        if tid:
+            _meta_tids.setdefault(tid, set()).add(mid)
+        while len(_meta_cache) > _META_CAP:
+            old_mid, old_msg = _meta_cache.popitem(last=False)
+            old_tid = old_msg.get("threadId")
+            if old_tid in _meta_tids:
+                _meta_tids[old_tid].discard(old_mid)
+                if not _meta_tids[old_tid]:
+                    del _meta_tids[old_tid]
+
+
 def _get_meta(mid):
+    with _meta_lock:
+        hit = _meta_cache.get(mid)
+        if hit is not None:
+            _meta_cache.move_to_end(mid)
+            return hit
     try:
-        return gget(f"/messages/{mid}", format="full", fields=_LIST_FIELDS)
+        msg = gget(f"/messages/{mid}", format="full", fields=_LIST_FIELDS)
     except Exception:
         return None  # message vanished (deleted/moved) — drop it
+    _meta_put(mid, msg)
+    return msg
 
 
 def summarize_ids(ids, outgoing=False):
@@ -758,6 +938,7 @@ def fetch_thread(thread_id):
         name, email_addr = _parse_addr(_header(headers, "From"))
         subject = subject or _header(headers, "Subject")
         text, html = _decode_body(m.get("payload", {}))
+        html = _resolve_inline_images(html, m.get("id"), m.get("payload", {}))
         vis_html, quoted_html = split_quoted_html(html)
         rfc_id = _header(headers, "Message-ID")
         if rfc_id:
@@ -774,6 +955,7 @@ def fetch_thread(thread_id):
             "senderEmail": email_addr,
             "to": _header(headers, "To"),
             "cc": _header(headers, "Cc"),   # needed for reply-all
+            "bcc": _header(headers, "Bcc"),  # only present on the sender's sent copy
             "date": _fmt_time(_header(headers, "Date")),
             "text": text,
             "html": vis_html,            # new content only; quoted history split out below
@@ -823,7 +1005,9 @@ def modify_thread(thread_id, add=None, remove=None):
         body["addLabelIds"] = add
     if remove:
         body["removeLabelIds"] = remove
-    return gpost(f"/threads/{thread_id}/modify", json=body)
+    resp = gpost(f"/threads/{thread_id}/modify", json=body)
+    _meta_evict_thread(thread_id)  # labels just moved; cached rows for it are stale
+    return resp
 
 
 def ensure_label(name):
@@ -856,7 +1040,9 @@ def _build_raw_message(to, subject, body, cc=None, bcc=None, in_reply_to=None,
         msg["Bcc"] = bcc            # Gmail strips Bcc from the delivered copy
     msg["Subject"] = subject
     if _user_email:
-        msg["From"] = _user_email
+        # Gmail passes a raw message's From through untouched (it only checks the
+        # address is one you may send as), so the display name has to be set here.
+        msg["From"] = formataddr((_user_name or "", _user_email))
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
         # RFC 2822 wants the full ancestry; fall back to just the parent id.
@@ -926,6 +1112,15 @@ def migrate_db():
         https_url  TEXT NOT NULL DEFAULT '',
         checked_at INTEGER NOT NULL
     )""")
+    # Cache of the Docs/Drive link extraction (per message): links is a JSON array,
+    # '[]' means scanned and nothing found. A message body never changes once it has
+    # arrived, so this is a permanent answer — without it the list re-downloaded every
+    # visible body on every repaint, which was the single largest quota drain in the app.
+    conn.execute("""CREATE TABLE IF NOT EXISTS doc_links (
+        message_id TEXT PRIMARY KEY,
+        links      TEXT NOT NULL DEFAULT '[]',
+        checked_at INTEGER NOT NULL
+    )""")
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     if "snoozed" in tables:
         now = int(time.time())
@@ -953,6 +1148,7 @@ SETTINGS_DEFAULTS = {
     "page_size": 50,
     "followup_default_days": 3,
     "notifications": True,         # Inbox-branded macOS banners on new unread mail
+    "notification_sound": True,    # play the system alert sound with each banner
 }
 
 
@@ -1115,34 +1311,52 @@ def _scheduler_loop():
 # ----------------------------------------------------------------------------
 # Native push notifications — Inbox-branded macOS banners on new unread mail
 # ----------------------------------------------------------------------------
-# Fired by the history poller below. Uses terminal-notifier with the bundled favicon
-# as -appIcon so every banner carries the Inbox glyph. Clicking opens the exact thread
-# via the inboxclone:// scheme the link handler already serves. Honors the Settings toggle.
+# Fired by the history poller below. Banners are sent through "Inbox Notifier.app"
+# (a rebranded terminal-notifier copy built once by setup_notifier.sh), so
+# Notification Center attributes them to "Inbox" with the real app icon and gives
+# them their own row in System Settings → Notifications. Without that bundle we
+# fall back to plain terminal-notifier dressed up with the bundled favicon
+# (which macOS attributes to terminal-notifier / Terminal).
 #
-# Optional: set INBOX_NOTIFY_SENDER to a local app's bundle id (e.g. the Inbox.app
-# launcher's) to also have the banner show that app's name and group under it in
-# Notification Center. Left unset in the repo on purpose — a bundle id is machine-
-# specific and can embed a real name, which must never land in this public repo.
-_NOTIFIER = shutil.which("terminal-notifier")
-_NOTIFY_SENDER = os.environ.get("INBOX_NOTIFY_SENDER")  # bundle id; favicon is the fallback brand
+# Fallback-only option: set INBOX_NOTIFY_SENDER to a local app's bundle id to have
+# plain terminal-notifier banners show that app's name. Left unset in the repo on
+# purpose — a bundle id is machine-specific and can embed a real name, which must
+# never land in this public repo. (setup_notifier.sh derives the branded bundle's
+# id from the installed launcher at build time for the same reason.)
+_NOTIFIER_BRANDED = os.path.expanduser(
+    "~/Library/Application Support/Inbox/Inbox Notifier.app/Contents/MacOS/terminal-notifier")
+if not os.path.exists(_NOTIFIER_BRANDED):
+    _NOTIFIER_BRANDED = None
+_NOTIFIER = _NOTIFIER_BRANDED or shutil.which("terminal-notifier")
+_NOTIFY_SENDER = os.environ.get("INBOX_NOTIFY_SENDER")  # fallback path only, see above
 _NOTIFY_ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "favicon.png")
 _notified_ids = set()   # message ids already pushed, so a re-poll never double-fires
 _NOTIFIED_CAP = 500
 
 
-def _notify(title, message, thread_id=None):
+def _notify(title, message, subtitle=None, thread_id=None, group=None):
     """Fire one Inbox-branded macOS notification. Fire-and-forget; never blocks the
-    poller. No-op if terminal-notifier isn't installed."""
+    poller. No-op if no notifier is installed."""
     if not _NOTIFIER:
         return
     cmd = [_NOTIFIER, "-title", title, "-message", message]
-    if _NOTIFY_SENDER:
-        cmd += ["-sender", _NOTIFY_SENDER]   # show + group under that app (incl. its icon)
-    if os.path.exists(_NOTIFY_ICON):
-        cmd += ["-appIcon", _NOTIFY_ICON]    # bundled Inbox glyph — the default branding
-    if thread_id:
-        # -execute wins over -sender for the click action: deep-link to the thread.
-        cmd += ["-execute", f'open "inboxclone://thread/{thread_id}"']
+    if subtitle:
+        cmd += ["-subtitle", subtitle]
+    if group:
+        # Same group -> new banner replaces the stale one instead of stacking.
+        cmd += ["-group", group]
+    if _get_setting("notification_sound", True):
+        cmd += ["-sound", "default"]
+    if not _NOTIFIER_BRANDED:
+        # Plain terminal-notifier: dress it up as best we can.
+        if _NOTIFY_SENDER:
+            cmd += ["-sender", _NOTIFY_SENDER]   # show + group under that app (incl. its icon)
+        if os.path.exists(_NOTIFY_ICON):
+            cmd += ["-appIcon", _NOTIFY_ICON]    # bundled Inbox glyph — the default branding
+    # -execute wins over -sender for the click action: deep-link to the exact thread,
+    # or just raise the app for a summary banner. The link handler serves both forms.
+    target = f"inboxclone://thread/{thread_id}" if thread_id else "inboxclone://"
+    cmd += ["-execute", f'open "{target}"']
     try:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
@@ -1169,7 +1383,8 @@ def _notify_new_mail(message_ids):
         headers = m.get("payload", {}).get("headers", [])
         name, addr = _parse_addr(_header(headers, "From"))
         subject = _header(headers, "Subject") or "(no subject)"
-        cards.append((name or addr or "New message", subject, m.get("threadId")))
+        snippet = _htmlmod.unescape(m.get("snippet", "")).strip()
+        cards.append((name or addr or "New message", subject, snippet, m.get("threadId")))
     # Bound the dedupe set so it can't grow without limit on a long-running process.
     if len(_notified_ids) > _NOTIFIED_CAP:
         for mid in list(_notified_ids)[:-_NOTIFIED_CAP]:
@@ -1177,11 +1392,18 @@ def _notify_new_mail(message_ids):
     if not cards:
         return
     if len(cards) == 1:
-        sender, subject, tid = cards[0]
-        _notify(sender, subject, tid)
+        sender, subject, snippet, tid = cards[0]
+        # Full-card layout: sender / subject / body preview. Without a snippet the
+        # subject stays in the message slot so the banner never looks empty.
+        if snippet:
+            _notify(sender, snippet[:180], subtitle=subject[:120], thread_id=tid,
+                    group=f"thread-{tid}" if tid else None)
+        else:
+            _notify(sender, subject, thread_id=tid,
+                    group=f"thread-{tid}" if tid else None)
     else:
         senders = ", ".join(dict.fromkeys(c[0] for c in cards))
-        _notify(f"{len(cards)} new messages", senders[:120])
+        _notify(f"{len(cards)} new messages", senders[:120], group="new-mail-burst")
 
 
 # ----------------------------------------------------------------------------
@@ -1203,6 +1425,17 @@ def _history_loop():
                                 historyTypes=["messageAdded", "labelAdded", "labelRemoved"])
                     if resp.get("history"):
                         SYNC["version"] += 1  # something changed -> tell the browser
+                        # Someone (another client, a filter, Gmail itself) moved labels.
+                        # Drop those rows from the metadata cache so the next repaint
+                        # refetches exactly them and nothing else.
+                        _meta_evict({m.get("id") for h in resp["history"]
+                                     for key in ("messages", "messagesAdded",
+                                                 "labelAdded", "labelRemoved",
+                                                 "messagesDeleted")
+                                     for rec in (h.get(key) or [])
+                                     for m in ([rec] if key == "messages"
+                                               else [rec.get("message", {})])
+                                     if m.get("id")})
                         # Scan newly-arrived inbox mail for body-buried unsubscribe links now,
                         # so the banner is ready in the list row by the time it's viewed.
                         added = [ma["message"]["id"]
@@ -1266,6 +1499,38 @@ def unsub_cache_put(mid, url):
         with conn:
             conn.execute("INSERT OR REPLACE INTO unsub_scan (message_id, https_url, checked_at) "
                          "VALUES (?,?,?)", (mid, url or "", int(time.time())))
+    finally:
+        conn.close()
+
+
+def doc_links_cache_get(ids):
+    """Return {message_id: [link, ...]} for ids already scanned. Missing key = never scanned."""
+    ids = [i for i in ids if i]
+    if not ids:
+        return {}
+    out, conn = {}, db()
+    try:
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            ph = ",".join("?" * len(chunk))
+            for mid, links in conn.execute(
+                    f"SELECT message_id, links FROM doc_links WHERE message_id IN ({ph})",
+                    chunk).fetchall():
+                try:
+                    out[mid] = json.loads(links)
+                except Exception:
+                    out[mid] = []
+    finally:
+        conn.close()
+    return out
+
+
+def doc_links_cache_put(mid, links):
+    conn = db()
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO doc_links (message_id, links, checked_at) "
+                         "VALUES (?,?,?)", (mid, json.dumps(links or []), int(time.time())))
     finally:
         conn.close()
 
@@ -1436,13 +1701,28 @@ def api_inbox():
         ids, next_token = list_ids(label_ids=["INBOX"], max_results=limit,
                                    page_token=token, return_token=True)
         rows = summarize_ids(ids)
+        # Pins are a shortlist, not a page of mail: a star from three weeks ago has to
+        # stay at the top of the inbox even after 50 newer conversations bury it. Paging
+        # alone can't do that (the starred thread sits several "Load more" clicks down,
+        # and bundle counts satisfy the client's fill target long before it gets there),
+        # so fetch the starred inbox on its own and merge it into the first page.
+        if not token:
+            seen_ids = set(ids)
+            seen_tids = {r["id"] for r in rows}
+            star_ids = [i for i in list_ids(label_ids=["INBOX", "STARRED"],
+                                            max_results=PINNED_MAX)
+                        if i not in seen_ids]
+            if star_ids:
+                rows += [r for r in summarize_ids(star_ids)
+                         if r["pinned"] and r["id"] not in seen_tids]
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     try:
         total, unread = inbox_totals()
     except Exception:
         total, unread = None, None
-    pinned = [r for r in rows if r["pinned"]]
+    pinned = sorted((r for r in rows if r["pinned"]),
+                    key=lambda r: int(r["ts"]), reverse=True)
     primary = [r for r in rows if not r["bundle"] and not r["pinned"]]
     # Smart-sort: float Gmail-flagged IMPORTANT + unread mail to the top, preserving
     # recency order within each group. A non-AI "priority inbox" honoring local/calm.
@@ -1639,6 +1919,28 @@ def api_attachment(message_id, attachment_id):
         disp = "inline" if (mime.startswith("image/") or mime == "application/pdf") else "attachment"
         return Response(content, mimetype=mime,
                         headers={"Content-Disposition": f'{disp}; filename="{name}"'})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+_SAFE_IMG_MIME = re.compile(r"^image/[a-z0-9.+-]{1,32}$", re.I)
+
+
+@app.route("/api/inline/<message_id>/<attachment_id>")
+def api_inline(message_id, attachment_id):
+    """Serve an embedded (cid:) image so the body renders it. Separate from
+    /api/attachment because this one is always inline, never a download."""
+    try:
+        mime = request.args.get("mime") or ""
+        # The mime rides in the URL, so never echo it into a header unvalidated.
+        if not _SAFE_IMG_MIME.match(mime):
+            mime = "application/octet-stream"
+        data = gget(f"/messages/{message_id}/attachments/{attachment_id}")
+        content = base64.urlsafe_b64decode(data.get("data", ""))
+        return Response(content, mimetype=mime, headers={
+            "Content-Disposition": "inline",
+            "Cache-Control": "private, max-age=3600",
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1937,6 +2239,113 @@ def api_mark():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/spam", methods=["POST"])
+def api_spam():
+    """Report a thread as spam. Gmail's classifier learns from this, so it also teaches
+    the filter. That's why this stays separate from blocking the sender outright."""
+    d = request.json or {}
+    tid = d.get("threadId")
+    if not tid:
+        return jsonify({"error": "missing threadId"}), 400
+    try:
+        modify_thread(tid, add=["SPAM"], remove=["INBOX", "UNREAD"])
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.exception("mark spam failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/not_spam", methods=["POST"])
+def api_not_spam():
+    d = request.json or {}
+    tid = d.get("threadId")
+    if not tid:
+        return jsonify({"error": "missing threadId"}), 400
+    try:
+        modify_thread(tid, add=["INBOX"], remove=["SPAM"])
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/bulk_spam", methods=["POST"])
+def api_bulk_spam():
+    ids = (request.json or {}).get("threadIds") or []
+    done, failed = _bulk_modify(ids, add=["SPAM"], remove=["INBOX", "UNREAD"])
+    return jsonify({"ok": True, "done": done, "failed": failed})
+
+
+@app.route("/api/bulk_not_spam", methods=["POST"])
+def api_bulk_not_spam():
+    ids = (request.json or {}).get("threadIds") or []
+    _bulk_modify(ids, add=["INBOX"], remove=["SPAM"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/blocked")
+def api_blocked():
+    try:
+        return jsonify({"blocked": list_blocked_senders()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/block", methods=["POST"])
+def api_block():
+    """Block a sender: everything they send from now on lands in Trash, unread and unseen.
+
+    Gmail filters only run on mail that arrives after they exist, so the thread in hand
+    gets trashed here too. Otherwise blocking someone leaves their message sitting in
+    the inbox, which reads like the block failed."""
+    d = request.json or {}
+    email = _bare_addr(d.get("email"))
+    tid = d.get("threadId")
+    if not email or "@" not in email:
+        return jsonify({"error": "no sender address"}), 400
+    if email == (_user_email or "").lower():
+        return jsonify({"error": "that's your own address"}), 400
+    try:
+        existing = find_block_filters(email)
+        if existing:
+            fid = existing[0]
+        else:
+            created = gpost("/settings/filters", json={
+                "criteria": {"from": email},
+                "action": {"addLabelIds": ["TRASH"], "removeLabelIds": ["INBOX"]},
+            })
+            fid = created.get("id")
+        trashed = False
+        if tid:
+            modify_thread(tid, add=["TRASH"], remove=["INBOX", "UNREAD"])
+            trashed = True
+        return jsonify({"ok": True, "email": email, "filterId": fid,
+                        "already": bool(existing), "trashed": trashed})
+    except Exception as e:
+        log.exception("block sender failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/unblock", methods=["POST"])
+def api_unblock():
+    """Undo a block: drop the filter and (when undoing right after) un-trash the thread."""
+    d = request.json or {}
+    email = _bare_addr(d.get("email"))
+    tid = d.get("threadId")
+    if not email:
+        return jsonify({"error": "no sender address"}), 400
+    try:
+        removed = 0
+        for fid in find_block_filters(email):
+            gdelete(f"/settings/filters/{fid}")
+            removed += 1
+        if tid:
+            modify_thread(tid, add=["INBOX"], remove=["TRASH"])
+        return jsonify({"ok": True, "removed": removed})
+    except Exception as e:
+        log.exception("unblock sender failed")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/followup", methods=["POST"])
 def api_followup():
     """Queue a 'remind me if no reply' nudge on a sent thread."""
@@ -2039,18 +2448,31 @@ def api_doc_links():
     attachment bytes, no headers."""
     mids = (request.json or {}).get("messageIds") or []
     mids = [m for m in mids if m][:80]
+    if not mids:
+        return jsonify({})
+    # A body never changes after delivery, so the extraction is a permanent answer.
+    # Serve it from SQLite and only pay Gmail for ids we have never scanned; the list
+    # re-asks for every visible row on every repaint, and paying for that each time was
+    # the app's largest single quota cost.
+    out = doc_links_cache_get(mids)
+    todo = [m for m in mids if m not in out]
+
     def one(mid):
         try:
             msg = gget(f"/messages/{mid}", format="full", fields="payload")
             _, html = _decode_body(msg.get("payload", {}))
             return mid, extract_doc_links(html)
         except Exception:
-            return mid, []
-    out = {}
-    if mids:
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            for mid, links in ex.map(one, mids):
+            return mid, None  # transient failure — leave it uncached so we retry later
+
+    if todo:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            for mid, links in ex.map(one, todo):
+                if links is None:
+                    out[mid] = []
+                    continue
                 out[mid] = links
+                doc_links_cache_put(mid, links)
     return jsonify(out)
 
 

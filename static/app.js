@@ -136,6 +136,7 @@ function cardEl(row) {
       <button class="icon-btn act-pin" title="Pin"><i class="material-icons">push_pin</i></button>
       <button class="icon-btn act-snooze" title="Snooze"><i class="material-icons">schedule</i></button>
       <button class="icon-btn act-label" title="Move to bundle"><i class="material-icons">label</i></button>
+      <button class="icon-btn act-spam" title="Report spam"><i class="material-icons">report</i></button>
       <button class="icon-btn act-done" title="Done"><i class="material-icons" style="color:var(--done-green)">playlist_add_check</i></button>
       <button class="icon-btn act-things" title="Send to Things 3"><img class="things-icon" src="/static/things-icon.png?v=37" alt="Send to Things 3"></button>
     </div>`;
@@ -173,6 +174,7 @@ function cardEl(row) {
   wire(".act-pin", (e) => { e.stopPropagation(); doPin(row); });
   wire(".act-snooze", (e) => { e.stopPropagation(); openSnooze(e.currentTarget, row); });
   wire(".act-label", (e) => { e.stopPropagation(); openRelabel(e.currentTarget, row); });
+  wire(".act-spam", (e) => { e.stopPropagation(); doSpam(row); });
   wire(".act-things", (e) => { e.stopPropagation(); doThings(row); });
   wire(".act-restore", (e) => { e.stopPropagation(); doRestore(row); });
   const ul = el.querySelector(".unsub-link");
@@ -242,7 +244,18 @@ function bundleEl(b) {
   return el;
 }
 
-function render() {
+// render() repaints the whole list, so it ALWAYS runs through the scroll anchor —
+// every caller (optimistic pin, rollback, live sync, backfill) would otherwise move
+// the ground under the reader. Pass {top:true} for the one case where starting at the
+// top is correct: an explicit view change.
+function render(opts) {
+  const top = !!(opts && opts.top === true);
+  const anchor = top ? null : captureScrollAnchor();
+  paintList();
+  if (top) scrollPageTop();
+  else restoreScrollAnchor(anchor);
+}
+function paintList() {
   const list = $("#list");
   list.innerHTML = "";
   const d = STATE.data;
@@ -321,10 +334,22 @@ function refreshFooter() {
 // the topmost conversation currently in view and re-pin it to the same screen position
 // after the render, so whatever you're looking at stays put — no jerk, ever.
 const APPBAR_H = 56; // sticky app bar height; cards above this line are scrolled away
+// While an overlay holds the page scroll frozen (see lockPageScroll) the document's own
+// scrollTop reads 0, so all three of these go through the lock's remembered offset. Card
+// rects stay meaningful either way — the frozen body is simply parked at -scrollLockY.
+function pageScrollY() { return pageLocked ? scrollLockY : (window.scrollY || (document.scrollingElement || document.documentElement).scrollTop || 0); }
+function scrollPageBy(dy) {
+  if (!dy) return;
+  if (pageLocked) { scrollLockY = Math.max(0, scrollLockY + dy); document.body.style.top = -scrollLockY + "px"; }
+  else (document.scrollingElement || document.documentElement).scrollBy(0, dy);
+}
+function scrollPageTop() {
+  if (pageLocked) { scrollLockY = 0; document.body.style.top = "0px"; }
+  else (document.scrollingElement || document.documentElement).scrollTo(0, 0);
+}
 function captureScrollAnchor() {
-  const sc = document.scrollingElement || document.documentElement;
   // At the very top: don't anchor, so freshly arrived mail can reveal itself naturally.
-  if (sc.scrollTop < 4) return null;
+  if (pageScrollY() < 4) return null;
   for (const c of document.querySelectorAll('#list .card[data-tid]')) {
     const r = c.getBoundingClientRect();
     if (r.bottom > APPBAR_H + 8) return { tid: c.dataset.tid, top: r.top };
@@ -336,16 +361,46 @@ function restoreScrollAnchor(anchor) {
   const sel = window.CSS && CSS.escape ? CSS.escape(anchor.tid) : anchor.tid;
   const el = document.querySelector(`#list .card[data-tid="${sel}"]`);
   if (!el) return; // the anchored conversation is gone — leave scroll where it is
-  const delta = el.getBoundingClientRect().top - anchor.top;
-  if (delta) (document.scrollingElement || document.documentElement).scrollBy(0, delta);
+  scrollPageBy(el.getBoundingClientRect().top - anchor.top);
 }
-// Full re-render that keeps the viewport pinned (used when backfill changes structure,
-// e.g. a new bundle category appears, where an incremental append can't place it).
-function scrollPreservingRender() {
+// Kept as a name for the "structure changed above the fold" call sites; render() itself
+// now anchors, so this is just render().
+function scrollPreservingRender() { render(); }
+// Run a DOM change that resizes content, keeping whatever is on screen on screen. Used
+// for late-arriving decoration (Docs chips) that would otherwise grow cards above you.
+function withListAnchor(fn) {
   const a = captureScrollAnchor();
-  render();
+  fn();
   restoreScrollAnchor(a);
 }
+// ---------- Page scroll lock (overlays) ----------
+// The reader/compose/settings overlays cover the page. Without a lock, a wheel event
+// that runs past the end of an overlay's own scroller chains into the inbox behind it,
+// so closing the overlay drops you somewhere you never scrolled to. Freeze the body at
+// its current offset while any overlay is up, and put the exact offset back after.
+let pageLocked = false, scrollLockY = 0;
+const OVERLAY_SELECTORS = ["#reader", "#composeOverlay", "#settingsOverlay", "#aliasOverlay", "#cmdkOverlay"];
+function syncScrollLock() {
+  const open = OVERLAY_SELECTORS.some((s) => { const e = $(s); return e && !e.hidden; });
+  if (open === pageLocked) return;
+  if (open) {
+    scrollLockY = window.scrollY || (document.scrollingElement || document.documentElement).scrollTop || 0;
+    document.body.style.top = -scrollLockY + "px";
+    document.body.classList.add("scroll-locked");
+    pageLocked = true;
+  } else {
+    pageLocked = false;
+    document.body.classList.remove("scroll-locked");
+    document.body.style.top = "";
+    window.scrollTo(0, scrollLockY);
+  }
+}
+// Overlays are opened and closed from a dozen places by flipping `hidden`; watching the
+// attribute means every one of them is covered without threading a call through each.
+(function watchOverlays() {
+  const obs = new MutationObserver(syncScrollLock);
+  OVERLAY_SELECTORS.forEach((s) => { const e = $(s); if (e) obs.observe(e, { attributes: true, attributeFilter: ["hidden"] }); });
+})();
 // Tag conversations that weren't on screen before this render so CSS can fade them in
 // gently instead of popping. `prev` is the set of tids present before render().
 function markArrivals(prev) {
@@ -401,6 +456,44 @@ async function doDone(row) {
     render();
     toast("Couldn't archive — restored");
   }
+  ensureFilled();
+}
+// Report spam. Same optimistic pattern as Done, but the undo has to put the thread back
+// in the inbox AND clear the SPAM label, or Gmail keeps re-filing it.
+async function doSpam(row) {
+  const snap = { ...row };
+  removeCard(row.id);
+  removeFromData(row.id);
+  try {
+    await post("/api/spam", { threadId: row.id });
+    toast("Reported spam", async () => {
+      await post("/api/not_spam", { threadId: row.id });
+      load();
+    });
+  } catch (err) {
+    (STATE.data.primary || STATE.data.items || (STATE.data.primary = [])).unshift(snap);
+    STATE.threads.set(snap.id, snap);
+    render();
+    toast("Couldn't report spam, restored");
+  }
+  ensureFilled();
+}
+// Block a sender outright: a Gmail filter sends everything they send next straight to
+// Trash. Confirmed first, since it's the one action here that swallows future mail.
+async function doBlock(email, threadId, opts = {}) {
+  const who = (email || "").trim();
+  if (!who) { toast("No sender address"); return; }
+  if (!confirm(`Block ${who}?\n\nEverything they send from now on goes straight to Trash, and this conversation gets trashed too. You can unblock them in Settings.`)) return;
+  const r = await post("/api/block", { email: who, threadId });
+  if (!r.ok) { toast(r.error || "Couldn't block sender"); return; }
+  if (threadId) { removeCard(threadId); removeFromData(threadId); }
+  if (opts.closeReader) closeReader();
+  toast(r.already ? `${who} was already blocked` : `Blocked ${who}`, async () => {
+    await post("/api/unblock", { email: who, threadId });
+    STATE.inboxCache = null;
+    load();
+    toast(`Unblocked ${who}`);
+  });
   ensureFilled();
 }
 // Optimistic pin: flip in place and move between Pinned/Mail sections — no reload flash.
@@ -460,6 +553,20 @@ async function bulkDone() {
   if (!res || res.error) { load(); toast("Couldn't archive — restored"); return; }
   toast(`${ids.length} marked done`, async () => {
     await post("/api/bulk_undo_done", { threadIds: ids });
+    load();
+  });
+}
+async function bulkSpam() {
+  const ids = [...STATE.selected];
+  if (!ids.length) return;
+  ids.forEach((id) => { removeCard(id); removeFromData(id); });
+  clearSelection();
+  ensureFilled();
+  let res;
+  try { res = await post("/api/bulk_spam", { threadIds: ids }); } catch (_) { res = { error: 1 }; }
+  if (!res || res.error) { load(); toast("Couldn't report spam, restored"); return; }
+  toast(`${ids.length} reported as spam`, async () => {
+    await post("/api/bulk_not_spam", { threadIds: ids });
     load();
   });
 }
@@ -524,6 +631,19 @@ async function doRestore(row) {
 function removeCard(tid) {
   document.querySelectorAll(`.card[data-tid="${tid}"]`).forEach((c) => {
     if (c.classList.contains("removing")) return; // already collapsing
+    // Scrolled past it? Then the collapse is playing to an empty house — all you'd feel
+    // is the list hitching upward as the gap closes somewhere behind you. Drop it in one
+    // frame instead, and pin the viewport across the drop.
+    //
+    // The correction is measured, not computed: both engines already re-pin the page
+    // themselves when a node above the scroll offset is removed (this is layout scroll
+    // adjustment, which they do have — unlike overflow-anchor), so subtracting the card's
+    // height by hand would double it and scroll you a card too far. Anchoring on what
+    // ACTUALLY moved is zero here and still correct if a path ever doesn't self-adjust.
+    if (c.getBoundingClientRect().bottom <= APPBAR_H + 8) {
+      withListAnchor(() => c.remove());
+      return;
+    }
     c.style.maxHeight = c.offsetHeight + "px";
     c.getBoundingClientRect();                     // force reflow so max-height has a start value to animate from
     c.classList.add("removing");
@@ -595,6 +715,7 @@ document.addEventListener("click", (e) => {
 // ---------- Selection bar wiring ----------
 $("#selClear").onclick = clearSelection;
 $("#selDone").onclick = bulkDone;
+$("#selSpam").onclick = bulkSpam;
 $("#selPin").onclick = bulkPin;
 $("#selThings").onclick = bulkThings;
 $("#selSnooze").onclick = (e) => openSnoozeMulti(e.currentTarget);
@@ -671,7 +792,12 @@ function openSnoozeFromSwipe(el, row) { openSnooze(el.querySelector(".act-snooze
 // ---------- Thread reader ----------
 // Block remote images (read-receipt tracking) by injecting a CSP into the sandboxed
 // srcdoc. data: images and inline styles still render; remote http(s) images don't.
-const IMG_CSP = '<meta http-equiv="Content-Security-Policy" content="img-src data:; style-src \'unsafe-inline\' data:; font-src data:; default-src \'none\'">';
+// 'self'/our own origin stays allowed so EMBEDDED images (cid: parts, rewritten
+// server-side to /api/inline/…) still render while blocking is on. Those bytes came
+// with the message, so showing them tells the sender nothing. Only remote hosts, where
+// the tracking pixels live, get cut off.
+const IMG_CSP = () => '<meta http-equiv="Content-Security-Policy" content="img-src data: \'self\' '
+  + location.origin + '; style-src \'unsafe-inline\' data:; font-src data:; default-src \'none\'">';
 const HAS_REMOTE_IMG = /<img[^>]+src=["']?https?:/i;
 // Force every email link to default to a new browsing context. Paired with the iframe's
 // allow-popups sandbox flag, this routes every click through pywebview's createWebView
@@ -679,6 +805,36 @@ const HAS_REMOTE_IMG = /<img[^>]+src=["']?https?:/i;
 // target=_blank links to the browser (never normal in-frame clicks), so without this a link
 // would just navigate the app in-place. See stripIframeLinkTargets for the full mechanism.
 const BASE_BLANK = '<base target="_blank">';
+
+// Live ResizeObservers for the message iframes of the open thread (torn down per thread).
+let readerFrames = [];
+// Run a change that resizes reader content while keeping the message you're looking at
+// fixed on screen. The reader has its own scroller, and WebKit has no native scroll
+// anchoring, so a message resizing above the fold moves your text out from under you
+// unless we compensate by hand.
+function withReaderAnchor(fn) {
+  const sc = $("#readerBody");
+  if (!sc || sc.scrollTop < 2) { fn(); return; }
+  const fold = sc.getBoundingClientRect().top;
+  let el = null, top = 0;
+  for (const msg of sc.querySelectorAll(".msg")) {
+    const r = msg.getBoundingClientRect();
+    if (r.bottom > fold + 8) { el = msg; top = r.top; break; }
+  }
+  fn();
+  if (!el) return;
+  const delta = el.getBoundingClientRect().top - top;
+  if (delta) sc.scrollTop += delta;
+}
+// Size a message frame to its content. No-ops when the height hasn't actually changed,
+// so the ResizeObserver can't loop.
+function sizeFrame(f, doc) {
+  let h;
+  try { h = Math.max(doc.body.scrollHeight, doc.documentElement.scrollHeight || 0) + 24; }
+  catch (e) { return; }
+  if (!h || Math.abs(parseFloat(f.style.height) - h) < 1) return;
+  withReaderAnchor(() => { f.style.height = h + "px"; f.style.minHeight = "0"; });
+}
 
 function renderMsgBody(mb, m, forceImages, showQuoted) {
   if (mb.dataset.rendered && !forceImages && !showQuoted) return;
@@ -723,8 +879,17 @@ function renderMsgBody(mb, m, forceImages, showQuoted) {
       try {
         const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
         if (doc && doc.body && (doc.URL === "about:srcdoc" || doc.body.children.length > 0)) {
-          f.style.height = (doc.body.scrollHeight + 24) + "px";
+          sizeFrame(f, doc);
           stripIframeLinkTargets(doc);
+          // Images and webfonts land after the first measurement, and each one that lands
+          // grows the message. Keep re-measuring, always through the reader anchor, so a
+          // message ABOVE the one you're reading can grow without moving your place.
+          if (window.ResizeObserver && !f.dataset.observed) {
+            f.dataset.observed = "1";
+            const ro = new ResizeObserver(() => sizeFrame(f, doc));
+            ro.observe(doc.documentElement);
+            readerFrames.push(ro);
+          }
           ok = true;
         }
       } catch (e) {}
@@ -734,7 +899,7 @@ function renderMsgBody(mb, m, forceImages, showQuoted) {
   };
   f.onload = routeWhenReady;
   mb.appendChild(f);
-  f.srcdoc = BASE_BLANK + (blocked ? IMG_CSP : "") + htmlContent;
+  f.srcdoc = BASE_BLANK + (blocked ? IMG_CSP() : "") + htmlContent;
   routeWhenReady();
   // Gmail-style "•••" control to reveal (or re-hide) the trimmed quote history.
   if (m.quotedHtml) {
@@ -769,8 +934,11 @@ function stripIframeLinkTargets(doc) {
 
 async function openThread(tid) {
   const reader = $("#reader");
+  readerFrames.forEach((o) => o.disconnect());
+  readerFrames = [];
   $("#readerSubject").textContent = "Loading…";
   $("#readerBody").innerHTML = "";
+  $("#readerBody").scrollTop = 0;
   // reset the reply editor for the new thread
   $("#replyBox").innerHTML = "";
   STATE.replyAttachments = [];
@@ -840,7 +1008,14 @@ async function openThread(tid) {
     const collapsed = t.messages.length > 2 && idx < lastIdx;
     const d = document.createElement("div");
     d.className = "msg" + (collapsed ? " collapsed" : "");
+    // Recipients line: "to Jane, cc Bob, bcc Carol" — bcc only exists on sent copies.
+    const addrName = (a) => { const n = a.match(/^\s*"?([^"<]*?)"?\s*</); return (n && n[1].trim()) || a.replace(/[<>]/g, "").trim(); };
+    const rcpt = [["to", m.to], ["cc", m.cc], ["bcc", m.bcc]]
+      .filter(([, v]) => v)
+      .map(([k, v]) => `${k} ${(v.match(/(?:"[^"]*"|[^,])+/g) || []).map(addrName).filter(Boolean).join(", ")}`)
+      .join(", ");
     d.innerHTML = `<div class="mhead"><span class="mfrom">${esc(m.sender)}</span><span>${esc(m.date)}</span></div>
+      ${rcpt ? `<div class="mrcpt" title="${esc([m.to && "to " + m.to, m.cc && "cc " + m.cc, m.bcc && "bcc " + m.bcc].filter(Boolean).join(", "))}">${esc(rcpt)}</div>` : ""}
       <div class="mpreview">${esc((m.text || "").replace(/\s+/g, " ").trim().slice(0, 120))}</div>
       <div class="mbody"></div>`;
     const mb = d.querySelector(".mbody");
@@ -897,7 +1072,11 @@ function closeReader() {
   clearTimeout(replyDraftTimer);
   // Capture the last keystrokes of an in-progress reply before leaving the thread.
   if (!$("#reader").hidden && replyHasContent()) saveReplyDraftNow();
-  $("#reader").hidden = true; load();
+  readerFrames.forEach((o) => o.disconnect());
+  readerFrames = [];
+  // Refresh silently: the list is already on screen behind the reader, so a loud reload
+  // would flash "Loading…", rebuild every card and drop you back at the top of the inbox.
+  $("#reader").hidden = true; load({ silent: true });
 }
 $("#readerBack").onclick = closeReader;
 $("#readerDone").onclick = async () => { await post("/api/done", { threadId: $("#reader").dataset.tid }); toast("Marked done"); closeReader(); };
@@ -1026,6 +1205,27 @@ $("#readerMute").onclick = async () => {
   toast(willMute ? "Thread muted" : "Unmuted");
   if (willMute) closeReader();
   else { r.dataset.muted = ""; $("#readerMute").querySelector(".material-icons").textContent = "volume_off"; }
+};
+$("#readerSpam").onclick = async () => {
+  const tid = $("#reader").dataset.tid;
+  const r = await post("/api/spam", { threadId: tid });
+  if (!r || r.error) { toast("Couldn't report spam"); return; }
+  removeCard(tid); removeFromData(tid);
+  closeReader();
+  toast("Reported spam", async () => {
+    await post("/api/not_spam", { threadId: tid });
+    STATE.inboxCache = null;
+    load();
+  });
+};
+$("#readerBlock").onclick = () => {
+  const r = $("#reader");
+  const t = STATE.threadCache[r.dataset.tid];
+  // Block whoever actually wrote last. On a thread you replied to, message[0] can be you.
+  const msgs = (t && t.messages) || [];
+  const me = (STATE.email || "").toLowerCase();
+  const them = [...msgs].reverse().find((m) => (m.senderEmail || "").toLowerCase() !== me) || msgs[0] || {};
+  doBlock(them.senderEmail, r.dataset.tid, { closeReader: true });
 };
 $("#readerMarkUnread").onclick = async () => {
   await post("/api/mark", { threadId: $("#reader").dataset.tid, read: false });
@@ -1242,15 +1442,113 @@ document.addEventListener("click", (e) => {
   if (!e.target.closest("#scheduleMenu") && !e.target.closest("#composeSchedule")) $("#scheduleMenu").hidden = true;
 });
 
-// ---------- Paste sanitizer (compose, reply, signature) ----------
+// ---------- Rich text editors (compose body, reply, signature) ----------
+// The three contenteditables share one behaviour set: sanitized paste, links that build
+// themselves (paste, type-through, ⌘K), a link bubble for editing them afterwards, and
+// pasted images that become attachments.
+const EDITOR_IDS = ["cBody", "replyBox", "setSignature"];
+// Where files pasted into an editor go. The signature has no attachment list, so it's absent.
+const PASTE_ATTACH = { cBody: ["attachments", "#cAttachments"], replyBox: ["replyAttachments", "#rAttachments"] };
+
 function stripDangerousHtml(html) {
   const d = document.createElement("div");
   d.innerHTML = html;
   d.querySelectorAll("script,style,meta,link,head,object,embed,iframe").forEach((n) => n.remove());
   d.querySelectorAll("img[src]").forEach((img) => { if (!(img.getAttribute("src") || "").startsWith("data:")) img.remove(); });
   d.querySelectorAll("*").forEach((el) => [...el.attributes].forEach((at) => { if (/^on/i.test(at.name)) el.removeAttribute(at.name); }));
+  // Anchors keep their href and nothing else: a javascript: URL is an attack, and a
+  // carried-over target/style is just clutter in the message we send.
+  d.querySelectorAll("a").forEach((a) => {
+    const href = a.getAttribute("href") || "";
+    [...a.attributes].forEach((at) => a.removeAttribute(at.name));
+    if (/^(https?:|mailto:|tel:)/i.test(href)) a.setAttribute("href", href);
+    else if (href && !/^[a-z][a-z0-9+.-]*:/i.test(href)) a.setAttribute("href", "https://" + href);
+  });
   return d.innerHTML;
 }
+
+// ---------- Linkifying ----------
+// Candidates: full URLs, www-hosts, bare hostnames (github.com/x), and email addresses.
+// Deliberately greedy at the tail; trimUrl gives back the trailing punctuation that
+// belongs to the sentence rather than the link, and isLinkCandidate throws out the
+// things that merely LOOK like hosts.
+const CAND_SRC = "(?:https?://|www\\.)[^\\s\\u00a0<>\"']+"
+  + "|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\\.[A-Za-z0-9-]+)+(?:[/?#][^\\s\\u00a0<>\"']*)?"
+  + "|[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+";
+const CANDIDATE_RE = new RegExp("(" + CAND_SRC + ")", "g");
+// The token immediately behind the caret, optionally followed by the whitespace that
+// just ended it.
+const trailingCandidateRe = (ws) =>
+  new RegExp("(^|[\\s\\u00a0(\\[{\"'])(" + CAND_SRC + ")(" + (ws ? "[\\s\\u00a0]+" : "") + ")$");
+// A dotted word is a host only if its last label is a plausible TLD. Without this,
+// "Node.js", "index.html" and "report.final" all turn blue.
+const TLD_COMMON = /^(com|org|net|edu|gov|mil|int|io|dev|app|ai|co|us|uk|ca|de|fr|jp|nl|eu|me|tv|info|biz|xyz|gg|so|to|ly|be|it|es|se|no|fi|pl|ru|ch|at|au|nz|in|br|mx|cloud|site|online|tech|store|blog|news|help|page|link|live|work|design|studio|email|social|fm|im|cc)$/i;
+// Extensions beat TLDs: a filename in a sentence is not a link.
+const TLD_BLOCKED = /^(js|jsx|ts|tsx|py|rb|go|rs|php|md|html?|txt|png|jpe?g|gif|svg|webp|pdf|zip|tar|gz|csv|tsv|json|ya?ml|toml|ini|cfg|conf|log|exe|dmg|pkg|css|scss|sql|xml|docx?|xlsx?|pptx?|mp[34]|mov|wav|sh|bat|cpp|java|swift|kt|env|lock|bak|tmp|old|final|new)$/i;
+function isLinkCandidate(s) {
+  if (/^(https?:\/\/|www\.)/i.test(s)) return true;
+  if (s.includes("@")) return /^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(s);
+  const host = s.split(/[/?#]/)[0];
+  const tld = host.split(".").pop() || "";
+  if (!/^[A-Za-z]{2,24}$/.test(tld) || TLD_BLOCKED.test(tld)) return false;
+  return TLD_COMMON.test(tld) || s.length > host.length; // known TLD, or it carries a path
+}
+function hrefFor(raw) {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return raw;
+  if (raw.includes("@") && !raw.includes("/")) return "mailto:" + raw;
+  return "https://" + raw;
+}
+// "(docs at https://x.dev/a)." should link https://x.dev/a — not the paren, not the stop.
+function trimUrl(raw) {
+  let u = raw.replace(/[.,;:!?'"]+$/, "");
+  while (/[)\]}]$/.test(u)) {
+    const open = (u.match(/[([{]/g) || []).length, close = (u.match(/[)\]}]/g) || []).length;
+    if (close <= open) break;
+    u = u.slice(0, -1).replace(/[.,;:!?'"]+$/, "");
+  }
+  return u;
+}
+// Plain text → HTML with every URL/address turned into a real link.
+function linkifyText(text) {
+  let out = "", last = 0;
+  text.replace(CANDIDATE_RE, (m, _g, idx) => {
+    const url = trimUrl(m);
+    if (!url || !isLinkCandidate(url)) return m;
+    out += esc(text.slice(last, idx)) + `<a href="${esc(hrefFor(url))}">${esc(url)}</a>`;
+    last = idx + url.length;
+    return m;
+  });
+  out += esc(text.slice(last));
+  return out.replace(/\r\n|\r|\n/g, "<br>");
+}
+// Turn the URL sitting just behind the caret into a link, the way every mail client does
+// once you hit space or enter. Done as DOM surgery rather than execCommand so the caret
+// lands *after* the link and the next character you type isn't swallowed into it.
+function autolinkAtCaret(trailing) {
+  const sel = window.getSelection();
+  if (!sel || !sel.isCollapsed || !sel.anchorNode) return;
+  const node = sel.anchorNode;
+  if (node.nodeType !== 3) return;                              // text nodes only
+  if (node.parentElement && node.parentElement.closest("a")) return; // already a link
+  const before = node.data.slice(0, sel.anchorOffset);
+  const m = before.match(trailingCandidateRe(trailing));
+  if (!m) return;
+  const url = trimUrl(m[2]);
+  if (!url || url.length < 4 || !isLinkCandidate(url)) return;
+  const start = sel.anchorOffset - m[3].length - m[2].length;
+  const tail = node.splitText(start);          // tail begins with the URL
+  const rest = tail.splitText(url.length);     // rest begins with what followed it
+  const a = document.createElement("a");
+  a.href = hrefFor(url);
+  a.textContent = tail.data;
+  tail.parentNode.replaceChild(a, tail);
+  const r = document.createRange();
+  r.setStart(rest, Math.min(m[3].length, rest.data.length));
+  r.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(r);
+}
+
 // Cmd/Ctrl+Shift+V = paste without formatting. The browser would do this natively,
 // but our paste handler intercepts every paste and prefers text/html — so we must
 // honor the intent ourselves. Set on keydown (fires before the paste event), consume
@@ -1262,18 +1560,174 @@ document.addEventListener("keydown", (e) => {
     setTimeout(() => { forcePlainPaste = false; }, 300);
   }
 });
-["cBody", "replyBox", "setSignature"].forEach((id) => {
+
+function editorPaste(e, el) {
+  const dt = e.clipboardData;
+  if (!dt) return;
+  const plain = forcePlainPaste;
+  forcePlainPaste = false;
+  // A screenshot or a file on the clipboard becomes an attachment — inlining it would
+  // bloat the message body and most clients would strip it anyway. Copying an image out
+  // of a web page hands us the file AND an <img> tag pointing at the original host, so
+  // images win outright; other files only when there's no text alternative to paste.
+  const files = [...(dt.files || [])];
+  const target = PASTE_ATTACH[el.id];
+  if (target && (files.some((f) => /^image\//.test(f.type)) || (files.length && !dt.getData("text/plain")))) {
+    e.preventDefault();
+    STATE[target[0]] = (STATE[target[0]] || []).concat(files);
+    renderChips(target[0], target[1]);
+    toast(files.length === 1 ? `Attached ${files[0].name || "image"}` : `Attached ${files.length} files`);
+    return;
+  }
+  e.preventDefault();
+  const html = dt.getData("text/html");
+  const text = dt.getData("text/plain") || "";
+  if (plain) { document.execCommand("insertText", false, text); return; }
+  // A URL pasted over selected text links that text, instead of replacing it.
+  const sel = window.getSelection();
+  const bare = text.trim();
+  if (!html && /^(?:https?:\/\/|www\.)\S+$/i.test(bare) && sel && !sel.isCollapsed && !String(sel).includes("\n")) {
+    document.execCommand("createLink", false, hrefFor(trimUrl(bare)));
+    return;
+  }
+  if (html) document.execCommand("insertHTML", false, stripDangerousHtml(html));
+  else if (text) document.execCommand("insertHTML", false, linkifyText(text));
+}
+
+// ---------- Link popover (insert / edit a link) ----------
+// prompt() is unreliable inside the desktop WKWebView and can't show the link it's about
+// to change, so links get a real bubble: URL, display text, and Open/Remove on an existing one.
+let linkRange = null, linkEl = null, linkEditor = null;
+function placeLinkPop(rect) {
+  const p = $("#linkPop");
+  p.hidden = false;
+  const w = p.offsetWidth || 320, h = p.offsetHeight || 150;
+  p.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - w - 8)) + "px";
+  const below = rect.bottom + 8;
+  p.style.top = (below + h > window.innerHeight - 8 ? Math.max(8, rect.top - h - 8) : below) + "px";
+}
+function openLinkPop(editor, anchor) {
+  const sel = window.getSelection();
+  linkEditor = editor;
+  linkEl = anchor || null;
+  linkRange = sel && sel.rangeCount && editor.contains(sel.anchorNode) ? sel.getRangeAt(0).cloneRange() : null;
+  const selText = linkRange ? linkRange.toString() : "";
+  $("#lpUrl").value = anchor ? anchor.getAttribute("href") || "" : "";
+  $("#lpText").value = anchor ? anchor.textContent : selText;
+  $("#lpText").disabled = !!(linkRange && !linkRange.collapsed && !anchor && selText.includes("\n"));
+  $("#lpOpen").hidden = !anchor;
+  $("#lpRemove").hidden = !anchor;
+  const rect = anchor ? anchor.getBoundingClientRect()
+    : (linkRange && linkRange.getBoundingClientRect().width ? linkRange.getBoundingClientRect() : editor.getBoundingClientRect());
+  placeLinkPop(rect);
+  setTimeout(() => $("#lpUrl").focus(), 10);
+}
+function closeLinkPop() { $("#linkPop").hidden = true; linkRange = null; linkEl = null; linkEditor = null; }
+function applyLinkPop() {
+  const raw = $("#lpUrl").value.trim();
+  const text = $("#lpText").value;
+  if (!raw) { closeLinkPop(); return; }
+  const url = hrefFor(raw);
+  if (linkEl) {                                   // editing an existing link in place
+    linkEl.setAttribute("href", url);
+    if (text && text !== linkEl.textContent) linkEl.textContent = text;
+  } else {
+    const ed = linkEditor;
+    if (!ed) { closeLinkPop(); return; }
+    ed.focus();
+    if (linkRange) { const s = window.getSelection(); s.removeAllRanges(); s.addRange(linkRange); }
+    const sel = window.getSelection();
+    const same = sel && !sel.isCollapsed && sel.toString() === text;
+    // Keep the selection intact when only the URL is new — createLink is undoable.
+    if (same) document.execCommand("createLink", false, url);
+    else document.execCommand("insertHTML", false, `<a href="${esc(url)}">${esc(text || raw)}</a>&nbsp;`);
+  }
+  const ed = linkEditor;
+  closeLinkPop();
+  if (ed) { ed.focus(); ed.dispatchEvent(new Event("input", { bubbles: true })); }
+}
+$("#lpApply").onclick = applyLinkPop;
+$("#lpCancel").onclick = closeLinkPop;
+$("#lpOpen").onclick = () => { if (linkEl) openExternal(linkEl.href); closeLinkPop(); };
+$("#lpRemove").onclick = () => {
+  if (linkEl) {
+    const ed = linkEditor;
+    const t = document.createTextNode(linkEl.textContent);
+    linkEl.parentNode.replaceChild(t, linkEl);
+    closeLinkPop();
+    if (ed) ed.dispatchEvent(new Event("input", { bubbles: true }));
+  } else closeLinkPop();
+};
+["#lpUrl", "#lpText"].forEach((s) => $(s).addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); applyLinkPop(); }
+  else if (e.key === "Escape") { e.preventDefault(); closeLinkPop(); }
+  e.stopPropagation();                            // never reaches the app's global shortcuts
+}));
+document.addEventListener("mousedown", (e) => {
+  if ($("#linkPop").hidden) return;
+  if (e.target.closest("#linkPop") || e.target.closest(".tb-link")) return;
+  closeLinkPop();
+});
+
+// ---------- Editor wiring ----------
+EDITOR_IDS.forEach((id) => {
   const el = document.getElementById(id);
   if (!el) return;
-  el.addEventListener("paste", (e) => {
+  el.addEventListener("paste", (e) => editorPaste(e, el));
+  // Drop a URL (from a browser tab or another app) straight into the body as a link.
+  el.addEventListener("drop", (e) => {
+    const uri = e.dataTransfer && (e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain"));
+    if (!uri || !/^(https?:\/\/|www\.)\S+$/i.test(uri.trim())) return;
     e.preventDefault();
-    const html = e.clipboardData.getData("text/html");
-    const text = e.clipboardData.getData("text/plain");
-    if (!forcePlainPaste && html) document.execCommand("insertHTML", false, stripDangerousHtml(html));
-    else document.execCommand("insertText", false, text);
-    forcePlainPaste = false;
+    const u = trimUrl(uri.trim());
+    el.focus();
+    document.execCommand("insertHTML", false, `<a href="${esc(hrefFor(u))}">${esc(u)}</a>&nbsp;`);
+  });
+  el.addEventListener("keydown", (e) => {
+    const mod = e.metaKey || e.ctrlKey;
+    if (mod && !e.altKey) {
+      const k = e.key.toLowerCase();
+      if (k === "k") { e.preventDefault(); e.stopPropagation(); openLinkPop(el, currentLinkAtCaret(el)); return; }
+      if (k === "b" || k === "i" || k === "u") {
+        e.preventDefault();
+        document.execCommand({ b: "bold", i: "italic", u: "underline" }[k], false, null);
+        return;
+      }
+      if (e.shiftKey && (k === "7" || k === "8")) {
+        e.preventDefault();
+        document.execCommand(k === "7" ? "insertOrderedList" : "insertUnorderedList", false, null);
+        return;
+      }
+    }
+    // Enter finishes a URL just like a space does.
+    if (e.key === "Enter" && !e.shiftKey) autolinkAtCaret(false);
+  });
+  // Space (and any whitespace run) closes off a URL as you type.
+  el.addEventListener("input", (e) => {
+    if (e.inputType === "insertText" && (e.data === " " || e.data === "\u00a0")) autolinkAtCaret(true);
+  });
+  el.addEventListener("blur", () => autolinkAtCaret(false));
+  // Click a link to edit it; ⌘/Ctrl-click opens it, like every other link in the app.
+  el.addEventListener("click", (e) => {
+    const a = e.target.closest("a");
+    if (!a || !el.contains(a)) return;
+    e.preventDefault();
+    if (e.metaKey || e.ctrlKey) { openExternal(a.href); return; }
+    openLinkPop(el, a);
   });
 });
+function currentLinkAtCaret(el) {
+  const sel = window.getSelection();
+  if (!sel || !sel.anchorNode || !el.contains(sel.anchorNode)) return null;
+  const n = sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentElement;
+  const a = n && n.closest("a");
+  return a && el.contains(a) ? a : null;
+}
+// The editor a toolbar button belongs to (its own card's contenteditable).
+function editorForToolbar(btn) {
+  const scope = btn.closest(".reader-reply, .compose-card, .settings-card, .set-field") || document;
+  return scope.querySelector('[contenteditable="true"]');
+}
 
 // ---------- Drag-to-attach (Finder → compose) ----------
 (function wireDrop() {
@@ -1334,20 +1788,36 @@ async function openDraft(draftId) {
   if (r.error) { toast("Couldn't open draft"); return; }
   openCompose({ draftId, to: r.to, subject: r.subject, body: r.body, html: r.bodyHtml });
 }
-// Rich-text toolbars (compose + reply). execCommand is deprecated but works
-// everywhere and acts on whichever contenteditable currently holds the selection.
+// Rich-text toolbars (compose + reply + signature). execCommand is deprecated but works
+// everywhere, keeps the browser's own undo stack, and acts on whichever contenteditable
+// currently holds the selection. mousedown + preventDefault so the caret never leaves it.
 document.querySelectorAll(".compose-toolbar [data-cmd]").forEach((b) => {
-  b.addEventListener("mousedown", (e) => { e.preventDefault(); document.execCommand(b.dataset.cmd, false, null); });
+  b.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    const ed = editorForToolbar(b);
+    document.execCommand(b.dataset.cmd, false, null);
+    if (ed) ed.dispatchEvent(new Event("input", { bubbles: true })); // autosave sees it
+  });
 });
 document.querySelectorAll(".tb-link").forEach((b) => {
   b.addEventListener("mousedown", (e) => {
     e.preventDefault();
-    const raw = prompt("Link URL:");
-    if (!raw) return;
-    const url = /^[a-z]+:\/\//i.test(raw) ? raw : "https://" + raw;
-    const sel = window.getSelection();
-    if (sel && sel.toString()) document.execCommand("createLink", false, url);
-    else document.execCommand("insertHTML", false, `<a href="${url}">${esc(url)}</a>`);
+    const ed = editorForToolbar(b);
+    if (ed) openLinkPop(ed, currentLinkAtCaret(ed));
+  });
+});
+// Keep the toolbar buttons lit for whatever the caret is sitting in.
+document.addEventListener("selectionchange", () => {
+  const sel = window.getSelection();
+  const node = sel && sel.anchorNode;
+  const ed = node && EDITOR_IDS.map((i) => document.getElementById(i)).find((e) => e && e.contains(node));
+  if (!ed) return;
+  const bar = (ed.closest(".reader-reply, .compose-card, .settings-card, .set-field") || document).querySelector(".compose-toolbar");
+  if (!bar) return;
+  bar.querySelectorAll("[data-cmd]").forEach((b) => {
+    let on = false;
+    try { on = document.queryCommandState(b.dataset.cmd); } catch (e) {}
+    b.classList.toggle("on", !!on);
   });
 });
 // Attachment chips, keyed by STATE field + list container
@@ -1391,8 +1861,9 @@ document.querySelectorAll(".nav-item").forEach((n) => {
     load();
   };
 });
-$("#refreshBtn").onclick = load;
-$("#pinnedOnly").onchange = render;
+$("#refreshBtn").onclick = () => load();
+// Filtering the list to pinned-only replaces what's on screen wholesale — start at the top.
+$("#pinnedOnly").onchange = () => render({ top: true });
 $("#menuBtn").onclick = () => document.querySelector(".layout").classList.toggle("nav-collapsed");
 // ---------- Search (Gmail-style: suggestions, operators, advanced builder) ----------
 const SEARCH_OPS = [
@@ -1570,9 +2041,47 @@ function openSettings() {
   $("#setDarkMode").value = s.dark_mode || "auto";
   $("#setImageBlock").checked = s.image_block ?? false;
   $("#setNotifications").checked = s.notifications ?? true;
+  $("#setNotifSound").checked = s.notification_sound ?? true;
   $("#setFollowupDays").value = String(s.followup_default_days ?? 3);
   $("#settingsOverlay").hidden = false;
+  renderBlocked();
 }
+
+// Blocked senders live in Gmail as filters, not in our DB, so this reads them back from
+// the account every time. A block made in Gmail's own UI shows up here, and vice versa.
+async function renderBlocked() {
+  const wrap = $("#blockedList");
+  wrap.textContent = "Loading…";
+  let r;
+  try { r = await api("/api/blocked"); } catch (_) { r = { error: 1 }; }
+  const rows = (r && r.blocked) || [];
+  if (r && r.error) { wrap.textContent = "Couldn't load blocked senders"; return; }
+  if (!rows.length) { wrap.innerHTML = '<div class="blocked-empty">No blocked senders</div>'; return; }
+  wrap.innerHTML = "";
+  rows.forEach((b) => {
+    const el = document.createElement("div");
+    el.className = "blocked-row";
+    el.innerHTML = `<span class="blocked-addr">${esc(b.email)}</span>
+      <button type="button" class="ghost-btn blocked-unblock">Unblock</button>`;
+    el.querySelector(".blocked-unblock").onclick = async () => {
+      const res = await post("/api/unblock", { email: b.email });
+      if (res.ok) { toast(`Unblocked ${b.email}`); renderBlocked(); }
+      else toast(res.error || "Couldn't unblock");
+    };
+    wrap.appendChild(el);
+  });
+}
+$("#blockAddBtn").onclick = async () => {
+  const input = $("#blockAddInput");
+  const email = (input.value || "").trim();
+  if (!email) return;
+  const r = await post("/api/block", { email });
+  if (!r.ok) { toast(r.error || "Couldn't block sender"); return; }
+  input.value = "";
+  toast(r.already ? `${r.email} was already blocked` : `Blocked ${r.email}`);
+  renderBlocked();
+};
+$("#blockAddInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("#blockAddBtn").click(); } });
 $("#settingsBtn").onclick = openSettings;
 $("#settingsClose").onclick = () => ($("#settingsOverlay").hidden = true);
 $("#settingsOverlay").addEventListener("click", (e) => { if (e.target.id === "settingsOverlay") $("#settingsOverlay").hidden = true; });
@@ -1583,6 +2092,7 @@ $("#settingsSave").onclick = async () => {
     dark_mode: $("#setDarkMode").value,
     image_block: $("#setImageBlock").checked,
     notifications: $("#setNotifications").checked,
+    notification_sound: $("#setNotifSound").checked,
     followup_default_days: +$("#setFollowupDays").value,
   };
   STATE.settings = Object.assign(STATE.settings || {}, upd);
@@ -1677,7 +2187,7 @@ $("#aliasDesc").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#
 const HELP_ROWS = [
   ["j / k", "Move down / up"], ["Enter or o", "Open conversation"],
   ["e", "Done (archive)"], ["p", "Pin"], ["s", "Snooze"], ["r", "Reply / open"],
-  ["c", "Compose"], ["/", "Search"], ["⌘K / Ctrl+K", "Command palette"],
+  ["c", "Compose"], ["!", "Report spam"], ["/", "Search"], ["⌘K / Ctrl+K", "Command palette"],
   ["?", "This help"], ["Esc", "Close / back"],
 ].map((r) => `<div class="help-row"><kbd>${esc(r[0])}</kbd><span>${esc(r[1])}</span></div>`).join("");
 function openHelp() {
@@ -1710,7 +2220,7 @@ const COMMANDS = [
   { label: "Refresh", icon: "refresh", run: () => load() },
   { label: "Email aliases", icon: "alternate_email", run: () => openAliases() },
   { label: "Open settings", icon: "settings", run: () => openSettings() },
-  { label: "Toggle pinned only", icon: "push_pin", run: () => { $("#pinnedOnly").checked = !$("#pinnedOnly").checked; render(); } },
+  { label: "Toggle pinned only", icon: "push_pin", run: () => { $("#pinnedOnly").checked = !$("#pinnedOnly").checked; render({ top: true }); } },
   { label: "Keyboard shortcuts", icon: "keyboard", run: () => openHelp() },
 ];
 let palIdx = 0, palFiltered = [];
@@ -1777,6 +2287,8 @@ document.addEventListener("keydown", (e) => {
     case "s": { if (!inReader) { const cards = visibleCards(); const r = cursorRow(); if (r && cards[cursorIdx]) openSnooze(cards[cursorIdx], r); } break; }
     case "r": { if (inReader) $("#replyBox").focus(); else { const r = cursorRow(); if (r) openThread(r.id); } break; }
     case "c": openCompose(); break;
+    // Gmail's own spam key, so the muscle memory carries over.
+    case "!": { if (inReader) $("#readerSpam").click(); else { const r = cursorRow(); if (r) doSpam(r); } break; }
     case "/": e.preventDefault(); $("#searchInput").focus(); break;
     case "?": openHelp(); break;
     default: return;
@@ -1800,14 +2312,21 @@ function toast(msg, undo) {
 // viewport is pinned via scroll anchoring so an arriving/disappearing message
 // never yanks what you're reading.
 async function load(opts = {}) {
-  const silent = !!opts.silent;
-  const anchor = silent ? captureScrollAnchor() : null;
-  const prevTids = silent ? visibleTidSet() : null;
-  if (!silent) {
+  const silent = !!(opts && opts.silent === true);
+  const v = STATE.view;
+  // An in-place refresh (live sync, closing a thread, the refresh button) must land you
+  // exactly where you were; only an explicit view change starts at the top.
+  const viewChanged = STATE.renderedView !== v
+    || (v === "search" && STATE.renderedQuery !== STATE.query);
+  const anchor = viewChanged ? null : captureScrollAnchor();
+  const prevTids = visibleTidSet();
+  // The "Loading…" block sits above the list, so raising it on a refresh shoves the whole
+  // list down and then back up — two jumps for a fetch you didn't ask to see. Show it only
+  // when there's nothing on screen to keep.
+  if (!silent && !document.querySelector("#list .card")) {
     $("#loading").hidden = false;
     $("#loading").textContent = "Loading…";
   }
-  const v = STATE.view;
   const lim = "limit=" + PAGE;
   let d;
   if (v === "inbox") {
@@ -1849,13 +2368,16 @@ async function load(opts = {}) {
   if (d.email) STATE.email = d.email;
   if (d.email) $("#acctEmail").textContent = d.email;
   if (v === "inbox") renderNavBundles();
-  render();
-  if (silent) { markArrivals(prevTids); restoreScrollAnchor(anchor); }
+  render({ top: viewChanged });
+  if (silent) markArrivals(prevTids);
+  if (!viewChanged) restoreScrollAnchor(anchor);
+  STATE.renderedView = v;
+  STATE.renderedQuery = STATE.query;
   enrichDocLinks();
   // Top the list up, then re-pin once more: ensureFilled() only appends below the fold,
   // but the grew-pinned / new-bundle branch can re-render structure above it.
   try { await ensureFilled(); } catch (e) { /* a fill error must not reject load() */ }
-  if (silent) restoreScrollAnchor(anchor);
+  if (!viewChanged) restoreScrollAnchor(anchor);
 }
 
 // ---------- Lazy Docs/Drive link chips on cards ----------
@@ -1886,9 +2408,13 @@ async function enrichDocLinks() {
   try { res = await post("/api/doc_links", { messageIds: need.map((r) => r.messageId) }); }
   catch (e) { res = null; }
   if (!res) { need.forEach((r) => { if (r.docLinks === null) r.docLinks = undefined; }); return; }
-  need.forEach((r) => {
-    r.docLinks = res[r.messageId] || [];
-    if (r.docLinks.length) injectDocChips(r);
+  // Chips make a card taller. One above the fold would push the list down under you,
+  // so the whole batch goes in behind the scroll anchor.
+  withListAnchor(() => {
+    need.forEach((r) => {
+      r.docLinks = res[r.messageId] || [];
+      if (r.docLinks.length) injectDocChips(r);
+    });
   });
 }
 
@@ -2047,7 +2573,11 @@ async function ensureFilled() {
   STATE.filling = true;
   try {
     let guard = 0;
-    while (STATE.token && inViewCount() < TARGET && guard < 25) { guard++; await loadMore(); }
+    // Each page costs ~255 Gmail quota units, so the guard is a real budget, not a
+    // paranoia limit: at 25 one fill loop could spend 6,000 units and trip the
+    // 15,000-per-minute ceiling on its own. Four pages is 200 messages, which fills
+    // 50 conversation rows unless the inbox is almost entirely long threads.
+    while (STATE.token && inViewCount() < TARGET && guard < 4) { guard++; await loadMore(); }
   } finally {
     STATE.filling = false;
   }
@@ -2083,7 +2613,7 @@ function renderNavBundles() {
 }
 
 // ---------- Live sync (Server-Sent Events) ----------
-let evtSource = null;
+let evtSource = null, syncTimer = null;
 function startStream() {
   if (evtSource) return;
   try {
@@ -2096,9 +2626,11 @@ function startStream() {
       // Mailbox changed server-side (new mail / label change). Refresh the current view
       // silently: no loading flash, and scroll anchoring keeps the conversation you're
       // looking at pinned in place so arriving/vanishing mail never jerks the viewport.
-      // Overlays (reader, compose) sit on top and are untouched.
-      STATE.inboxCache = null;
-      load({ silent: true });
+      // Overlays (reader, compose) sit on top and are untouched. One server-side change
+      // often lands as a burst of events (a sweep touches every thread it moves), so
+      // coalesce them into a single repaint instead of one per event.
+      clearTimeout(syncTimer);
+      syncTimer = setTimeout(() => { STATE.inboxCache = null; load({ silent: true }); }, 400);
     };
     // EventSource reconnects automatically on error — nothing to handle.
   } catch (e) { /* SSE unsupported */ }
