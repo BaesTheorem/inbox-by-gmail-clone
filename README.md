@@ -12,7 +12,7 @@ Reverse-engineered from a detailed UX spec of the original product; see
 **[docs/DESIGN.md](docs/DESIGN.md)** for the full design document (colors, typography,
 components, interactions, and history).
 
-> 📱 **iPhone:** a native SwiftUI app lives in **[ios/](ios/README.md)**. Mac-independent (talks to Gmail directly), same triage model, same Send to Things backlinks. It replaced the PWA plan in [docs/ROADMAP.md](docs/ROADMAP.md).
+> 📱 **iPhone:** a native SwiftUI app exists in a separate private repo (checked out at `ios/` next to this code, which the gitignore skips). Mac-independent (talks to Gmail directly), same triage model, same Send to Things backlinks. It replaced the PWA plan in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Architecture
 - **Backend:** `app.py`: Flask + Gmail API (`uv run --script`, deps inline via PEP 723).

@@ -2,8 +2,8 @@
 
 ## ✅ iPhone app: shipped native instead (2026-08-23)
 
-The PWA plan below was superseded. A native SwiftUI app now lives in
-[ios/](../ios/README.md); it reuses the Desktop OAuth client's refresh token,
+The PWA plan below was superseded. A native SwiftUI app now lives in a
+separate private repo (checked out at `ios/`); it reuses the Desktop OAuth client's refresh token,
 so the "new Web OAuth client + hosted frontend" work the PWA needed never
 happened, and native gets the two things the PWA couldn't do: scheduled snooze
 wake notifications and owning the `inboxclone://` scheme for Things backlinks.

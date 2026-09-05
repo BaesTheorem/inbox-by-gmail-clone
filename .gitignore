@@ -4,6 +4,9 @@ credentials/*
 token.json
 *.json
 snooze.db
+
+# The iPhone app is its own private repo, checked out here at ios/
+ios/
 __pycache__/
 *.pyc
 server.log
