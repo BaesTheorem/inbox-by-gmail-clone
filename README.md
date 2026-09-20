@@ -12,6 +12,8 @@ Reverse-engineered from a detailed UX spec of the original product; see
 **[docs/DESIGN.md](docs/DESIGN.md)** for the full design document (colors, typography,
 components, interactions, and history).
 
+> 🤖 **Android:** a native Kotlin/Compose app lives in [`android/`](android/README.md), with a setup wizard that connects a fresh Gmail account without a terminal. `./android/scripts/build-apk.sh` produces one signed 2.4 MB APK you can hand to someone.
+
 > 📱 **iPhone:** a native SwiftUI app exists in a separate private repo (checked out at `ios/` next to this code, which the gitignore skips). Mac-independent (talks to Gmail directly), same triage model, same Send to Things backlinks. It replaced the PWA plan in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Architecture

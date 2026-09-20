@@ -14,3 +14,13 @@ desktop.log
 .venv/
 .DS_Store
 **/.DS_Store
+
+# Android build output and signing material
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/keystore/
+android/keystore.properties
+android/client.properties
+android/.kotlin/

@@ -1,0 +1,9 @@
+# Copy to client.properties (gitignored) to bake an OAuth client into the APK.
+# The client must be of type "Desktop app" in Google Cloud Console, and every
+# person who installs the APK has to be allowed on that project (test user, or
+# the project published). Leave the file out entirely and the setup wizard
+# makes each user create their own project instead.
+CLIENT_ID=000000000000-xxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com
+CLIENT_SECRET=GOCSPX-xxxxxxxxxxxxxxxxxxxx
+# Shown in the wizard so the user knows whose Google Cloud project they are using
+OWNER=Alex
