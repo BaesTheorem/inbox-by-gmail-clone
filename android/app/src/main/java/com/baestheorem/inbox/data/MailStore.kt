@@ -15,18 +15,17 @@ import com.baestheorem.inbox.gmail.GmailClient
 import com.baestheorem.inbox.gmail.GmailException
 import com.baestheorem.inbox.gmail.InboxData
 import com.baestheorem.inbox.gmail.MessageDetail
-import com.baestheorem.inbox.gmail.Net
 import com.baestheorem.inbox.gmail.ThreadDetail
 import com.baestheorem.inbox.gmail.ThreadSummary
 import com.baestheorem.inbox.gmail.UnsubInfo
 import com.baestheorem.inbox.gmail.UnsubMethod
+import com.baestheorem.inbox.gmail.UnsubResolver
 import com.baestheorem.inbox.gmail.buildRawMessage
 import com.baestheorem.inbox.gmail.collectAttachments
 import com.baestheorem.inbox.gmail.decodeBody
 import com.baestheorem.inbox.gmail.findBodyUnsubscribe
 import com.baestheorem.inbox.gmail.gmailPermalink
 import com.baestheorem.inbox.gmail.headerValue
-import com.baestheorem.inbox.gmail.hostResolvesPublicOnly
 import com.baestheorem.inbox.gmail.parseAddr
 import com.baestheorem.inbox.gmail.parseUnsubscribe
 import com.baestheorem.inbox.gmail.resolveInlineImages
@@ -41,8 +40,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import okhttp3.FormBody
-import okhttp3.Request
 import java.io.IOException
 
 sealed class MailMode(val title: String) {
@@ -728,47 +725,93 @@ class MailStore(app: Application) : AndroidViewModel(app) {
 
     // MARK: Unsubscribe (RFC 2369 / RFC 8058, port of api_unsubscribe)
 
+    // Walks the whole opt-out ladder before it will hand anything to the browser:
+    //   1. RFC 8058 one-click, when the sender advertises it
+    //   2. the sender's unsubscribe page, driven to completion by UnsubResolver
+    //   3. a one-click POST the sender never advertised (plenty of ESPs honor it anyway)
+    //   4. the page again in a real browser engine, for opt-outs that only exist in JS
+    //   5. the List-Unsubscribe mailto
+    //   6. the browser, and only once every one of those has failed
     fun unsubscribe(info: UnsubInfo, sender: String) {
         viewModelScope.launch {
-            when (info.method) {
-                UnsubMethod.ONE_CLICK -> {
-                    val urlStr = info.httpsUrl ?: return@launch
-                    val uri = Uri.parse(urlStr)
-                    val host = uri.host ?: ""
-                    val safe = uri.scheme?.lowercase() == "https" && host.isNotEmpty() &&
-                        withContext(Dispatchers.IO) { hostResolvesPublicOnly(host) }
-                    if (!safe) {
-                        // Refuse to POST at a private/loopback target; finish in the browser
-                        openUrl(urlStr)
-                        return@launch
-                    }
-                    val ok = withContext(Dispatchers.IO) {
-                        runCatching {
-                            val req = Request.Builder().url(urlStr)
-                                .post(FormBody.Builder().add("List-Unsubscribe", "One-Click").build())
-                                .build()
-                            Net.client.newCall(req).execute().use { it.isSuccessful }
-                        }.getOrDefault(false)
-                    }
-                    if (ok) showSnack("Unsubscribed from $sender") else openUrl(urlStr)
+            showSnack("Unsubscribing from $sender…")
+            val url = info.httpsUrl
+
+            // 1. A 2xx here is RFC 8058's own success signal.
+            if (info.method == UnsubMethod.ONE_CLICK && url != null) {
+                val ok = withContext(Dispatchers.IO) { UnsubResolver.oneClickPost(url).first }
+                if (ok) {
+                    showSnack("Unsubscribed from $sender")
+                    return@launch
                 }
-                UnsubMethod.MAILTO -> {
-                    val to = info.mailto
-                    if (to.isNullOrEmpty()) return@launch
-                    val raw = buildRawMessage(
-                        to = to, cc = null, subject = info.mailtoSubject,
-                        body = "Please unsubscribe this address from your mailing list.",
-                        fromName = displayName.value, fromEmail = userEmail.value,
-                        inReplyTo = null, references = null,
+            }
+
+            // 2. Redirects, the confirm form, the "which address?" box, the reason
+            //    dropdown, the second confirm screen: all of it, in-app.
+            if (url != null) {
+                val email = userEmail.value.ifEmpty { null }
+                val res = withContext(Dispatchers.IO) { UnsubResolver.resolve(url, email) }
+                if (res.ok) {
+                    showSnack(
+                        if (res.confirmed) "Unsubscribed from $sender"
+                        else "Unsubscribe submitted to $sender"
                     )
-                    try {
-                        GmailClient.send(raw, null)
-                        showSnack("Unsubscribe email sent to $sender")
-                    } catch (e: IOException) {
-                        showSnack("Couldn't send unsubscribe email")
-                    }
+                    return@launch
                 }
-                UnsubMethod.LINK -> info.httpsUrl?.let { openUrl(it) }
+            }
+
+            // 3. Unadvertised one-click. A bare 2xx proves nothing (the endpoint may have
+            //    just re-served the confirm page), so only the sender's own wording counts.
+            //    Skipped for body-scraped links: findBodyUnsubscribe guesses at which link
+            //    is the opt-out, and a guess does not earn a POST.
+            if (info.method != UnsubMethod.ONE_CLICK && !info.fromBody && url != null) {
+                val done = withContext(Dispatchers.IO) {
+                    val (ok, _, body) = UnsubResolver.oneClickPost(url)
+                    ok && UnsubResolver.saysDone(body)
+                }
+                if (done) {
+                    showSnack("Unsubscribed from $sender")
+                    return@launch
+                }
+            }
+
+            // 4. Nothing in the raw HTML, so the opt-out may only exist once the page's
+            //    scripts have run. Drive a real browser engine at it, offscreen.
+            if (url != null) {
+                val res = UnsubWebDriver.drive(ctx, url, userEmail.value.ifEmpty { null })
+                if (res.ok) {
+                    showSnack(
+                        if (res.confirmed) "Unsubscribed from $sender"
+                        else "Unsubscribe submitted to $sender"
+                    )
+                    return@launch
+                }
+            }
+
+            // 5. Mail the list owner. Slower than the web route, but no browser either.
+            val to = info.mailto
+            if (!to.isNullOrEmpty()) {
+                val raw = buildRawMessage(
+                    to = to, cc = null, subject = info.mailtoSubject,
+                    body = "Please unsubscribe this address from your mailing list.",
+                    fromName = displayName.value, fromEmail = userEmail.value,
+                    inReplyTo = null, references = null,
+                )
+                try {
+                    GmailClient.send(raw, null)
+                    showSnack("Unsubscribe email sent to $sender")
+                    return@launch
+                } catch (e: IOException) {
+                    // fall through to the page
+                }
+            }
+
+            // 6. Out of automatic options, so hand over the page.
+            if (url != null) {
+                openUrl(url)
+                showSnack("Their page needs a human, so I opened it")
+            } else {
+                showSnack("Couldn't unsubscribe from $sender")
             }
         }
     }

@@ -77,10 +77,21 @@ Press **Publish app** on the console's Audience page and it stops happening.
 - **Unsubscribe** (RFC 2369 / RFC 8058): an inline link on the card, a banner in
   the reader, and a long-press action. Senders that bury the opt-out in the body
   get a one-time background body scan whose verdict is cached, same as the Mac's
-  `unsub_scan` table. One-click POSTs go straight to the sender behind the same
-  resolve-to-public-only SSRF guard as the Mac; mailto sends the unsubscribe
-  email from your account; plain links open the browser. Both surfaces confirm
-  first.
+  `unsub_scan` table. Both surfaces confirm first, then `UnsubResolver` walks
+  the same ladder as the Mac's api_unsubscribe, stopping at the first rung that
+  works: the RFC 8058 one-click POST; the sender's confirmation page driven to
+  completion in-app (redirects including meta-refresh and window.location, the
+  confirm form with its hidden tokens, the opt-out radio, your address in the
+  "which address?" box, the reason dropdown, a second confirm screen, up to four
+  rounds); a one-click POST the sender never advertised, accepted only when the
+  response says in words that you are off the list; `UnsubWebDriver`, which
+  loads the page again in an offscreen WebView for opt-outs that only exist once
+  the page's scripts have run; then the mailto route sent from your account. The
+  browser opens only when all five have failed. Every hop and every subresource
+  goes through the same resolve-to-public-only SSRF guard as the Mac, login
+  forms are never submitted, and a page reading "sorry to see you go" above a
+  confirm button is not mistaken for success. `UnsubResolverTest` runs the same
+  fixtures the Mac and iOS ports are checked against.
 - New-mail banners from a 15-minute WorkManager poll (Android's floor for
   periodic work), toggleable in Settings
 - `inboxclone://thread/<id>` opens that exact thread, so a shared link or a
@@ -124,9 +135,10 @@ first, or Google refuses the sign-in.
       auth/     AuthStore (encrypted client + refresh token), OAuthFlow
                 (loopback PKCE), ClientCredentials (paste parser)
       gmail/    GmailClient (REST, retry, metadata cache, history cursor),
-                Bundling / Mime / Unsub (app.py ports), Models, Net
+                Bundling / Mime / Unsub / UnsubResolver (app.py ports),
+                Models, Net
       data/     MailStore (the view model), SnoozeStore, UnsubScanCache,
-                SwipeConfig, Prefs
+                UnsubWebDriver (the JS-page rung), SwipeConfig, Prefs
       ui/       Theme + MIcon, SetupWizard, RootScreen, MailList,
                 SwipeableRow, ThreadScreen (+ ThreadHtml), ComposeScreen,
                 SnoozeSheet, SettingsScreen

@@ -26,6 +26,10 @@ android {
     namespace = "com.baestheorem.inbox"
     compileSdk = 34
 
+    // UnsubResolverTest exercises pure parsing that never calls into the framework,
+    // but Bundling.kt/Mime.kt pull in android.util.Base64 at class level.
+    testOptions { unitTests.isReturnDefaultValues = true }
+
     defaultConfig {
         applicationId = "com.baestheorem.inbox"
         minSdk = 26

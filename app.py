@@ -2698,8 +2698,9 @@ def api_unsubscribe():
       1. RFC 8058 one-click POST, when the sender advertises it
       2. the sender's unsubscribe page, driven to completion by resolve_unsubscribe_link
       3. a one-click POST the sender never advertised (plenty of ESPs honor it anyway)
-      4. the List-Unsubscribe mailto
-      5. the browser, and only once every one of those has failed
+      4. the page again in a real WebKit engine, for opt-outs that only exist in JS
+      5. the List-Unsubscribe mailto
+      6. the browser, and only once every one of those has failed
 
     Reports which rung won in `steps`, and `confirmed` when the sender said in words
     that the address is off the list."""
@@ -2760,7 +2761,26 @@ def api_unsubscribe():
                 log.info("unsubscribe %s via %s", mid, steps)
                 return jsonify({"ok": True, "method": "one-click", "confirmed": True, "steps": steps})
 
-        # 4. Mail the list owner. Slower than the web route but it needs no browser either.
+        # 4. Nothing in the raw HTML, so the opt-out may only exist once the page's
+        #    scripts have run. Drive a real WebKit engine at it. Only possible inside
+        #    the desktop shell, which has an AppKit run loop; bare `python app.py`
+        #    skips this rung.
+        if url and _is_safe_public_url(url):
+            try:
+                import unsub_webdriver
+                if unsub_webdriver.available():
+                    res = unsub_webdriver.drive(url, email=_user_email)
+                    steps += res["steps"] or ["js:nothing"]
+                    if res["error"]:
+                        steps.append(f"js:{res['error']}")
+                    if res["ok"]:
+                        log.info("unsubscribe %s via %s", mid, steps)
+                        return jsonify({"ok": True, "method": "auto",
+                                        "confirmed": res["confirmed"], "steps": steps})
+            except Exception as e:
+                steps.append(f"js:{e}")
+
+        # 5. Mail the list owner. Slower than the web route but it needs no browser either.
         if mailto:
             send_message(mailto, info.get("mailtoSubject") or "unsubscribe",
                          "Please unsubscribe this address from your mailing list.")
@@ -2769,7 +2789,7 @@ def api_unsubscribe():
             return jsonify({"ok": True, "method": "mailto", "to": mailto,
                             "confirmed": False, "steps": steps})
 
-        # 5. Out of automatic options, so hand over the page.
+        # 6. Out of automatic options, so hand over the page.
         if url:
             log.info("unsubscribe %s fell through to the browser: %s", mid, steps)
             return jsonify({"ok": True, "method": "link", "url": url,

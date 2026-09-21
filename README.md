@@ -110,8 +110,12 @@ External links *inside emails* are routed to the default browser via pywebview's
   opt-out radio, types your address into the "which address?" box, answers the reason
   dropdown, presses the confirm button, and repeats for a second confirm screen, up to
   four rounds; (3) a one-click POST the sender never advertised, accepted only if the
-  response says in words that you are off the list; (4) the `mailto:` route, sent from
-  your account; (5) the browser, and only once all of that has failed. Every hop is
+  response says in words that you are off the list; (4) **the page again in a real
+  WebKit engine**, offscreen, for opt-outs that only exist once the page's scripts have
+  run: it ticks the opt-out control, types your address, presses the confirm button and
+  reads the result (needs the desktop shell's AppKit loop, so bare `python app.py` skips
+  this rung); (5) the `mailto:` route, sent from your account; (6) the browser, and only
+  once all of that has failed. Every hop is
   SSRF-checked (https + publicly-resolving host), login forms are never submitted, and a
   page that says "we're sorry to see you go" above a confirm button is not mistaken for
   success. Confirmation prompt guards accidental clicks.
