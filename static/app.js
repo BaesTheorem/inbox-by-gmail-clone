@@ -590,22 +590,28 @@ async function bulkThings() {
   });
 }
 async function doUnsub(messageId, btn, name) {
+  // The server walks the whole ladder (one-click, then the sender's confirmation page
+  // driven to completion there, then mailto) and only hands back a url once all of
+  // that has failed, so method "link" is the one case that still needs a browser.
   if (!messageId) return;
+  const who = name || "this sender";
   const orig = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; btn.textContent = "Unsubscribing…"; }
   const r = await post("/api/unsubscribe", { messageId });
+  const reset = () => { if (btn) { btn.disabled = false; btn.textContent = orig; } };
   if (r.ok && r.method === "link") {
-    openExternal(r.url); toast("Opened unsubscribe page");
-    if (btn) { btn.disabled = false; btn.textContent = orig; }
-  } else if (r.ok) {
-    toast(r.method === "mailto" ? "Unsubscribe email sent" : "Unsubscribed");
+    openExternal(r.url);
+    toast("Their page needs a human, so I opened it");
+    reset();
+  } else if (r.ok && r.method === "mailto") {
+    toast(`Unsubscribe email sent to ${r.to}`);
     if (btn) btn.textContent = "Unsubscribed ✓";
-  } else if (r.fallbackUrl) {
-    openExternal(r.fallbackUrl); toast("Finish unsubscribing in the browser");
-    if (btn) { btn.disabled = false; btn.textContent = orig; }
+  } else if (r.ok) {
+    toast(r.confirmed ? `Unsubscribed from ${who}` : `Unsubscribe submitted to ${who}`);
+    if (btn) btn.textContent = "Unsubscribed ✓";
   } else {
-    toast("Unsubscribe failed");
-    if (btn) { btn.disabled = false; btn.textContent = orig; }
+    toast(r.error ? `Unsubscribe failed: ${r.error}` : "Unsubscribe failed");
+    reset();
   }
 }
 async function doThings(row) {

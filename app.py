@@ -47,7 +47,8 @@ import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import formataddr, parsedate_to_datetime
-from urllib.parse import quote, urlparse
+from html.parser import HTMLParser as _HTMLParser
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 import random
 from concurrent.futures import ThreadPoolExecutor
@@ -466,6 +467,326 @@ def find_body_unsubscribe(html):
             fallback = {"available": True, "method": "link", "httpsUrl": href,
                         "mailto": None, "mailtoSubject": "unsubscribe", "source": "body"}
     return fallback
+
+
+# ----------------------------------------------------------------------------
+# Unsubscribe resolver
+# ----------------------------------------------------------------------------
+# Senders that skip RFC 8058 one-click hand you a link that lands on a
+# confirmation page, usually after a redirect or two: "click here to confirm",
+# a reason dropdown, a box asking which address to remove. This walks that page
+# the way a person would, here on the server, so the opt-out finishes without a
+# browser window ever opening. The browser is the last resort, not the first.
+
+_BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+
+# Wording that means the opt-out already went through. Deliberately narrow: a
+# confirmation page says "unsubscribe" too, and "you are about to unsubscribe"
+# must not read as done.
+_UNSUB_DONE_RE = re.compile("|".join([
+    r"you(?:'ve| have) been (?:successfully )?(?:unsubscribed|removed|opted[\s\-]?out)",
+    r"(?:has|have) been (?:successfully )?(?:unsubscribed|removed from)",
+    r"(?:successfully|now) (?:unsubscribed|opted[\s\-]?out)",
+    r"unsubscri(?:be|ption)[^.]{0,20}(?:was )?(?:success|complete|confirmed)",
+    r"you(?:'re| are) (?:now )?(?:unsubscribed|opted[\s\-]?out)",
+    r"you will no longer receive",
+    r"no longer (?:be )?subscribed",
+    r"removed from (?:our|the|this|that) (?:mailing |e-?mail |distribution )?list",
+    r"(?:subscription|e-?mail preferences|preferences) (?:has|have) been (?:cancell?ed|updated|saved|removed)",
+    r"opt[\s\-]?out (?:is )?(?:complete|successful|confirmed)",
+]), re.I)
+
+# Wording on a button, link, or form that means "this control finishes the opt-out".
+_UNSUB_CONFIRM_RE = re.compile("|".join([
+    r"unsubscrib",
+    r"opt[\s\-]?out",
+    r"remove\s+(?:me|my|this)",
+    r"yes[,!\s]",
+    r"confirm",
+    r"stop\s+(?:receiving|all|these)",
+    r"no\s+longer\s+(?:wish|want)",
+    r"(?:update|save)\s+(?:my\s+)?(?:e-?mail\s+)?preferences",
+]), re.I)
+
+# Forms that must never be submitted, even if the page around them is an opt-out page.
+_FORM_SKIP_RE = re.compile(r"search|log[\s\-]?in|sign[\s\-]?in|signup|register|donate|(?<!un)subscribe", re.I)
+
+_EMAIL_FIELD_RE = re.compile(r"e-?mail|addr", re.I)
+# Values/ids that mark the "take me off everything" option in a radio group or checkbox
+# list. Deliberately excludes a bare "all": on a preference radio, value="all" is the
+# opposite of an opt-out.
+_OPTOUT_VALUE_RE = re.compile(r"unsub|opt[\s\-]?out|remove|stop|\bnone\b|no[\s_\-]?e-?mail", re.I)
+
+
+class _FormScraper(_HTMLParser):
+    """Pulls every <form> out of a page with the fields we would need to submit it."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.forms = []
+        self._f = self._select = self._opt = self._btn = None
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "form":
+            self._f = {"action": a.get("action", ""),
+                       "method": (a.get("method") or "get").strip().lower(),
+                       "ident": " ".join([a.get("id", ""), a.get("name", ""), a.get("class", "")]),
+                       "fields": [], "text": ""}
+            self.forms.append(self._f)
+            return
+        if self._f is None:
+            return
+        if tag == "input":
+            self._f["fields"].append({
+                "kind": "input", "type": (a.get("type") or "text").strip().lower(),
+                "name": a.get("name", ""), "value": a.get("value", ""),
+                "id": " ".join([a.get("id", ""), a.get("class", "")]), "checked": "checked" in a})
+        elif tag == "select":
+            self._select = {"kind": "select", "name": a.get("name", ""), "options": [], "selected": None}
+            self._f["fields"].append(self._select)
+        elif tag == "option" and self._select is not None:
+            self._opt = {"value": a.get("value", ""), "text": "", "explicit": "value" in a}
+            self._select["options"].append(self._opt)
+            if "selected" in a:
+                self._select["selected"] = self._opt
+        elif tag == "textarea":
+            self._f["fields"].append({"kind": "textarea", "name": a.get("name", ""), "value": ""})
+        elif tag == "button":
+            self._btn = {"kind": "button", "type": (a.get("type") or "submit").strip().lower(),
+                         "name": a.get("name", ""), "value": a.get("value", ""), "label": ""}
+            self._f["fields"].append(self._btn)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self._f = self._select = self._opt = self._btn = None
+        elif tag == "select":
+            self._select = self._opt = None
+        elif tag == "option":
+            self._opt = None
+        elif tag == "button":
+            self._btn = None
+
+    def handle_data(self, data):
+        if self._f is None:
+            return
+        if self._opt is not None:
+            self._opt["text"] += data
+        if self._btn is not None:
+            self._btn["label"] += data
+        self._f["text"] += data
+
+
+def _visible_text(html):
+    s = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", html or "")
+    return _htmlmod.unescape(re.sub(r"<[^>]+>", " ", s))
+
+
+def _scrape_forms(html):
+    p = _FormScraper()
+    try:
+        p.feed(html or "")
+    except Exception:
+        pass  # malformed marketing HTML; keep whatever forms parsed before the break
+    return p.forms
+
+
+def _pick_unsub_form(forms, page_text):
+    """The form that finishes the opt-out, or None. Refuses login forms outright and
+    only guesses at an unlabeled form when it is the page's only one and the page
+    itself is clearly an opt-out page."""
+    usable = []
+    for form in forms:
+        if any(f["kind"] == "input" and f["type"] == "password" for f in form["fields"]):
+            continue
+        ident = form["action"] + " " + form["ident"]
+        blob = " ".join([ident, form["text"]]
+                        + [str(f.get("value", "")) + " " + str(f.get("label", "")) for f in form["fields"]])
+        if _UNSUB_CONFIRM_RE.search(blob):
+            return form
+        if not _FORM_SKIP_RE.search(ident):
+            usable.append(form)
+    if len(usable) == 1 and _UNSUB_CONFIRM_RE.search(page_text or ""):
+        return usable[0]
+    return None
+
+
+def _form_payload(form, email):
+    """Fill a confirmation form the way a person would: keep the hidden tokens, tick the
+    opt-out option, answer the "which address?" box, press the confirm button."""
+    data, submits, radios = [], [], OrderedDict()
+    for f in form["fields"]:
+        kind = f["kind"]
+        if kind == "select":
+            opt = f["selected"]
+            if opt is None:
+                opts = [o for o in f["options"] if (o["value"] or o["text"].strip())]
+                opt = (next((o for o in opts if _OPTOUT_VALUE_RE.search(o["value"] + " " + o["text"])), None)
+                       or next((o for o in opts if o["value"].strip()), None)
+                       or (opts[0] if opts else None))
+            if f["name"] and opt is not None:
+                data.append((f["name"], opt["value"] if opt["explicit"] else (opt["value"] or opt["text"].strip())))
+            continue
+        if kind == "textarea":
+            if f["name"]:
+                data.append((f["name"], ""))
+            continue
+        if kind == "button":
+            if f["type"] == "submit":
+                submits.append(f)
+            continue
+        t, name = f["type"], f["name"]
+        if t in ("submit", "image"):
+            submits.append(f)
+            continue
+        if t in ("button", "reset", "file") or not name:
+            continue
+        if t == "radio":
+            radios.setdefault(name, []).append(f)
+            continue
+        if t == "checkbox":
+            if f["checked"] or _OPTOUT_VALUE_RE.search(f"{name} {f['value']} {f['id']}"):
+                data.append((name, f["value"] or "on"))
+            continue
+        if t == "email" or (t in ("text", "hidden") and not f["value"]
+                            and _EMAIL_FIELD_RE.search(name + " " + f["id"])):
+            data.append((name, f["value"] or (email or "")))
+            continue
+        data.append((name, f["value"]))
+    for name, group in radios.items():
+        pick = (next((r for r in group if r["checked"]), None)
+                or next((r for r in group if _OPTOUT_VALUE_RE.search(f"{r['value']} {r['id']}")), None)
+                or group[0])
+        data.append((name, pick["value"] or "on"))
+    if submits:
+        pick = next((s for s in submits
+                     if _UNSUB_CONFIRM_RE.search(f"{s.get('value', '')} {s.get('label', '')}")), submits[0])
+        if pick.get("name"):
+            data.append((pick["name"], pick.get("value") or ""))
+    return data
+
+
+def _find_confirm_link(html, base):
+    """A plain <a> that finishes the job, for pages that use a link instead of a form."""
+    for m in re.finditer(r'<a\b[^>]*?href=(["\'])(.*?)\1[^>]*?>(.*?)</a>', html or "", re.I | re.S):
+        text = _htmlmod.unescape(re.sub(r"<[^>]+>", " ", m.group(3))).strip()
+        if text and _UNSUB_CONFIRM_RE.search(text):
+            href = urljoin(base, _htmlmod.unescape(m.group(2)).strip())
+            if _is_safe_public_url(href):
+                return href
+    return None
+
+
+def _find_client_redirect(html, base):
+    """meta-refresh and window.location hops: the redirects a plain HTTP client misses."""
+    m = re.search(r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]*content=["\'][^"\']*?url\s*=\s*([^"\'>;]+)',
+                  html or "", re.I)
+    if not m:
+        m = re.search(r'(?:window\.|document\.)?location(?:\.href|\.replace\()?\s*(?:=|\()\s*["\']([^"\']+)["\']',
+                      html or "", re.I)
+    if not m:
+        return None
+    href = urljoin(base, _htmlmod.unescape(m.group(1).strip()))
+    return href if _is_safe_public_url(href) else None
+
+
+def _safe_fetch(session, method, url, data=None, max_hops=8):
+    """Like session.request(follow_redirects) but SSRF-checks every hop, since each
+    Location comes from the sender. Returns (response, final_url)."""
+    for _ in range(max_hops):
+        if not _is_safe_public_url(url):
+            raise RuntimeError(f"unsafe redirect target: {urlparse(url).hostname}")
+        r = session.request(method, url, data=data, timeout=12, allow_redirects=False)
+        if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
+            url = urljoin(url, r.headers["Location"])
+            if r.status_code in (301, 302, 303):
+                method, data = "GET", None
+            continue
+        return r, url
+    raise RuntimeError("too many redirects")
+
+
+def resolve_unsubscribe_link(url, email=None, max_rounds=4):
+    """Drive a sender's unsubscribe page to completion without opening a browser.
+
+    Each round: fetch, check for a "you're unsubscribed" message, otherwise follow a
+    client-side redirect, submit the confirmation form, or click the confirmation link.
+    Returns {ok, confirmed, steps, finalUrl, error}; `confirmed` means the page said so
+    in words, `ok` means that or we submitted the confirmation and it was accepted."""
+    out = {"ok": False, "confirmed": False, "steps": [], "finalUrl": url, "error": None}
+    session = requests.Session()
+    session.headers.update({"User-Agent": _BROWSER_UA,
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "Accept-Language": "en-US,en;q=0.9"})
+    seen = set()
+    method, data, target = "GET", None, url
+    submitted = False
+    try:
+        for _ in range(max_rounds):
+            if method == "GET" and target in seen:
+                break
+            seen.add(target)
+            r, final = _safe_fetch(session, method, target, data)
+            out["finalUrl"] = final
+            ctype = (r.headers.get("Content-Type") or "text/html").lower()
+            page = r.text[:400_000] if ("html" in ctype or "text/plain" in ctype) else ""
+            text = _visible_text(page)
+            form = _pick_unsub_form(_scrape_forms(page), text)
+            if _UNSUB_DONE_RE.search(text) and (submitted or form is None):
+                out["steps"].append("confirmed")
+                out.update(ok=True, confirmed=True)
+                return out
+            if r.status_code >= 400:
+                out["error"] = f"HTTP {r.status_code}"
+                break
+            hop = _find_client_redirect(page, final)
+            if hop and hop not in seen:
+                out["steps"].append("redirect")
+                method, data, target = "GET", None, hop
+                continue
+            if form is not None:
+                action = urljoin(final, form["action"]) if form["action"] else final
+                payload = _form_payload(form, email)
+                out["steps"].append("form")
+                submitted = True
+                if form["method"] == "post":
+                    method, data, target = "POST", payload, action
+                else:
+                    sep = "&" if "?" in action else "?"
+                    method, data, target = "GET", None, action + sep + urlencode(payload)
+                continue
+            link = _find_confirm_link(page, final)
+            if link and link not in seen:
+                out["steps"].append("confirm-link")
+                submitted = True
+                method, data, target = "GET", None, link
+                continue
+            break
+        out["ok"] = out["confirmed"] or (submitted and not out["error"])
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+def _one_click_post(url, session=None):
+    """RFC 8058 one-click POST. Returns (ok, detail, body). The body lets an
+    unadvertised attempt be judged on the sender's own wording rather than on a 2xx."""
+    if not _is_safe_public_url(url):
+        return False, "unsafe URL", ""
+    s = session or requests.Session()
+    s.headers.setdefault("User-Agent", _BROWSER_UA)
+    try:
+        r, _final = _safe_fetch(s, "POST", url, data={"List-Unsubscribe": "One-Click"})
+        body = r.text[:200_000] if "html" in (r.headers.get("Content-Type") or "").lower() else ""
+        if 200 <= r.status_code < 300:
+            return True, str(r.status_code), body
+        return False, f"HTTP {r.status_code}", body
+    except Exception as e:
+        return False, str(e), ""
 
 
 def _decode_body(payload):
@@ -2371,8 +2692,17 @@ def api_followup():
 
 @app.route("/api/unsubscribe", methods=["POST"])
 def api_unsubscribe():
-    """Re-read the message's headers server-side and act per RFC 2369 / 8058."""
-    import urllib.request
+    """Re-read the message's headers server-side and walk the whole opt-out ladder here,
+    so the sender's confirmation page never becomes a browser tab:
+
+      1. RFC 8058 one-click POST, when the sender advertises it
+      2. the sender's unsubscribe page, driven to completion by resolve_unsubscribe_link
+      3. a one-click POST the sender never advertised (plenty of ESPs honor it anyway)
+      4. the List-Unsubscribe mailto
+      5. the browser, and only once every one of those has failed
+
+    Reports which rung won in `steps`, and `confirmed` when the sender said in words
+    that the address is off the list."""
     mid = (request.json or {}).get("messageId")
     tid = (request.json or {}).get("threadId")
     try:
@@ -2394,30 +2724,57 @@ def api_unsubscribe():
             if not info:
                 return jsonify({"error": "no unsubscribe link found"}), 400
 
-        if info["method"] == "one-click":
-            if not _is_safe_public_url(info["httpsUrl"]):
-                # Refuse to POST to a private/loopback target; let the user finish in-browser.
-                return jsonify({"ok": False, "method": "one-click",
-                                "fallbackUrl": info["httpsUrl"], "error": "unsafe URL"})
-            req = urllib.request.Request(
-                info["httpsUrl"], data=b"List-Unsubscribe=One-Click",
-                headers={"Content-Type": "application/x-www-form-urlencoded",
-                         "User-Agent": "InboxClone/1.0"},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    return jsonify({"ok": True, "method": "one-click", "status": r.status})
-            except Exception as e:
-                # Sender's endpoint failed — let the user finish in the browser
-                return jsonify({"ok": False, "method": "one-click",
-                                "fallbackUrl": info["httpsUrl"], "error": str(e)})
-        if info["method"] == "mailto":
-            send_message(info["mailto"], info["mailtoSubject"] or "unsubscribe",
+        url, mailto = info.get("httpsUrl"), info.get("mailto")
+        steps = []
+
+        # 1. The sender opted into RFC 8058: a 2xx here is the spec's own success signal.
+        if info["method"] == "one-click" and url:
+            ok, detail, _body = _one_click_post(url)
+            steps.append("one-click:ok" if ok else f"one-click:{detail}")
+            if ok:
+                log.info("unsubscribe %s via %s", mid, steps)
+                return jsonify({"ok": True, "method": "one-click", "confirmed": True, "steps": steps})
+
+        # 2. Drive the confirmation page ourselves: redirects, the confirm form, the
+        #    "which address?" box, the reason dropdown, the second confirm screen.
+        if url:
+            get_session()  # populates _user_email for pages that ask you to retype it
+            res = resolve_unsubscribe_link(url, email=_user_email)
+            steps += res["steps"] or ["page:nothing-to-submit"]
+            if res["error"]:
+                steps.append(f"page:{res['error']}")
+            if res["ok"]:
+                log.info("unsubscribe %s via %s", mid, steps)
+                return jsonify({"ok": True, "method": "auto", "confirmed": res["confirmed"],
+                                "steps": steps, "finalUrl": res["finalUrl"]})
+
+        # 3. Unadvertised one-click. A bare 2xx proves nothing here (the endpoint may have
+        #    just re-served the confirm page), so only the sender's own wording counts.
+        #    Skipped for body-scraped links: find_body_unsubscribe guesses at which link
+        #    is the opt-out, and a guess does not earn a POST.
+        if url and info["method"] != "one-click" and info.get("source") != "body":
+            ok, detail, body = _one_click_post(url)
+            done = ok and bool(_UNSUB_DONE_RE.search(_visible_text(body)))
+            steps.append("blind-one-click:ok" if done else f"blind-one-click:{detail if not ok else 'unconfirmed'}")
+            if done:
+                log.info("unsubscribe %s via %s", mid, steps)
+                return jsonify({"ok": True, "method": "one-click", "confirmed": True, "steps": steps})
+
+        # 4. Mail the list owner. Slower than the web route but it needs no browser either.
+        if mailto:
+            send_message(mailto, info.get("mailtoSubject") or "unsubscribe",
                          "Please unsubscribe this address from your mailing list.")
-            return jsonify({"ok": True, "method": "mailto", "to": info["mailto"]})
-        # link only — open in the browser
-        return jsonify({"ok": True, "method": "link", "url": info["httpsUrl"]})
+            steps.append("mailto")
+            log.info("unsubscribe %s via %s", mid, steps)
+            return jsonify({"ok": True, "method": "mailto", "to": mailto,
+                            "confirmed": False, "steps": steps})
+
+        # 5. Out of automatic options, so hand over the page.
+        if url:
+            log.info("unsubscribe %s fell through to the browser: %s", mid, steps)
+            return jsonify({"ok": True, "method": "link", "url": url,
+                            "confirmed": False, "steps": steps})
+        return jsonify({"error": "no unsubscribe route worked", "steps": steps}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

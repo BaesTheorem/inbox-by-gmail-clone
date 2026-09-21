@@ -100,11 +100,21 @@ External links *inside emails* are routed to the default browser via pywebview's
   via a `Bundle/<name>` Gmail label that overrides the heuristic + native category. Checkbox
   **"Apply to future from [sender]"** creates a Gmail **filter** so future mail from that sender
   auto-lands there. Needs the `gmail.settings.basic` scope (one-time re-consent).
-- **One-click Unsubscribe** (RFC 2369 / RFC 8058): inline link on inbox cards + a banner
-  at the top of the email, shown only when a `List-Unsubscribe` header exists. Server
-  re-reads headers at action time and: (1) one-click → `POST List-Unsubscribe=One-Click`
-  to the https URI; (2) mailto → sends an unsubscribe email from your account; (3) plain
-  https link → opens in the browser. Confirmation prompt guards accidental clicks.
+- **Unsubscribe without the click-through** (RFC 2369 / RFC 8058): inline link on inbox
+  cards + a banner at the top of the email, shown when a `List-Unsubscribe` header exists
+  or a body scan found an opt-out link. The server re-reads headers at action time and
+  walks a ladder, stopping at the first rung that works: (1) `POST List-Unsubscribe=One-Click`
+  to the https URI when the sender advertises RFC 8058; (2) **the sender's confirmation
+  page, driven to completion server-side**: it follows redirects (including meta-refresh
+  and `window.location`), fills the confirm form, keeps the hidden tokens, ticks the
+  opt-out radio, types your address into the "which address?" box, answers the reason
+  dropdown, presses the confirm button, and repeats for a second confirm screen, up to
+  four rounds; (3) a one-click POST the sender never advertised, accepted only if the
+  response says in words that you are off the list; (4) the `mailto:` route, sent from
+  your account; (5) the browser, and only once all of that has failed. Every hop is
+  SSRF-checked (https + publicly-resolving host), login forms are never submitted, and a
+  page that says "we're sorry to see you go" above a confirm button is not mistaken for
+  success. Confirmation prompt guards accidental clicks.
 - **Report spam**: card action, reader action, bulk-bar action, and Gmail's own `!` key.
   Undo ("not spam") is on the snackbar, and it both restores `INBOX` and clears `SPAM` so
   Gmail stops re-filing the thread.

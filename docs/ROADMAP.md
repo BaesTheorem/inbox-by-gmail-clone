@@ -35,8 +35,9 @@ live-sync (SSE) / **Send-to-Things** (Things has an iOS URL scheme).
 - **Snooze scheduler** — no background execution; snoozed mail can't re-file itself while
   the app is closed. Options: (a) re-file on app open + periodic foreground check, or
   (b) a tiny free serverless cron (Cloudflare Worker) that re-adds `INBOX` at wake time.
-- **One-click unsubscribe** — the silent POST to the sender is blocked by browser CORS;
-  degrades to "open the unsubscribe page." (mailto-unsubscribe still works via Gmail send.)
+- **Unsubscribe**: CORS blocks both the one-click POST and the confirmation-page walk,
+  so the whole ladder collapses to "open the unsubscribe page." (mailto-unsubscribe still
+  works via Gmail send.) A CORS proxy would restore it, at the cost of a server.
 - **Notifications** — iOS web push (16.4+) is possible but finicky; likely skip initially.
 
 ### Rough effort
