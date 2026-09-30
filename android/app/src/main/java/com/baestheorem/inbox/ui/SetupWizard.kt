@@ -198,7 +198,7 @@ private fun Welcome(embedded: Boolean, owner: String, onSignIn: () -> Unit, onOw
             Spacer(Modifier.height(8.dp))
             Text(
                 "Through " + owner.ifEmpty { "the app owner" } + "'s Google Cloud project. " +
-                    "Your address has to be on its allowed list, or Google refuses the sign-in.",
+                    "If that project is still in testing, your address has to be on its allowed list.",
                 style = robotoStyle(12),
                 color = Theme.textFaint,
             )

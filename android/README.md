@@ -139,8 +139,9 @@ bring-your-own-project route.
 `build/Inbox.apk` is the whole thing, about 2.4 MB. Mail it, AirDrop it, drop it
 in a chat. On the phone: open the file, allow the app store prompt about
 installing unknown apps, install, open, follow the wizard. If they are on the
-built-in connection, add their Gmail address as a test user on the Cloud project
-first, or Google refuses the sign-in.
+built-in connection and the Cloud project is still in Testing, add their Gmail
+address as a test user first, or Google refuses the sign-in; a project that has
+been published (even unverified, up to its 100-user cap) takes any account.
 
 ## Layout
 
