@@ -1,6 +1,5 @@
 package com.baestheorem.inbox.auth
 
-import android.net.Uri
 import com.baestheorem.inbox.gmail.Net
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -13,9 +12,12 @@ import java.io.InputStreamReader
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
+import java.net.URLDecoder
+import java.net.URLEncoder
 import java.security.MessageDigest
 import java.security.SecureRandom
-import android.util.Base64
+import java.util.Base64
 
 /**
  * Installed-app OAuth with PKCE against a **Desktop app** client, exactly like
@@ -27,6 +29,9 @@ import android.util.Base64
  *
  * Consent must happen in a real browser (Custom Tab). Google blocks OAuth
  * inside an embedded WebView with `disallowed_useragent`.
+ *
+ * Only java.* is used here, on purpose: `OAuthFlowTest` drives the listener on
+ * a plain JVM, where android.net.Uri and android.util.Base64 are stubs.
  */
 object OAuthFlow {
     const val AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -40,6 +45,9 @@ object OAuthFlow {
         "https://www.googleapis.com/auth/gmail.modify",
         "https://www.googleapis.com/auth/gmail.send",
     )
+
+    private const val CONSENT_TIMEOUT_MS = 5 * 60 * 1000L
+    private const val READ_TIMEOUT_MS = 10_000
 
     class AuthError(message: String, val code: String = "") : Exception(message)
 
@@ -59,10 +67,13 @@ object OAuthFlow {
         val authUrl: String,
         private val server: ServerSocket,
         private val verifier: String,
+        internal val state: String,
         private val redirectUri: String,
         private val clientId: String,
         private val clientSecret: String,
     ) {
+        internal val port: Int get() = server.localPort
+
         /** Blocks until the browser hits the loopback listener. */
         suspend fun awaitTokens(): Tokens = withContext(Dispatchers.IO) {
             try {
@@ -73,37 +84,77 @@ object OAuthFlow {
             }
         }
 
-        private fun awaitCode(): String {
-            server.soTimeout = 5 * 60 * 1000
-            val socket: Socket = try {
-                server.accept()
-            } catch (e: IOException) {
-                throw AuthError("Timed out waiting for the Google sign-in to come back.")
-            }
-            socket.use { s ->
-                val reader = BufferedReader(InputStreamReader(s.getInputStream()))
-                val requestLine = reader.readLine() ?: ""
-                val path = requestLine.split(" ").getOrNull(1) ?: ""
-                val uri = Uri.parse("http://127.0.0.1$path")
-                val code = uri.getQueryParameter("code")
-                val error = uri.getQueryParameter("error")
-                respond(s, code != null)
-                if (code != null) return code
+        private class Outcome(val code: String?, val error: String?)
+
+        /**
+         * Serves the loopback port until a request carrying this session's
+         * `state` arrives. Everything else the browser throws at the port is
+         * answered and ignored: the speculative preconnects Chrome opens and
+         * never writes to, the favicon fetch, and any request with a foreign or
+         * missing state (another app on the phone can reach 127.0.0.1 too).
+         * A single stray hit must not end the real sign-in.
+         */
+        internal fun awaitCode(timeoutMs: Long = CONSENT_TIMEOUT_MS): String {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (true) {
+                val left = deadline - System.currentTimeMillis()
+                if (left <= 0) throw AuthError("Timed out waiting for the Google sign-in to come back.")
+                server.soTimeout = left.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                val socket: Socket = try {
+                    server.accept()
+                } catch (e: SocketTimeoutException) {
+                    throw AuthError("Timed out waiting for the Google sign-in to come back.")
+                } catch (e: IOException) {
+                    throw AuthError("The sign-in was cancelled before Google came back.")
+                }
+                val outcome = socket.use { handle(it) } ?: continue
+                if (outcome.code != null) return outcome.code
                 throw AuthError(
-                    when (error) {
+                    when (outcome.error) {
                         "access_denied" -> "You declined the permissions Inbox needs."
                         null -> "The browser came back without an authorization code."
-                        else -> "Google returned: $error"
+                        else -> "Google returned: ${outcome.error}"
                     },
-                    error ?: "",
+                    outcome.error ?: "",
                 )
             }
         }
 
-        private fun respond(socket: Socket, ok: Boolean) {
-            val title = if (ok) "Signed in" else "Sign-in cancelled"
-            val note = if (ok) "You can close this tab and go back to Inbox."
-            else "Nothing was changed. Go back to Inbox and try again."
+        /** One connection. Null means "not the redirect, keep listening". */
+        private fun handle(socket: Socket): Outcome? {
+            socket.soTimeout = READ_TIMEOUT_MS
+            val requestLine = try {
+                BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.ISO_8859_1)).readLine()
+            } catch (e: IOException) {
+                null
+            } ?: return null
+            val target = requestLine.split(" ").getOrNull(1) ?: return null
+            val path = target.substringBefore('?')
+            val query = parseQuery(target.substringAfter('?', ""))
+            if (path != "/" && path != "") {
+                respond(socket, 404, "Not found", "")
+                return null
+            }
+            val code = query["code"]
+            val error = query["error"]
+            if (code == null && error == null) {
+                respond(socket, 404, "Not found", "")
+                return null
+            }
+            val theirs = query["state"] ?: ""
+            if (!MessageDigest.isEqual(theirs.toByteArray(), state.toByteArray())) {
+                respond(socket, 400, "Sign-in mismatch", "This response belongs to a different sign-in attempt.")
+                return null
+            }
+            if (code != null) {
+                respond(socket, 200, "Signed in", "Inbox is bringing itself back. You can close this tab.")
+            } else {
+                respond(socket, 200, "Sign-in cancelled", "Nothing was changed. Go back to Inbox and try again.")
+            }
+            return Outcome(code, error)
+        }
+
+        private fun respond(socket: Socket, status: Int, title: String, note: String) {
             val body = """
                 <!doctype html><html><head><meta charset="utf-8">
                 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -117,15 +168,24 @@ object OAuthFlow {
                 </div></body></html>
             """.trimIndent()
             val bytes = body.toByteArray(Charsets.UTF_8)
-            socket.getOutputStream().apply {
-                write(
-                    ("HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: text/html; charset=utf-8\r\n" +
-                        "Content-Length: ${bytes.size}\r\n" +
-                        "Connection: close\r\n\r\n").toByteArray(Charsets.UTF_8)
-                )
-                write(bytes)
-                flush()
+            val reason = when (status) {
+                200 -> "OK"
+                400 -> "Bad Request"
+                else -> "Not Found"
+            }
+            try {
+                socket.getOutputStream().apply {
+                    write(
+                        ("HTTP/1.1 $status $reason\r\n" +
+                            "Content-Type: text/html; charset=utf-8\r\n" +
+                            "Content-Length: ${bytes.size}\r\n" +
+                            "Connection: close\r\n\r\n").toByteArray(Charsets.UTF_8)
+                    )
+                    write(bytes)
+                    flush()
+                }
+            } catch (e: IOException) {
+                // the browser hung up first; the query string was already read
             }
         }
 
@@ -140,24 +200,46 @@ object OAuthFlow {
 
     /** Binds the loopback listener and builds the consent URL for it. */
     fun start(clientId: String, clientSecret: String, loginHint: String = ""): Session {
-        val server = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+        // Backlog above 1: Chrome opens a spare connection alongside the real
+        // one, and a refused real one is a dead-end error page for the user.
+        val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
         val redirectUri = "http://127.0.0.1:${server.localPort}"
-        val verifier = randomVerifier()
+        val verifier = randomToken(64)
+        val state = randomToken(32)
         val challenge = s256(verifier)
-        val url = Uri.parse(AUTH_ENDPOINT).buildUpon()
-            .appendQueryParameter("client_id", clientId)
-            .appendQueryParameter("redirect_uri", redirectUri)
-            .appendQueryParameter("response_type", "code")
-            .appendQueryParameter("scope", SCOPES.joinToString(" "))
-            .appendQueryParameter("code_challenge", challenge)
-            .appendQueryParameter("code_challenge_method", "S256")
-            .appendQueryParameter("access_type", "offline")
+        val params = mutableListOf(
+            "client_id" to clientId,
+            "redirect_uri" to redirectUri,
+            "response_type" to "code",
+            "scope" to SCOPES.joinToString(" "),
+            "code_challenge" to challenge,
+            "code_challenge_method" to "S256",
+            "state" to state,
+            "access_type" to "offline",
             // force the refresh token even if this account consented before
-            .appendQueryParameter("prompt", "consent")
-            .apply { if (loginHint.isNotEmpty()) appendQueryParameter("login_hint", loginHint) }
-            .build()
-            .toString()
-        return Session(url, server, verifier, redirectUri, clientId, clientSecret)
+            "prompt" to "consent",
+        )
+        if (loginHint.isNotEmpty()) params += "login_hint" to loginHint
+        val url = AUTH_ENDPOINT + "?" + params.joinToString("&") { (k, v) ->
+            k + "=" + URLEncoder.encode(v, "UTF-8")
+        }
+        return Session(url, server, verifier, state, redirectUri, clientId, clientSecret)
+    }
+
+    internal fun parseQuery(query: String): Map<String, String> {
+        if (query.isEmpty()) return emptyMap()
+        val out = HashMap<String, String>()
+        for (pair in query.split('&')) {
+            if (pair.isEmpty()) continue
+            val k = pair.substringBefore('=')
+            val v = pair.substringAfter('=', "")
+            try {
+                out[URLDecoder.decode(k, "UTF-8")] = URLDecoder.decode(v, "UTF-8")
+            } catch (e: IllegalArgumentException) {
+                // a malformed percent-escape from something that is not Google
+            }
+        }
+        return out
     }
 
     private fun exchange(
@@ -221,14 +303,16 @@ object OAuthFlow {
         else -> description ?: "Google returned: $error"
     }
 
-    private fun randomVerifier(): String {
-        val bytes = ByteArray(64)
-        SecureRandom().nextBytes(bytes)
-        return Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+    private val urlSafe = Base64.getUrlEncoder().withoutPadding()
+
+    private fun randomToken(bytes: Int): String {
+        val buf = ByteArray(bytes)
+        SecureRandom().nextBytes(buf)
+        return urlSafe.encodeToString(buf)
     }
 
     private fun s256(verifier: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray(Charsets.US_ASCII))
-        return Base64.encodeToString(digest, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+        return urlSafe.encodeToString(digest)
     }
 }

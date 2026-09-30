@@ -15,22 +15,35 @@ drawer, and the yellow mailing-list banner. `ui/Theme.kt` holds the tokens;
 ## The setup wizard
 
 The point of this build: hand someone the APK and they connect their own Gmail
-without touching a terminal. First launch runs `ui/SetupWizard.kt`, which offers
-two routes.
+without touching a terminal. First launch runs `ui/SetupWizard.kt`.
 
-1. **The built-in connection.** If the APK was built with `client.properties`
-   present, it carries an OAuth client and sign-in is one tap. Everyone who uses
-   such a build has to be allowed on that one Google Cloud project (a test user,
-   or the app published), and the project owner can see the usage.
-2. **Your own Google Cloud project.** The wizard walks through creating a
-   project, enabling the Gmail API, filling in the consent screen, and creating a
-   **Desktop app** OAuth client, with a button per step that opens the exact
+1. **Sign in with Google.** If the APK was built with `client.properties`
+   present, it carries an OAuth client and the welcome screen's main button
+   goes straight to a one-screen heads-up about Google's warning, then to
+   Google's consent page: two taps. Everyone who uses such a build has to be
+   allowed on that one Google Cloud project (a test user, or the app
+   published), and the project owner can see the usage.
+2. **Your own Google Cloud project.** The link under that button (or the only
+   route, in a build with no baked-in client) walks through creating a
+   project, enabling the Gmail API, filling in the consent screen, and creating
+   a **Desktop app** OAuth client, with a button per step that opens the exact
    console page. Then paste the downloaded `client_secret.json` (or the ID and
    secret on two lines) and sign in. Nothing then depends on anyone else.
 
 Either way Google's consent page opens in a Chrome Custom Tab, and it shows
 "Google hasn't verified this app" because this app is not going through Google's
 review. Advanced, then "Go to Inbox (unsafe)". The wizard says so up front.
+When Google redirects back, the app pops the tab and returns to the foreground
+by itself; the tab's page also says it is safe to close.
+
+The attempt lives in `auth/AuthSession.kt` for the life of the process, not in
+the wizard's composition, so a rotation or a recreated activity while the
+browser is up does not close the port Google is about to redirect to. The
+listener in `auth/OAuthFlow.kt` answers and ignores anything that is not its
+redirect (Chrome's spare preconnects, the favicon fetch, a hit with a foreign
+`state`) and only ever completes on a request carrying its own `state`, so
+another app on the phone cannot end or spoof the sign-in. Waiting has a Cancel
+button. `OAuthFlowTest` drives all of that on a plain JVM.
 
 ### Why the OAuth client must be "Desktop app"
 
@@ -133,7 +146,8 @@ first, or Google refuses the sign-in.
 
     app/src/main/java/com/baestheorem/inbox/
       auth/     AuthStore (encrypted client + refresh token), OAuthFlow
-                (loopback PKCE), ClientCredentials (paste parser)
+                (loopback PKCE + state), AuthSession (the in-flight
+                attempt, process-scoped), ClientCredentials (paste parser)
       gmail/    GmailClient (REST, retry, metadata cache, history cursor),
                 Bundling / Mime / Unsub / UnsubResolver (app.py ports),
                 Models, Net

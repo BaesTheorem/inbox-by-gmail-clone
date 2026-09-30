@@ -1,14 +1,15 @@
 package com.baestheorem.inbox.ui
 
+import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.net.Uri
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -28,10 +29,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -40,15 +43,11 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.baestheorem.inbox.auth.AuthSession
 import com.baestheorem.inbox.auth.AuthStore
 import com.baestheorem.inbox.auth.ClientCredentials
-import com.baestheorem.inbox.auth.OAuthFlow
-import com.baestheorem.inbox.gmail.GmailClient
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
-private enum class Step { WELCOME, CHOOSE, BYO, CONSENT, SIGNING_IN, DONE }
+private enum class Step { WELCOME, BYO, CONSENT, SIGNING_IN, DONE }
 
 private const val URL_PROJECT = "https://console.cloud.google.com/projectcreate"
 private const val URL_GMAIL_API = "https://console.cloud.google.com/apis/library/gmail.googleapis.com"
@@ -56,60 +55,49 @@ private const val URL_AUDIENCE = "https://console.cloud.google.com/auth/audience
 private const val URL_CLIENTS = "https://console.cloud.google.com/auth/clients"
 
 /**
- * First-run setup. Two ways in: the OAuth client baked into this build (if the
- * person who handed you the APK put one there), or your own Google Cloud
- * project, which the wizard walks through step by step. Either way the app ends
- * up holding a refresh token for your account and nothing else.
+ * First-run setup. With an OAuth client baked into this build, the path is
+ * Welcome, one heads-up about Google's unverified-app warning, and the
+ * browser: two taps. Without one (or by choice) the wizard walks through
+ * making your own Google Cloud project. Either way the app ends up holding a
+ * refresh token for your account and nothing else.
+ *
+ * The sign-in itself runs in [AuthSession], which outlives this composable;
+ * the wizard only mirrors its state, so coming back from the browser into a
+ * recreated activity lands on the right screen.
  */
 @Composable
 fun SetupWizard(onDone: () -> Unit) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var step by remember {
-        mutableStateOf(
-            when {
-                AuthStore.hasClient -> Step.CONSENT
-                AuthStore.hasEmbeddedClient -> Step.WELCOME
-                else -> Step.WELCOME
-            }
-        )
+    var step by rememberSaveable {
+        mutableStateOf(if (AuthStore.hasClient) Step.CONSENT else Step.WELCOME)
     }
-    var error by remember { mutableStateOf<String?>(null) }
-    var pasted by remember { mutableStateOf("") }
+    var error by rememberSaveable { mutableStateOf<String?>(null) }
+    var pasted by rememberSaveable { mutableStateOf("") }
     var account by remember { mutableStateOf(AuthStore.account) }
+    val auth by AuthSession.state.collectAsState()
+
+    LaunchedEffect(auth) {
+        when (val a = auth) {
+            AuthSession.State.Idle -> if (step == Step.SIGNING_IN) step = Step.CONSENT
+            is AuthSession.State.Waiting -> step = Step.SIGNING_IN
+            is AuthSession.State.Done -> {
+                account = a.account
+                error = null
+                step = Step.DONE
+                AuthSession.consume()
+            }
+            is AuthSession.State.Failed -> {
+                error = a.message
+                step = Step.CONSENT
+                AuthSession.consume()
+            }
+        }
+    }
 
     fun signIn() {
         error = null
         step = Step.SIGNING_IN
-        scope.launch {
-            val session = try {
-                withContext(Dispatchers.IO) {
-                    OAuthFlow.start(AuthStore.clientId, AuthStore.clientSecret, AuthStore.account)
-                }
-            } catch (e: Exception) {
-                error = "Could not open a local listener for the sign-in: ${e.message}"
-                step = Step.CONSENT
-                return@launch
-            }
-            if (!openInBrowser(context, session.authUrl)) {
-                session.close()
-                error = "No browser is installed, so Google's sign-in page cannot open."
-                step = Step.CONSENT
-                return@launch
-            }
-            try {
-                val tokens = session.awaitTokens()
-                AuthStore.refreshToken = tokens.refreshToken
-                GmailClient.resetForNewAccount()
-                val email = withContext(Dispatchers.IO) { GmailClient.profileEmail() }
-                AuthStore.account = email
-                account = email
-                step = Step.DONE
-            } catch (e: Exception) {
-                error = e.message ?: "Sign-in failed."
-                step = Step.CONSENT
-            }
-        }
+        AuthSession.begin(context) { openInBrowser(context, it) }
     }
 
     Box(Modifier.fillMaxSize().background(Theme.pageBg)) {
@@ -122,13 +110,11 @@ fun SetupWizard(onDone: () -> Unit) {
             Spacer(Modifier.height(28.dp))
             when (step) {
                 Step.WELCOME -> Welcome(
-                    onNext = {
-                        step = if (AuthStore.hasEmbeddedClient) Step.CHOOSE else Step.BYO
-                    }
-                )
-                Step.CHOOSE -> Choose(
-                    onEmbedded = {
+                    embedded = AuthStore.hasEmbeddedClient,
+                    owner = AuthStore.embeddedOwner,
+                    onSignIn = {
                         AuthStore.useEmbeddedClient()
+                        error = null
                         step = Step.CONSENT
                     },
                     onOwn = { step = Step.BYO },
@@ -152,14 +138,24 @@ fun SetupWizard(onDone: () -> Unit) {
                 Step.CONSENT -> Consent(
                     ownProject = AuthStore.ownProject,
                     owner = AuthStore.embeddedOwner,
+                    embeddedAvailable = AuthStore.hasEmbeddedClient,
                     error = error,
                     onSignIn = { signIn() },
-                    onBack = {
+                    onOwn = {
                         error = null
-                        step = if (AuthStore.hasEmbeddedClient) Step.CHOOSE else Step.BYO
+                        step = Step.BYO
+                    },
+                    onEmbedded = {
+                        AuthStore.useEmbeddedClient()
+                        error = null
                     },
                 )
-                Step.SIGNING_IN -> SigningIn()
+                Step.SIGNING_IN -> SigningIn(
+                    onCancel = {
+                        AuthSession.cancel()
+                        step = Step.CONSENT
+                    }
+                )
                 Step.DONE -> Done(account = account, onOpen = onDone)
             }
             Spacer(Modifier.height(40.dp))
@@ -168,7 +164,7 @@ fun SetupWizard(onDone: () -> Unit) {
 }
 
 @Composable
-private fun Welcome(onNext: () -> Unit) {
+private fun Welcome(embedded: Boolean, owner: String, onSignIn: () -> Unit, onOwn: () -> Unit) {
     Column {
         MIcon("inbox", size = 56, color = Theme.blue)
         Spacer(Modifier.height(16.dp))
@@ -197,35 +193,20 @@ private fun Welcome(onNext: () -> Unit) {
             )
         }
         Spacer(Modifier.height(24.dp))
-        PrimaryButton("Get started", onNext)
-    }
-}
-
-@Composable
-private fun Choose(onEmbedded: () -> Unit, onOwn: () -> Unit) {
-    Column {
-        Heading("Connect Gmail")
-        Text(
-            "Two ways to do this. The quick one works if whoever gave you this app " +
-                "added your address to their Google Cloud project.",
-            style = robotoStyle(15),
-            color = Theme.textSecondary,
-        )
-        Spacer(Modifier.height(20.dp))
-        ChoiceCard(
-            title = "Use the built-in connection",
-            body = "One tap. Needs your Gmail address on " +
-                (AuthStore.embeddedOwner.ifEmpty { "the owner" }) +
-                "'s allowed list, or Google will refuse the sign-in.",
-            onClick = onEmbedded,
-        )
-        Spacer(Modifier.height(12.dp))
-        ChoiceCard(
-            title = "Use my own Google Cloud project",
-            body = "About five minutes of setup in a browser, then nothing depends on " +
-                "anyone else's account or quota.",
-            onClick = onOwn,
-        )
+        if (embedded) {
+            PrimaryButton("Sign in with Google", onSignIn)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Through " + owner.ifEmpty { "the app owner" } + "'s Google Cloud project. " +
+                    "Your address has to be on its allowed list, or Google refuses the sign-in.",
+                style = robotoStyle(12),
+                color = Theme.textFaint,
+            )
+            Spacer(Modifier.height(6.dp))
+            TextButton("Use my own Google Cloud project instead", onOwn)
+        } else {
+            PrimaryButton("Get started", onOwn)
+        }
     }
 }
 
@@ -308,9 +289,11 @@ private fun BringYourOwn(
 private fun Consent(
     ownProject: Boolean,
     owner: String,
+    embeddedAvailable: Boolean,
     error: String?,
     onSignIn: () -> Unit,
-    onBack: () -> Unit,
+    onOwn: () -> Unit,
+    onEmbedded: () -> Unit,
 ) {
     Column {
         Heading("Sign in to Google")
@@ -339,7 +322,7 @@ private fun Consent(
                 Text(
                     "If Google says the app is blocked or your account is not allowed, " +
                         "your address still needs adding as a test user on that project. " +
-                        "Ask for it, or go back and make your own project.",
+                        "Ask for it, or make your own project below.",
                     style = robotoStyle(13),
                     color = Theme.textSecondary,
                 )
@@ -350,14 +333,19 @@ private fun Consent(
             ErrorNote(error)
         }
         Spacer(Modifier.height(20.dp))
-        PrimaryButton("Continue to Google", onSignIn)
+        PrimaryButton("Sign in with Google", onSignIn)
         Spacer(Modifier.height(10.dp))
-        TextButton("Use different credentials", onBack)
+        if (ownProject) {
+            TextButton("Paste different credentials", onOwn)
+            if (embeddedAvailable) TextButton("Use the built-in connection instead", onEmbedded)
+        } else {
+            TextButton("Use my own Google Cloud project instead", onOwn)
+        }
     }
 }
 
 @Composable
-private fun SigningIn() {
+private fun SigningIn(onCancel: () -> Unit) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
         Spacer(Modifier.height(60.dp))
         CircularProgressIndicator(color = Theme.blue)
@@ -365,10 +353,12 @@ private fun SigningIn() {
         Text("Waiting for Google", style = robotoStyle(16, FontWeight.Medium), color = Theme.textPrimary)
         Spacer(Modifier.height(8.dp))
         Text(
-            "Finish in the browser tab that just opened, then come back here.",
+            "Finish in the browser tab that just opened. Inbox comes back on its own.",
             style = robotoStyle(14),
             color = Theme.textSecondary,
         )
+        Spacer(Modifier.height(28.dp))
+        TextButton("Cancel", onCancel)
     }
 }
 
@@ -518,22 +508,38 @@ fun TextButton(label: String, onClick: () -> Unit) {
     }
 }
 
-/** Custom Tab when a browser supports it, plain VIEW intent otherwise. */
+/**
+ * Custom Tab when a browser supports it, plain VIEW intent otherwise. From an
+ * Activity the tab opens inside this app's task, which is what lets the
+ * finished sign-in pop it and land back here; only a non-Activity context
+ * needs a new task.
+ */
 fun openInBrowser(context: Context, url: String): Boolean {
     val uri = Uri.parse(url)
+    val activity = context.findActivity()
+    val extraFlags = if (activity == null) Intent.FLAG_ACTIVITY_NEW_TASK else 0
     return try {
         CustomTabsIntent.Builder()
             .setShowTitle(true)
             .build()
-            .also { it.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+            .also { it.intent.addFlags(extraFlags) }
             .launchUrl(context, uri)
         true
     } catch (e: ActivityNotFoundException) {
         try {
-            context.startActivity(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            context.startActivity(Intent(Intent.ACTION_VIEW, uri).addFlags(extraFlags))
             true
         } catch (e2: ActivityNotFoundException) {
             false
         }
     }
+}
+
+private fun Context.findActivity(): Activity? {
+    var c: Context = this
+    while (c is ContextWrapper) {
+        if (c is Activity) return c
+        c = c.baseContext
+    }
+    return null
 }
