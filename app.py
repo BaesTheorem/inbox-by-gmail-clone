@@ -62,6 +62,8 @@ from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
+import otp
+
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
@@ -1470,6 +1472,7 @@ SETTINGS_DEFAULTS = {
     "followup_default_days": 3,
     "notifications": True,         # Inbox-branded macOS banners on new unread mail
     "notification_sound": True,    # play the system alert sound with each banner
+    "otp_banners": True,           # banner for an emailed verification code; click types it
 }
 
 
@@ -1728,6 +1731,77 @@ def _notify_new_mail(message_ids):
 
 
 # ----------------------------------------------------------------------------
+# Emailed verification codes — a banner that fills the code on click
+# ----------------------------------------------------------------------------
+# The history poller hands every new inbox message id to _otp_scan, which pulls
+# the body, runs otp.extract_code (the rules live in otp.py; the iPhone app has a
+# line-for-line port) and raises one banner per code: "Code 482913 from GitHub".
+# The click runs otp-fill.sh, which copies the code and types it into the field
+# that has focus, so the flow matches the system's own SMS-code popup. Codes are
+# validated against [A-Z0-9]{4,8} before they touch a shell command.
+_OTP_FILL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "otp-fill.sh")
+_OTP_FIELDS = ("id,threadId,internalDate,labelIds,payload(mimeType,headers,body/data,"
+               "parts(mimeType,body/data,parts(mimeType,body/data,parts(mimeType,body/data))))")
+_otp_seen = set()
+_OTP_MAX_AGE = 15 * 60   # ignore codes older than this (a backfill after sleep)
+
+
+def _otp_scan(message_ids):
+    """Detect one-time codes in freshly arrived mail and banner each one."""
+    if not _NOTIFIER or not _get_setting("otp_banners", True):
+        return
+    for mid in message_ids:
+        if mid in _otp_seen:
+            continue
+        _otp_seen.add(mid)
+        try:
+            full = gget(f"/messages/{mid}", format="full", fields=_OTP_FIELDS)
+        except Exception:  # noqa: BLE001 - a vanished message is not an error worth a banner
+            log.info("otp scan: could not fetch %s", mid)
+            continue
+        labels = full.get("labelIds") or []
+        if "SENT" in labels or "DRAFT" in labels:
+            continue
+        age = time.time() - int(full.get("internalDate", 0)) / 1000
+        if age > _OTP_MAX_AGE:
+            continue
+        headers = full.get("payload", {}).get("headers", [])
+        subject = _header(headers, "Subject")
+        sender = _header(headers, "From")
+        text, html = _decode_body(full.get("payload", {}))
+        hit = otp.extract_code(subject, text or html, sender)
+        if not hit and html and text:
+            hit = otp.extract_code(subject, html, sender)   # the code sat in an HTML-only cell
+        if not hit:
+            continue
+        _notify_otp(hit["code"], hit["service"], full.get("threadId"))
+    if len(_otp_seen) > _NOTIFIED_CAP:
+        for old in list(_otp_seen)[:-_NOTIFIED_CAP]:
+            _otp_seen.discard(old)
+
+
+def _notify_otp(code, service, thread_id=None):
+    """Banner: title carries the code and sender; the click types it."""
+    if not re.fullmatch(r"[A-Z0-9]{4,8}", code):
+        return
+    cmd = [_NOTIFIER, "-title", f"Code {code} from {service}",
+           "-message", "Click to type it into the active field (also copied)",
+           "-group", f"otp-{code}", "-execute", f'"{_OTP_FILL}" {code}']
+    if _get_setting("notification_sound", True):
+        cmd += ["-sound", "default"]
+    if not _NOTIFIER_BRANDED:
+        if _NOTIFY_SENDER:
+            cmd += ["-sender", _NOTIFY_SENDER]
+        if os.path.exists(_NOTIFY_ICON):
+            cmd += ["-appIcon", _NOTIFY_ICON]
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log.info("otp banner: %s from %s (thread %s)", code, service, thread_id)
+    except Exception:
+        log.exception("otp banner failed")
+
+
+# ----------------------------------------------------------------------------
 # Live sync — poll Gmail's History API for deltas, push to browsers via SSE
 # ----------------------------------------------------------------------------
 POLL_INTERVAL = 8  # seconds
@@ -1766,6 +1840,7 @@ def _history_loop():
                         if added:
                             enqueue_unsub_scan(added)
                             _notify_new_mail(added)
+                            threading.Thread(target=_otp_scan, args=(added,), daemon=True).start()
                     SYNC["history_id"] = resp.get("historyId", SYNC["history_id"])
                 except GmailHTTPError as he:
                     # 404 = startHistoryId too old; reset cursor and force a refresh

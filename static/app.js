@@ -2048,6 +2048,7 @@ function openSettings() {
   $("#setImageBlock").checked = s.image_block ?? false;
   $("#setNotifications").checked = s.notifications ?? true;
   $("#setNotifSound").checked = s.notification_sound ?? true;
+  $("#setOtpBanners").checked = s.otp_banners ?? true;
   $("#setFollowupDays").value = String(s.followup_default_days ?? 3);
   $("#settingsOverlay").hidden = false;
   renderBlocked();
@@ -2099,6 +2100,7 @@ $("#settingsSave").onclick = async () => {
     image_block: $("#setImageBlock").checked,
     notifications: $("#setNotifications").checked,
     notification_sound: $("#setNotifSound").checked,
+    otp_banners: $("#setOtpBanners").checked,
     followup_default_days: +$("#setFollowupDays").value,
   };
   STATE.settings = Object.assign(STATE.settings || {}, upd);

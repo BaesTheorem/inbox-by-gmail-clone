@@ -152,6 +152,18 @@ External links *inside emails* are routed to the default browser via pywebview's
   Notifications. Without that bundle it falls back to plain terminal-notifier with the
   favicon pasted in (attributed to Terminal); `export INBOX_NOTIFY_SENDER=<app-bundle-id>`
   can dress up that fallback.
+- **Verification-code banners.** When a one-time code arrives by email (a login code,
+  a sign-in verification, an activation code) the poller raises a banner that leads with
+  the code: "Code 482913 from GitHub". Clicking it runs `otp-fill.sh`, which copies the
+  code and types it into the field that has keyboard focus, the same move as the system's
+  own SMS-code popup. The rules live in `otp.py` (pure functions, `tests/test_otp.py`):
+  a message counts only when its subject or opening text announces a code, and the token
+  must sit next to those words. Meeting passcodes, receipts, card last-fours, phone
+  numbers, promo codes and FAQ mentions of "your verification code" are excluded by
+  their surroundings. Toggle in Settings → "Banner for emailed verification codes".
+  Typing needs the Accessibility grant for the notifier (System Settings → Privacy &
+  Security → Accessibility → Inbox Notifier); until it is granted the click still copies
+  the code. The iPhone app ports the same rules as an AutoFill extension (see `ios/`).
 
 ## Not yet built
 - Snooze-by-location (geofencing isn't feasible from a local web app; Inbox itself
