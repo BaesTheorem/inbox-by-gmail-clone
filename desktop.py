@@ -134,20 +134,20 @@ def _server_up():
 
 
 def main():
-    # Singleton: if a server is already serving, don't start a second one.
-    if _server_up():
-        print("Inbox is already running.")
-        return
-    inbox.start_background()  # scheduler + auth (opens browser once on first run) + history poller
-    threading.Thread(
-        target=lambda: inbox.app.run(host="127.0.0.1", port=inbox.PORT,
-                                     debug=False, threaded=True, use_reloader=False),
-        daemon=True,
-    ).start()
-    for _ in range(160):  # wait up to ~40s for the server to come up
-        if _server_up():
-            break
-        time.sleep(0.25)
+    # If a server is already serving (the com.exobrain.inbox-server launchd agent,
+    # which keeps the browser bookmark alive), attach the window to it instead of
+    # starting a second scheduler.
+    if not _server_up():
+        inbox.start_background()  # scheduler + auth (opens browser once on first run) + history poller
+        threading.Thread(
+            target=lambda: inbox.app.run(host="127.0.0.1", port=inbox.PORT,
+                                         debug=False, threaded=True, use_reloader=False),
+            daemon=True,
+        ).start()
+        for _ in range(160):  # wait up to ~40s for the server to come up
+            if _server_up():
+                break
+            time.sleep(0.25)
     _install_external_link_routing()
     webview.create_window("Inbox", URL, js_api=Api(),
                           width=1180, height=820, min_size=(820, 600))

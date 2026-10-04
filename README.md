@@ -69,8 +69,10 @@ uv pip install --python .venv/bin/python flask google-auth google-auth-oauthlib 
 - **Native desktop app (default):** double-click `/Applications/Inbox.app` → native macOS
   **WKWebView** window (system WebKit, no Chromium). Starts the server in-process; quitting
   the window stops everything. Singleton: a second launch no-ops if one is running.
-- **Browser fallback:** `cd ~/Documents/inbox-clone && uv run --script app.py`, then open
-  `http://127.0.0.1:5008` in any browser.
+- **Browser:** `cd ~/Documents/inbox-by-gmail-clone && uv run --script app.py`, then open
+  `http://127.0.0.1:5008` in any browser. To keep that URL live as a bookmark, run the same
+  command from a launchd agent with `KeepAlive`. Inbox.app then attaches its window to that
+  server and does not start a second one.
 
 ## Deep links with the native window
 `inboxclone://` is owned by a hidden helper, **`~/Library/Application Support/Inbox/Inbox
