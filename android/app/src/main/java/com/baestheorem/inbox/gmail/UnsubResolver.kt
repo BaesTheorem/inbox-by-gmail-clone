@@ -114,6 +114,13 @@ object UnsubResolver {
                 // promises. Trust the wording only once we have submitted something, or
                 // when there is no form left to submit.
                 if (doneRx.containsMatchIn(text) && (submitted || form == null)) {
+                    if (!submitted && optOutRunsInScript(f.page)) {
+                        // Static wording; the request in the script is the opt-out, and
+                        // it never ran here. Leave it to the WebView rung.
+                        steps += "scripted"
+                        error = "opt-out runs in the page's script"
+                        break
+                    }
                     steps += "confirmed"
                     return UnsubResolution(true, true, steps, finalUrl, null)
                 }
@@ -175,6 +182,21 @@ object UnsubResolver {
     /** True when the page's own wording says the opt-out went through. */
     fun saysDone(html: String): Boolean = doneRx.containsMatchIn(visibleText(html))
 
+    // A page whose opt-out happens in a script: the HTML already says "you are
+    // unsubscribed" before anything ran, and an XMLHttpRequest or fetch in an inline
+    // script does the actual work (9Fold FullRail, which HungerRush restaurants use, is
+    // one). Read as raw HTML, that page reports success while the address stays on the
+    // list, so its wording only counts once a real engine has run the script.
+    private val scriptBlockRx = Regex("""<script\b[^>]*>(.*?)</script>""", IS)
+    private val scriptRequestRx = Regex("""XMLHttpRequest|\bfetch\s*\(|sendBeacon""")
+    private val scriptSendRx = Regex("""['"]POST['"]|\.send\s*\(|sendBeacon""", I)
+
+    /** True when an inline script on the page issues its own request. */
+    fun optOutRunsInScript(html: String): Boolean = scriptBlockRx.findAll(html).any { m ->
+        val body = m.groupValues[1]
+        scriptRequestRx.containsMatchIn(body) && scriptSendRx.containsMatchIn(body)
+    }
+
     // MARK: HTTP
 
     private class Fetched(val page: String, val status: Int, val url: HttpUrl)
@@ -211,7 +233,7 @@ object UnsubResolver {
         var verb = method
         var body = payload
         for (hop in 0 until maxHops) {
-            if (!isSafePublicUrl(url)) throw IOException("unsafe target: ${url.host}")
+            if (!isSafePublicUrl(url, allowHttp = verb == "GET")) throw IOException("unsafe target: ${url.host}")
             val builder = Request.Builder().url(url)
                 .header("User-Agent", BROWSER_UA)
                 .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
@@ -247,8 +269,17 @@ object UnsubResolver {
         throw IOException("too many redirects")
     }
 
-    private fun isSafePublicUrl(url: HttpUrl): Boolean =
-        url.scheme.lowercase() == "https" && hostResolvesPublicOnly(url.host)
+    /**
+     * SSRF guard: every address the host resolves to must be public, and the scheme https
+     * unless allowHttp is set. Plain http is admitted for GETs that follow a sender's click
+     * tracker (HungerRush, SendGrid and friends still mail http:// links; the first hop is
+     * theirs to upgrade). POSTs stay https-only, as RFC 8058 requires.
+     */
+    private fun isSafePublicUrl(url: HttpUrl, allowHttp: Boolean = false): Boolean {
+        val scheme = url.scheme.lowercase()
+        if (scheme != "https" && !(allowHttp && scheme == "http")) return false
+        return hostResolvesPublicOnly(url.host)
+    }
 
     // MARK: Form model
 
@@ -435,7 +466,7 @@ object UnsubResolver {
             if (text.isEmpty() || !confirmRx.containsMatchIn(text)) continue
             val href = decodeEntities(m.groupValues[2]).trim()
             val u = base.resolve(href) ?: continue
-            if (u.scheme.lowercase() == "https") return u
+            if (u.scheme.lowercase() in setOf("https", "http")) return u
         }
         return null
     }
@@ -444,7 +475,7 @@ object UnsubResolver {
     fun findClientRedirect(html: String, base: HttpUrl): HttpUrl? {
         val m = metaRefreshRx.find(html) ?: jsRedirectRx.find(html) ?: return null
         val u = base.resolve(decodeEntities(m.groupValues[1].trim())) ?: return null
-        return if (u.scheme.lowercase() == "https") u else null
+        return if (u.scheme.lowercase() in setOf("https", "http")) u else null
     }
 
     fun visibleText(html: String): String = stripTags(scriptRx.replace(html, " "))

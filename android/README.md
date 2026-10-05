@@ -101,9 +101,13 @@ Press **Publish app** on the console's Audience page and it stops happening.
   loads the page again in an offscreen WebView for opt-outs that only exist once
   the page's scripts have run; then the mailto route sent from your account. The
   browser opens only when all five have failed. Every hop and every subresource
-  goes through the same resolve-to-public-only SSRF guard as the Mac, login
-  forms are never submitted, and a page reading "sorry to see you go" above a
-  confirm button is not mistaken for success. `UnsubResolverTest` runs the same
+  goes through the same resolve-to-public-only SSRF guard as the Mac (plain
+  `http://` click trackers are followed on GET, POSTs stay https-only, which is
+  why the manifest allows cleartext traffic), login forms are never submitted, a
+  page reading "sorry to see you go" above a confirm button is not mistaken for
+  success, and a page whose "you are unsubscribed" wording is static while a
+  script does the real opt-out (FullRail, used by HungerRush) goes to the
+  WebView rung instead of being believed. `UnsubResolverTest` runs the same
   fixtures the Mac and iOS ports are checked against.
 - New-mail banners from a 15-minute WorkManager poll (Android's floor for
   periodic work), toggleable in Settings

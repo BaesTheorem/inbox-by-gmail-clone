@@ -73,7 +73,7 @@ object UnsubWebDriver {
                         val u = request.url
                         val scheme = u.scheme?.lowercase()
                         if (scheme == "about" || scheme == "data") return null
-                        if (scheme != "https") return blocked
+                        if (scheme != "https" && scheme != "http") return blocked
                         val host = u.host ?: return blocked
                         val ok = synchronized(hostOk) {
                             hostOk.getOrPut(host) { hostResolvesPublicOnly(host) }
@@ -92,6 +92,9 @@ object UnsubWebDriver {
                         break
                     }
                     if (verdict == "done") {
+                        // Static wording with the opt-out in a script that fired on load:
+                        // give its request time to land before the view is torn down.
+                        if (!submitted) delay(AFTER_CLICK_MS)
                         steps += "js:confirmed"
                         confirmed = true
                         break

@@ -126,6 +126,37 @@ class UnsubResolverTest {
         assertNull(UnsubResolver.findClientRedirect(html, base))
     }
 
+    private val scriptedDone = """
+        <html><body><p><b>Unsubscribe successful.</b></p>
+        <p>Your email {emailAddress} has been successfully unsubscribed from this notification.</p>
+        </body><script>
+          var http = new XMLHttpRequest();
+          http.open('POST', 'https://api.example.com/api/unsubscribe/task-unsubscribe', true);
+          http.send(JSON.stringify({customerId: '1', taskId: '2'}));
+        </script></html>
+    """.trimIndent()
+
+    /** FullRail-style: the done wording is static, the XHR in the script is the opt-out. */
+    @Test fun doesNotBelieveADonePageWhoseScriptDoesTheWork() {
+        assertTrue(UnsubResolver.saysDone(scriptedDone))
+        assertTrue(UnsubResolver.optOutRunsInScript(scriptedDone))
+        assertFalse(
+            UnsubResolver.optOutRunsInScript(
+                "<html><body>You have been unsubscribed.<script>dataLayer.push({event: 'unsub'})</script></body></html>"
+            )
+        )
+        assertFalse(UnsubResolver.optOutRunsInScript("<script>fetch('/pixel.gif')</script>"))
+    }
+
+    /** Click trackers still mail plain http links; the first hop is theirs to upgrade. */
+    @Test fun followsAPlainHttpConfirmLink() {
+        val html = """<html><body><a href="http://tracker.example.com/ls/click?upn=x">Yes, unsubscribe me</a></body></html>"""
+        assertEquals(
+            "http://tracker.example.com/ls/click?upn=x",
+            UnsubResolver.findConfirmLink(html, base).toString(),
+        )
+    }
+
     @Test fun handlesGetForms() {
         val html = """
             <html><body><form action="/get-done" method="get">
