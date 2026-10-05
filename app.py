@@ -322,15 +322,20 @@ def gmail_permalink(thread_id):
     return f"https://mail.google.com/mail/u/0/#all/{thread_id}"
 
 
-def _is_safe_public_url(url):
-    """SSRF guard for sender-supplied URLs (one-click unsubscribe). Requires https
-    and a hostname that resolves only to public, non-loopback addresses."""
+def _is_safe_public_url(url, allow_http=False):
+    """SSRF guard for sender-supplied URLs. Requires a hostname that resolves only to
+    public, non-loopback addresses, and https unless allow_http is set. Plain http is
+    admitted for GETs that follow a sender's click tracker (HungerRush, SendGrid and
+    friends still mail http:// links; the first hop is theirs to upgrade). POSTs stay
+    https-only, as RFC 8058 requires."""
     try:
         p = urlparse(url)
-        if p.scheme != "https" or not p.hostname:
+        schemes = ("https", "http") if allow_http else ("https",)
+        if p.scheme not in schemes or not p.hostname:
             return False
+        port = p.port or (80 if p.scheme == "http" else 443)
         # Resolve every A/AAAA record and reject if any is private/loopback/link-local.
-        infos = socket.getaddrinfo(p.hostname, p.port or 443, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(p.hostname, port, proto=socket.IPPROTO_TCP)
         for *_, sockaddr in infos:
             ip = ipaddress.ip_address(sockaddr[0])
             if (ip.is_private or ip.is_loopback or ip.is_link_local
@@ -588,6 +593,25 @@ def _visible_text(html):
     return _htmlmod.unescape(re.sub(r"<[^>]+>", " ", s))
 
 
+# A page whose opt-out happens in a script: the HTML already says "you are
+# unsubscribed" before anything ran, and an XMLHttpRequest or fetch in an inline
+# script does the actual work (9Fold FullRail, which HungerRush restaurants use, is
+# one). Read over plain HTTP, that page reports success while the address stays on
+# the list, so its wording only counts once a real engine has run the script.
+_SCRIPT_BLOCK_RE = re.compile(r"(?is)<script\b[^>]*>(.*?)</script>")
+_SCRIPT_REQUEST_RE = re.compile(r"XMLHttpRequest|\bfetch\s*\(|sendBeacon")
+_SCRIPT_SEND_RE = re.compile(r"(?i)['\"]POST['\"]|\.send\s*\(|sendBeacon")
+
+
+def _opt_out_runs_in_script(html):
+    """True when an inline script on the page issues its own request."""
+    for m in _SCRIPT_BLOCK_RE.finditer(html or ""):
+        body = m.group(1)
+        if _SCRIPT_REQUEST_RE.search(body) and _SCRIPT_SEND_RE.search(body):
+            return True
+    return False
+
+
 def _scrape_forms(html):
     p = _FormScraper()
     try:
@@ -700,7 +724,7 @@ def _safe_fetch(session, method, url, data=None, max_hops=8):
     """Like session.request(follow_redirects) but SSRF-checks every hop, since each
     Location comes from the sender. Returns (response, final_url)."""
     for _ in range(max_hops):
-        if not _is_safe_public_url(url):
+        if not _is_safe_public_url(url, allow_http=(method == "GET")):
             raise RuntimeError(f"unsafe redirect target: {urlparse(url).hostname}")
         r = session.request(method, url, data=data, timeout=12, allow_redirects=False)
         if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
@@ -739,6 +763,12 @@ def resolve_unsubscribe_link(url, email=None, max_rounds=4):
             text = _visible_text(page)
             form = _pick_unsub_form(_scrape_forms(page), text)
             if _UNSUB_DONE_RE.search(text) and (submitted or form is None):
+                if not submitted and _opt_out_runs_in_script(page):
+                    # Static wording; the request in the script is the opt-out, and
+                    # it never ran here. Leave it to the WebKit rung.
+                    out["steps"].append("scripted")
+                    out["error"] = "opt-out runs in the page's script"
+                    break
                 out["steps"].append("confirmed")
                 out.update(ok=True, confirmed=True)
                 return out
@@ -2837,10 +2867,10 @@ def api_unsubscribe():
                 return jsonify({"ok": True, "method": "one-click", "confirmed": True, "steps": steps})
 
         # 4. Nothing in the raw HTML, so the opt-out may only exist once the page's
-        #    scripts have run. Drive a real WebKit engine at it. Only possible inside
-        #    the desktop shell, which has an AppKit run loop; bare `python app.py`
-        #    skips this rung.
-        if url and _is_safe_public_url(url):
+        #    scripts have run. Drive a real WebKit engine at it: in-process when the
+        #    desktop shell's AppKit loop is running, otherwise in a helper process
+        #    that brings its own.
+        if url and _is_safe_public_url(url, allow_http=True):
             try:
                 import unsub_webdriver
                 if unsub_webdriver.available():

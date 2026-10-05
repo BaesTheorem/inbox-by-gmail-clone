@@ -11,13 +11,21 @@ option, type the address into the "which address?" box, press the confirm contro
 read the result. Same driver script as the iOS and Android apps, so all three behave the
 same on the same page.
 
-Only usable inside the desktop shell, which runs an AppKit main loop (desktop.py ->
-pywebview). Bare `python app.py` has no run loop, so available() returns False and the
-ladder falls through to the mailto route and then the browser, exactly as before.
+WebKit needs an AppKit main loop to service its main queue. Inside the desktop shell
+(desktop.py -> pywebview) that loop is already running and the page is driven
+in-process. Anywhere else (the launchd server, bare `python app.py`) drive() runs this
+file as a helper process, `python unsub_webdriver.py --drive URL EMAIL`, which starts
+its own loop with no Dock icon and prints the result as one JSON line. available() is
+False only when no interpreter on hand can import WebKit.
 """
 import ipaddress
+import json
 import logging
+import os
+import shutil
 import socket
+import subprocess
+import sys
 import threading
 from urllib.parse import urlparse
 
@@ -113,9 +121,8 @@ def _host_ok(host, port):
     return ok
 
 
-def available():
-    """True when a WebKit engine can actually be driven from here: pyobjc present and an
-    AppKit main loop running to service the main queue."""
+def _loop_running():
+    """pyobjc present here and an AppKit main loop running to service the main queue."""
     try:
         import WebKit  # noqa: F401
         from AppKit import NSApplication
@@ -127,13 +134,102 @@ def available():
         return False
 
 
+_UNSET = object()
+_helper_cmd = _UNSET
+
+
+def _helper():
+    """Command that runs this file as a helper process with its own run loop, or None.
+    Prefers an interpreter that already imports WebKit (this one, then the repo's
+    .venv, which the desktop shell uses); falls back to `uv run --script`, which
+    installs the pyobjc frameworks from the header on first use. Memoized."""
+    global _helper_cmd
+    if _helper_cmd is not _UNSET:
+        return _helper_cmd
+    here = os.path.dirname(os.path.abspath(__file__))
+    me = os.path.abspath(__file__)
+    _helper_cmd = None
+    for py in (sys.executable, os.path.join(here, ".venv", "bin", "python")):
+        if not (py and os.path.exists(py)):
+            continue
+        try:
+            r = subprocess.run([py, "-c", "import WebKit, AppKit"],
+                               capture_output=True, timeout=30)
+        except Exception:
+            continue
+        if r.returncode == 0:
+            _helper_cmd = [py, me]
+            return _helper_cmd
+    uv = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv")
+    if os.path.exists(uv):
+        _helper_cmd = [uv, "run", "--script", me]
+    return _helper_cmd
+
+
+def available():
+    """True when a WebKit engine can be driven from here, in-process or in a helper."""
+    return _loop_running() or _helper() is not None
+
+
 def drive(url, email=None):
     """Load url in an offscreen WKWebView and press through the opt-out.
 
     Returns {ok, confirmed, steps, error}. Never raises: every failure degrades to
     ok=False so the caller can move to the next rung."""
+    if _loop_running():
+        return _drive_here(url, email)
+    return _drive_in_helper(url, email)
+
+
+def _drive_in_helper(url, email):
     out = {"ok": False, "confirmed": False, "steps": [], "error": None}
-    if not available():
+    cmd = _helper()
+    if not cmd:
+        out["error"] = "no interpreter with WebKit"
+        return out
+    try:
+        r = subprocess.run(cmd + ["--drive", url, email or ""], capture_output=True,
+                           text=True, timeout=_TOTAL_BUDGET + 30)
+    except subprocess.TimeoutExpired:
+        out["error"] = "helper timed out"
+        return out
+    lines = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
+    try:
+        res = json.loads(lines[-1])
+        assert isinstance(res, dict) and "steps" in res
+        return res
+    except Exception:
+        out["error"] = f"helper failed: {(r.stderr or '').strip()[-300:] or 'no output'}"
+        return out
+
+
+def _helper_main(url, email):
+    """Entry point of the helper process: bring up an AppKit loop that shows nothing,
+    drive the page on a worker thread, print the result, exit."""
+    from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)  # no Dock icon, no focus
+
+    def work():
+        for _ in range(200):
+            if app.isRunning():
+                break
+            _sleep(0.05)
+        try:
+            res = _drive_here(url, email)
+        except Exception as e:
+            res = {"ok": False, "confirmed": False, "steps": [], "error": str(e)}
+        sys.stdout.write(json.dumps(res) + "\n")
+        sys.stdout.flush()
+        os._exit(0)
+
+    threading.Thread(target=work, daemon=True).start()
+    app.run()
+
+
+def _drive_here(url, email=None):
+    out = {"ok": False, "confirmed": False, "steps": [], "error": None}
+    if not _loop_running():
         out["error"] = "no AppKit run loop"
         return out
     try:
@@ -173,13 +269,13 @@ def drive(url, email=None):
 
         def webView_decidePolicyForNavigationAction_decisionHandler_(self, webview, action, handler):
             # Every hop is the sender's to choose, so re-check it the same way the
-            # HTTP resolver does: https only, resolving to public addresses only.
+            # HTTP resolver does: http(s) only, resolving to public addresses only.
             try:
                 u = str(action.request().URL().absoluteString() or "")
                 p = urlparse(u)
                 # about: covers the blank document a fresh web view starts on.
                 ok = (p.scheme == "about"
-                      or (p.scheme == "https" and bool(p.hostname)
+                      or (p.scheme in ("https", "http") and bool(p.hostname)
                           and _host_ok(p.hostname, p.port)))
             except Exception:
                 ok = False
@@ -223,6 +319,10 @@ def drive(url, email=None):
                 out["error"] = out["error"] or "script failed"
                 break
             if verdict == "done":
+                if not submitted:
+                    # Static wording with the opt-out in a script that fired on load:
+                    # give its request time to land before the view is torn down.
+                    _sleep(_AFTER_CLICK)
                 out["steps"].append("js:confirmed")
                 out.update(ok=True, confirmed=True)
                 break
@@ -286,3 +386,15 @@ def _eval(on_main, state, script, deadline):
     if not state["jsdone"].wait(timeout=10) or deadline.is_set():
         return None
     return state["js"]
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Drive an unsubscribe page in a WebKit engine.")
+    ap.add_argument("--drive", nargs=2, metavar=("URL", "EMAIL"),
+                    help="load URL, press through the opt-out, print one JSON line")
+    args = ap.parse_args()
+    if args.drive:
+        _helper_main(args.drive[0], args.drive[1] or None)
+    else:
+        ap.print_help()

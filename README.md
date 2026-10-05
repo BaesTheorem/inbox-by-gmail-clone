@@ -115,12 +115,15 @@ External links *inside emails* are routed to the default browser via pywebview's
   response says in words that you are off the list; (4) **the page again in a real
   WebKit engine**, offscreen, for opt-outs that only exist once the page's scripts have
   run: it ticks the opt-out control, types your address, presses the confirm button and
-  reads the result (needs the desktop shell's AppKit loop, so bare `python app.py` skips
-  this rung); (5) the `mailto:` route, sent from your account; (6) the browser, and only
-  once all of that has failed. Every hop is
-  SSRF-checked (https + publicly-resolving host), login forms are never submitted, and a
-  page that says "we're sorry to see you go" above a confirm button is not mistaken for
-  success. Confirmation prompt guards accidental clicks.
+  reads the result (in-process under the desktop shell's AppKit loop, otherwise in a
+  helper process that starts its own, so the launchd server gets this rung too); (5) the
+  `mailto:` route, sent from your account; (6) the browser, and only once all of that
+  has failed. Every hop is SSRF-checked (publicly-resolving host; plain `http://` click
+  trackers are followed on GET, POSTs stay https-only), login forms are never submitted,
+  a page that says "we're sorry to see you go" above a confirm button is not mistaken
+  for success, and a page whose "you are unsubscribed" wording is static while a script
+  does the real opt-out (FullRail, used by HungerRush) is handed to the WebKit rung
+  instead of being believed. Confirmation prompt guards accidental clicks.
 - **Report spam**: card action, reader action, bulk-bar action, and Gmail's own `!` key.
   Undo ("not spam") is on the snackbar, and it both restores `INBOX` and clears `SPAM` so
   Gmail stops re-filing the thread.
