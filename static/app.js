@@ -160,6 +160,8 @@ function cardEl(row) {
     ${actionsHtml}`;
   el.addEventListener("click", (e) => {
     if (e.target.closest(".actions") || e.target.closest(".unsub-link") || e.target.closest(".select") || e.target.closest(".att-chip") || e.target.closest(".doc-chip") || e.target.closest(".alias-chip")) return;
+    // Shift+click anywhere on a card extends the selection instead of opening it.
+    if (e.shiftKey) { toggleSelect(row.id, el, true); return; }
     openThread(row.id);
   });
   // Doc/Drive links fetched lazily for this row (see enrichDocLinks) — render if cached.
@@ -167,7 +169,9 @@ function cardEl(row) {
   el.querySelectorAll(".att-chip").forEach((c) => {
     c.onclick = (e) => { e.stopPropagation(); openAttachment({ ...row.attachments[+c.dataset.ai], threadId: row.id }); };
   });
-  el.querySelector(".select").onclick = (e) => { e.stopPropagation(); toggleSelect(row.id, el); };
+  el.querySelector(".select").onclick = (e) => { e.stopPropagation(); toggleSelect(row.id, el, e.shiftKey); };
+  // Shift+mousedown would otherwise drag a text selection across the cards in the range.
+  el.addEventListener("mousedown", (e) => { if (e.shiftKey) e.preventDefault(); });
   // Guarded: the Done view renders a different action set (no pin/snooze/label/done).
   const wire = (sel, fn) => { const b = el.querySelector(sel); if (b) b.onclick = fn; };
   wire(".act-done", (e) => { e.stopPropagation(); doDone(row); });
@@ -511,16 +515,35 @@ async function doPin(row) {
   }, () => post("/api/pin", { threadId: row.id, pinned: willPin }));
 }
 // ---------- Multi-select ----------
-function toggleSelect(id, cardEl) {
-  if (STATE.selected.has(id)) STATE.selected.delete(id);
-  else STATE.selected.add(id);
-  const on = STATE.selected.has(id);
-  cardEl.classList.toggle("selected", on);
-  const icon = cardEl.querySelector(".select .check .material-icons");
-  if (icon) icon.textContent = on ? "check_circle" : "radio_button_unchecked";
+// selectAnchor is the last card toggled without Shift. A Shift toggle applies the
+// clicked card's new state to every card between it and the anchor, in on-screen
+// order (collapsed bundles have no cards in the DOM, so they are skipped, as in Gmail).
+let selectAnchor = null;
+function paintSelected(id, on) {
+  const sel = window.CSS && CSS.escape ? CSS.escape(id) : id;
+  document.querySelectorAll(`#list .card[data-tid="${sel}"]`).forEach((c) => {
+    c.classList.toggle("selected", on);
+    const icon = c.querySelector(".select .check .material-icons");
+    if (icon) icon.textContent = on ? "check_circle" : "radio_button_unchecked";
+  });
+}
+function toggleSelect(id, cardEl, range = false) {
+  const on = !STATE.selected.has(id);
+  const cards = [...document.querySelectorAll("#list .card[data-tid]")];
+  const a = range && selectAnchor ? cards.findIndex((c) => c.dataset.tid === selectAnchor) : -1;
+  const b = cards.indexOf(cardEl);
+  const ids = a >= 0 && b >= 0
+    ? cards.slice(Math.min(a, b), Math.max(a, b) + 1).map((c) => c.dataset.tid)
+    : [id];
+  for (const t of new Set(ids)) {
+    if (on) STATE.selected.add(t); else STATE.selected.delete(t);
+    paintSelected(t, on);
+  }
+  if (!range || a < 0) selectAnchor = id;
   updateSelectionBar();
 }
 function clearSelection() {
+  selectAnchor = null;
   STATE.selected.clear();
   document.querySelectorAll(".card.selected").forEach((c) => {
     c.classList.remove("selected");
@@ -776,6 +799,7 @@ document.addEventListener("click", (e) => {
 function enableSwipe(el, row) {
   let startX = 0, dx = 0, dragging = false;
   el.addEventListener("pointerdown", (e) => {
+    if (e.shiftKey) return; // Shift+click is range select, not the start of a swipe
     if (e.target.closest(".actions") || e.target.closest(".unsub-link") || e.target.closest(".select") || e.target.closest(".att-chip")) return;
     startX = e.clientX; dragging = true; el.classList.add("swiping"); el.setPointerCapture(e.pointerId);
   });
