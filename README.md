@@ -166,9 +166,15 @@ External links *inside emails* are routed to the default browser via pywebview's
   must sit next to those words. Meeting passcodes, receipts, card last-fours, phone
   numbers, promo codes and FAQ mentions of "your verification code" are excluded by
   their surroundings. Toggle in Settings → "Banner for emailed verification codes".
-  Typing needs the Accessibility grant for the notifier (System Settings → Privacy &
-  Security → Accessibility → Inbox Notifier); until it is granted the click still copies
-  the code. The iPhone app ports the same rules as an AutoFill extension (see `ios/`).
+  The click needs a notifier on `UNUserNotificationCenter`: on macOS 26 a click on a
+  terminal-notifier banner never runs its `-execute` command. When
+  `/Applications/MIST Notifier.app` (from
+  [exobrain-harness](https://github.com/BaesTheorem/exobrain-harness), `mist-notifier/`)
+  is installed, code banners go through it; set `INBOX_UN_NOTIFIER` to use another app
+  with the same JSON-spec and `cmd:` click contract. Without one, the banner falls back
+  to terminal-notifier and the click can do nothing. Typing needs the Accessibility
+  grant for the notifier app that runs the click (System Settings → Privacy & Security
+  → Accessibility); until it is granted the click still copies the code. The iPhone app ports the same rules as an AutoFill extension (see `ios/`).
 
 ## Not yet built
 - Snooze-by-location (geofencing isn't feasible from a local web app; Inbox itself

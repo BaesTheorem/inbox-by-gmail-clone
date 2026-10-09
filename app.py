@@ -37,6 +37,7 @@ import os
 import re
 import secrets
 import queue
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -1769,7 +1770,16 @@ def _notify_new_mail(message_ids):
 # The click runs otp-fill.sh, which copies the code and types it into the field
 # that has focus, so the flow matches the system's own SMS-code popup. Codes are
 # validated against [A-Z0-9]{4,8} before they touch a shell command.
+#
+# The click needs a notifier on UNUserNotificationCenter. terminal-notifier's
+# -execute rides the legacy NSUserNotification API, and on macOS 26 a click on
+# its banner never runs the command. So when a UN notifier app that takes a JSON
+# spec with a "cmd:<shell>" click link is installed (MIST Notifier from the
+# exobrain-harness repo, or any app at INBOX_UN_NOTIFIER with the same contract),
+# code banners go through it, and terminal-notifier is the fallback.
 _OTP_FILL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "otp-fill.sh")
+_UN_NOTIFIER = os.environ.get("INBOX_UN_NOTIFIER", "/Applications/MIST Notifier.app")
+_OTP_SPEC_DIR = os.path.expanduser("~/Library/Caches/inbox-otp")
 _OTP_FIELDS = ("id,threadId,internalDate,labelIds,payload(mimeType,headers,body/data,"
                "parts(mimeType,body/data,parts(mimeType,body/data,parts(mimeType,body/data))))")
 _otp_seen = set()
@@ -1810,9 +1820,52 @@ def _otp_scan(message_ids):
             _otp_seen.discard(old)
 
 
+def _notify_otp_un(code, service, thread_id=None):
+    """Post the code banner through the UN notifier app. True when it reported
+    delivery; False sends the caller to the terminal-notifier fallback."""
+    if not os.path.isdir(_UN_NOTIFIER):
+        return False
+    os.makedirs(_OTP_SPEC_DIR, exist_ok=True)
+    spec_path = os.path.join(_OTP_SPEC_DIR, f"{code}-{int(time.time() * 1000)}.json")
+    spec = {"title": f"Code {code} from {service}",
+            "body": "Click to type it into the active field (also copied)",
+            "link": f"cmd:{shlex.quote(_OTP_FILL)} {code}",
+            "id": f"otp-{code}", "group": "inbox-otp"}
+    if _get_setting("notification_sound", True):
+        spec["sound"] = "default"
+    try:
+        with open(spec_path, "w") as f:
+            json.dump(spec, f)
+        subprocess.run(["/usr/bin/open", "-n", "-a", _UN_NOTIFIER, "--args", "post", spec_path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        result = spec_path + ".result"
+        for _ in range(30):   # the app writes {"ok": ...} next to the spec, then exits
+            if os.path.exists(result):
+                break
+            time.sleep(0.2)
+        with open(result) as f:
+            ok = json.load(f).get("ok") is True
+    except Exception:
+        log.exception("otp banner via %s failed", _UN_NOTIFIER)
+        ok = False
+    finally:
+        for p in (spec_path, spec_path + ".result"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    if ok:
+        log.info("otp banner: %s from %s (thread %s, UN notifier)", code, service, thread_id)
+    return ok
+
+
 def _notify_otp(code, service, thread_id=None):
     """Banner: title carries the code and sender; the click types it."""
     if not re.fullmatch(r"[A-Z0-9]{4,8}", code):
+        return
+    if _notify_otp_un(code, service, thread_id):
+        return
+    if not _NOTIFIER:
         return
     cmd = [_NOTIFIER, "-title", f"Code {code} from {service}",
            "-message", "Click to type it into the active field (also copied)",
