@@ -151,7 +151,8 @@ def main():
     _install_external_link_routing()
     webview.create_window("Inbox", URL, js_api=Api(),
                           width=1180, height=820, min_size=(820, 600))
-    webview.start()  # blocks on the native GUI loop until the window closes
+    # pywebview's default private mode clears the page's localStorage and cookies at every launch
+    webview.start(private_mode=False)  # blocks on the native GUI loop until the window closes
 
 
 if __name__ == "__main__":
