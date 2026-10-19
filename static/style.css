@@ -231,6 +231,22 @@ body.scroll-locked{position:fixed;left:0;right:0;width:100%;overflow:hidden}
 .msg .mfrom{color:var(--text-primary);font-weight:500}
 .msg .mrcpt{color:var(--text-secondary);font-size:12px;margin:-4px 0 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .msg.collapsed .mrcpt{display:none}
+.msg .mwho{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:12px}
+.msg .maddr{color:var(--text-secondary);font-size:12px;margin-left:6px}
+.msg .mrcpt{display:flex;align-items:center}
+.msg .mrcpt-text{overflow:hidden;text-overflow:ellipsis}
+.mdetails-toggle{border:0;background:none;padding:0;margin-left:2px;cursor:pointer;color:var(--text-secondary);display:inline-flex;border-radius:4px}
+.mdetails-toggle:hover{background:#F1F3F4}
+.mdetails-toggle .material-icons{font-size:20px;transition:transform .15s}
+.mdetails-toggle.open .material-icons{transform:rotate(180deg)}
+.msg .mdetails{border:1px solid var(--divider);border-radius:8px;padding:10px 14px;margin:0 0 12px;font-size:12px;color:var(--text-primary);white-space:normal}
+.msg .mdetails[hidden],.msg.collapsed .mdetails{display:none}
+.msg .mdetails table{border-collapse:collapse}
+.msg .mdetails th{color:var(--text-secondary);font-weight:400;text-align:right;padding:2px 10px 2px 0;vertical-align:top;white-space:nowrap}
+.msg .mdetails td{padding:2px 0;word-break:break-word}
+.msg .mdetails td .material-icons{font-size:14px;vertical-align:-2px;margin-right:4px;color:var(--text-secondary)}
+.msg .show-original{display:inline-flex;align-items:center;gap:4px;margin-top:8px;color:#3367D6;text-decoration:none;font-size:12px}
+.msg .show-original .material-icons{font-size:16px}
 .msg .mbody{font-size:14px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}
 .msg .mbody iframe{width:100%;border:0}
 /* Gmail-style toggle for the trimmed quote history. */

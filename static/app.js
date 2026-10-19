@@ -866,6 +866,18 @@ function sizeFrame(f, doc) {
   withReaderAnchor(() => { f.style.height = h + "px"; f.style.minHeight = "0"; });
 }
 
+// Gmail's "show details" rows, in Gmail's order and wording. The server leaves out
+// rows that don't apply (no Reply-To, our own sent copies have no mailed-by).
+const DETAIL_ROWS = [["from", "from"], ["replyTo", "reply-to"], ["to", "to"], ["cc", "cc"], ["bcc", "bcc"],
+  ["date", "date"], ["subject", "subject"], ["mailedBy", "mailed-by"], ["signedBy", "signed-by"], ["security", "security"]];
+function detailsTable(m) {
+  const det = m.details || {};
+  const rows = DETAIL_ROWS.filter(([k]) => det[k])
+    .map(([k, label]) => `<tr><th>${label}:</th><td>${k === "security" ? '<i class="material-icons">lock</i>' : ""}${esc(det[k])}</td></tr>`)
+    .join("");
+  return `<table>${rows}</table><a href="#" class="show-original"><i class="material-icons">code</i>Show original</a>`;
+}
+
 function renderMsgBody(mb, m, forceImages, showQuoted) {
   if (mb.dataset.rendered && !forceImages && !showQuoted) return;
   mb.dataset.rendered = "1";
@@ -1044,10 +1056,19 @@ async function openThread(tid) {
       .filter(([, v]) => v)
       .map(([k, v]) => `${k} ${(v.match(/(?:"[^"]*"|[^,])+/g) || []).map(addrName).filter(Boolean).join(", ")}`)
       .join(", ");
-    d.innerHTML = `<div class="mhead"><span class="mfrom">${esc(m.sender)}</span><span>${esc(m.date)}</span></div>
-      ${rcpt ? `<div class="mrcpt" title="${esc([m.to && "to " + m.to, m.cc && "cc " + m.cc, m.bcc && "bcc " + m.bcc].filter(Boolean).join(", "))}">${esc(rcpt)}</div>` : ""}
-      <div class="mpreview">${esc((m.text || "").replace(/\s+/g, " ").trim().slice(0, 120))}</div>
-      <div class="mbody"></div>`;
+    const fromAddr = m.senderEmail && m.senderEmail !== m.sender ? `<span class="maddr">&lt;${esc(m.senderEmail)}&gt;</span>` : "";
+    d.innerHTML = `<div class="mhead"><span class="mwho"><span class="mfrom">${esc(m.sender)}</span>${fromAddr}</span><span>${esc(m.date)}</span></div>
+      <div class="mrcpt"><span class="mrcpt-text">${esc(rcpt || "details")}</span><button class="mdetails-toggle" title="Show details"><i class="material-icons">arrow_drop_down</i></button></div>
+      <div class="mdetails" hidden>${detailsTable(m)}</div>`;
+    d.querySelector(".mdetails-toggle").onclick = (e) => {
+      e.stopPropagation();
+      const box = d.querySelector(".mdetails");
+      box.hidden = !box.hidden;
+      e.currentTarget.classList.toggle("open", !box.hidden);
+    };
+    d.querySelector(".mdetails .show-original").onclick = (e) => { e.preventDefault(); e.stopPropagation(); openExternal(`${location.origin}/api/original/${m.id}`); };
+    d.insertAdjacentHTML("beforeend", `<div class="mpreview">${esc((m.text || "").replace(/\s+/g, " ").trim().slice(0, 120))}</div>
+      <div class="mbody"></div>`);
     const mb = d.querySelector(".mbody");
     // The whole collapsed message is the expand target (the header strip alone was
     // too small to hit, and the preview line below it looked clickable but wasn't).

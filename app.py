@@ -366,6 +366,70 @@ def _parse_addr(value):
     return (value or "").strip(), (value or "").strip()
 
 
+def _domain(addr):
+    return addr.rsplit("@", 1)[-1].strip(" <>").lower() if "@" in (addr or "") else ""
+
+
+def _fmt_full_date(date_str):
+    # Gmail's details popup: "Oct 19, 2026, 5:29 PM"
+    try:
+        dt = parsedate_to_datetime(date_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%b %-d, %Y, %-I:%M %p")
+    except Exception:
+        return date_str or ""
+
+
+def message_details(headers):
+    """The rows of Gmail's "show details" popup, from one message's headers.
+
+    mailed-by is the SPF envelope domain (smtp.mailfrom, else Return-Path). signed-by
+    is the passing DKIM domain, preferring the one aligned with From the way Gmail does.
+    security is TLS when Google's own Received hop says the message arrived encrypted.
+    Rows Gmail would leave out (empty headers, our own sent copies) are left out too."""
+    _, from_addr = _parse_addr(_header(headers, "From"))
+    from_dom = _domain(from_addr)
+    auth = " ".join(h.get("value", "") for h in headers
+                    if h.get("name", "").lower() == "authentication-results"
+                    and "mx.google.com" in h.get("value", ""))
+    mailed_by = ""
+    m = re.search(r"smtp\.mailfrom=([^\s;]+)", auth)
+    if m:
+        mailed_by = _domain(m.group(1)) or m.group(1).lower()
+    elif auth:
+        mailed_by = _domain(_header(headers, "Return-Path"))
+    signers = [d.lower() for d in re.findall(r"dkim=pass[^;]*?header\.(?:i|d)=@?([^\s;]+)", auth)]
+    signers = [s.rsplit("@", 1)[-1] for s in signers]
+    signed_by = ""
+    if signers:
+        signed_by = next((s for s in signers if s == from_dom), None) \
+            or next((s for s in signers if from_dom.endswith("." + s) or s.endswith("." + from_dom)), None) \
+            or signers[0]
+    security = ""
+    for h in headers:
+        if h.get("name", "").lower() != "received":
+            continue
+        v = h.get("value", "")
+        if "by mx.google.com" in v:
+            if re.search(r"version=TLS|Google Transport Security|\bE?SMTPS\b", v):
+                security = "Standard encryption (TLS)"
+            break
+    rows = {
+        "from": _header(headers, "From"),
+        "replyTo": _header(headers, "Reply-To"),
+        "to": _header(headers, "To"),
+        "cc": _header(headers, "Cc"),
+        "bcc": _header(headers, "Bcc"),
+        "date": _fmt_full_date(_header(headers, "Date")),
+        "subject": _header(headers, "Subject"),
+        "mailedBy": mailed_by,
+        "signedBy": signed_by,
+        "security": security,
+    }
+    return {k: v for k, v in rows.items() if v}
+
+
 def _fmt_time(date_str):
     try:
         dt = parsedate_to_datetime(date_str)
@@ -1311,6 +1375,7 @@ def fetch_thread(thread_id):
             "cc": _header(headers, "Cc"),   # needed for reply-all
             "bcc": _header(headers, "Bcc"),  # only present on the sender's sent copy
             "date": _fmt_time(_header(headers, "Date")),
+            "details": message_details(headers),  # Gmail's "show details" rows
             "text": text,
             "html": vis_html,            # new content only; quoted history split out below
             "quotedHtml": quoted_html,   # trimmed reply chain, revealed by the reader's toggle
@@ -2382,6 +2447,17 @@ def api_thread(thread_id):
         data = fetch_thread(thread_id)
         mark_read(thread_id)
         return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/original/<message_id>")
+def api_original(message_id):
+    """Gmail's "Show original": the full RFC 822 source, every header included."""
+    try:
+        raw = gget(f"/messages/{message_id}", format="raw").get("raw", "")
+        src = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "replace")
+        return Response(src, mimetype="text/plain; charset=utf-8")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
