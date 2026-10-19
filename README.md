@@ -127,6 +127,11 @@ External links *inside emails* are routed to the default browser via pywebview's
 - **Report spam**: card action, reader action, bulk-bar action, and Gmail's own `!` key.
   Undo ("not spam") is on the snackbar, and it both restores `INBOX` and clears `SPAM` so
   Gmail stops re-filing the thread.
+- **Sender details**: the reader shows the sender's address next to the name. The caret on
+  the recipients line opens Gmail's "show details" rows: from, reply-to, to, cc, bcc, date,
+  subject, mailed-by (SPF envelope domain), signed-by (DKIM domain aligned with From) and
+  security (TLS on Google's receiving hop). "Show original" opens the raw message from
+  `/api/original/<id>`.
 - **Block sender**: reader action (and a Settings field to block an address by hand). Creates
   the same object Gmail's own Block does, a `from:` filter whose action is Trash, so blocks
   made here show up in Gmail's Settings → Filters and unblocking in either place works.

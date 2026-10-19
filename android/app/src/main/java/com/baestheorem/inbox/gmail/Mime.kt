@@ -98,6 +98,7 @@ fun inlineCidMap(payload: GPayload?): Map<String, CidPart> {
 // from the Gmail attachment endpoint. https so WebView actually asks us.
 const val CID_HOST = "cid.inboxclone.invalid"
 const val ATTACH_HOST = "attach.inboxclone.invalid"
+const val ORIGINAL_HOST = "original.inboxclone.invalid"
 
 private val cidSrcRx = Regex(
     """(<img\b[^>]*?\bsrc\s*=\s*)(["']?)cid:([^"'\s>]+)\2""",

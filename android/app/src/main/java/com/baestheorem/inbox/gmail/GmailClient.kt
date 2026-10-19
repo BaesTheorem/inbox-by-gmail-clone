@@ -562,6 +562,19 @@ object GmailClient {
         return decodeBody(m.payload).html
     }
 
+    // Gmail's "Show original": the full RFC 822 source, every header included
+    suspend fun rawMessage(id: String): String {
+        val r = get(
+            "/messages/$id",
+            listOf("format" to "raw"),
+            tries = 3,
+            maxBackoff = 4.0,
+            serializer = GRawMessage.serializer(),
+        )
+        val bytes = r.raw?.let { base64UrlDecode(it) } ?: throw GmailException(0, "message had no raw source")
+        return String(bytes, Charsets.UTF_8)
+    }
+
     suspend fun attachmentData(messageId: String, attachmentId: String): ByteArray {
         val key = "$messageId/$attachmentId"
         cacheLock.withLock { attCache[key] }?.let { return it }

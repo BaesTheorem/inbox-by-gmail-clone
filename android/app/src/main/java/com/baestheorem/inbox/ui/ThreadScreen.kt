@@ -25,6 +25,10 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -43,13 +47,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
 import com.baestheorem.inbox.data.MailStore
 import com.baestheorem.inbox.gmail.ATTACH_HOST
+import com.baestheorem.inbox.gmail.ORIGINAL_HOST
 import com.baestheorem.inbox.gmail.CID_HOST
 import com.baestheorem.inbox.gmail.GmailClient
 import com.baestheorem.inbox.gmail.ThreadDetail
@@ -81,6 +89,7 @@ fun ThreadScreen(
     var sending by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     var confirmUnsub by remember { mutableStateOf(false) }
+    var originalId by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(threadId) {
         try {
@@ -173,7 +182,7 @@ fun ThreadScreen(
             Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator(color = Theme.blue) }
         } else {
             d.unsub?.let { u -> UnsubBanner(d, u) { confirmUnsub = true } }
-            Box(Modifier.weight(1f)) { ThreadWebView(store, d) }
+            Box(Modifier.weight(1f)) { ThreadWebView(store, d) { originalId = it } }
             ReplyBar(
                 store = store,
                 detail = d,
@@ -199,6 +208,8 @@ fun ThreadScreen(
             )
         }
     }
+
+    originalId?.let { OriginalDialog(store, it) { originalId = null } }
 
     if (confirmUnsub && detail?.unsub != null) {
         val d = detail!!
@@ -352,7 +363,7 @@ private fun ReplyBar(
  * links are intercepted and handed to whatever app opens that file type.
  */
 @Composable
-private fun ThreadWebView(store: MailStore, detail: ThreadDetail) {
+private fun ThreadWebView(store: MailStore, detail: ThreadDetail, onOriginal: (String) -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val loadedId = remember { mutableStateOf<String?>(null) }
@@ -390,6 +401,10 @@ private fun ThreadWebView(store: MailStore, detail: ThreadDetail) {
                         request: WebResourceRequest,
                     ): Boolean {
                         val url = request.url
+                        if (url.host == ORIGINAL_HOST) {
+                            url.pathSegments.firstOrNull()?.let(onOriginal)
+                            return true
+                        }
                         if (url.host == ATTACH_HOST) {
                             val parts = url.pathSegments
                             if (parts.size >= 2) {
@@ -461,4 +476,49 @@ private fun openAttachment(
             store.showSnack("Couldn't download attachment")
         }
     }
+}
+
+// Gmail's "Show original": the raw RFC 822 source, monospaced and selectable.
+// A message with big attachments is megabytes of base64, so the view stops at
+// the cap and Share carries the whole thing.
+@Composable
+private fun OriginalDialog(store: MailStore, messageId: String, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    var source by remember(messageId) { mutableStateOf<String?>(null) }
+    var failed by remember(messageId) { mutableStateOf(false) }
+    LaunchedEffect(messageId) {
+        try {
+            source = GmailClient.rawMessage(messageId)
+        } catch (e: IOException) {
+            failed = true
+        }
+    }
+    val cap = 120_000
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Original message", style = robotoStyle(17, FontWeight.Medium)) },
+        text = {
+            val src = source
+            when {
+                src != null -> SelectionContainer {
+                    Text(
+                        if (src.length > cap) src.take(cap) + "\n\n[… ${src.length - cap} more characters, use Share for the full source]" else src,
+                        style = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 11.sp),
+                        modifier = Modifier.verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState()),
+                    )
+                }
+                failed -> Text("Couldn't load the original message", color = Theme.textSecondary)
+                else -> CircularProgressIndicator(color = Theme.blue)
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done", color = Theme.blue) } },
+        dismissButton = {
+            source?.let { src ->
+                TextButton(onClick = {
+                    val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, src)
+                    context.startActivity(Intent.createChooser(send, "Share original"))
+                }) { Text("Share", color = Theme.blue) }
+            }
+        },
+    )
 }

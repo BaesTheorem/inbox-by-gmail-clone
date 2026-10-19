@@ -1,6 +1,7 @@
 package com.baestheorem.inbox.ui
 
 import com.baestheorem.inbox.gmail.ATTACH_HOST
+import com.baestheorem.inbox.gmail.ORIGINAL_HOST
 import com.baestheorem.inbox.gmail.ThreadDetail
 import com.baestheorem.inbox.gmail.fmtBytes
 import com.baestheorem.inbox.gmail.htmlEscape
@@ -22,7 +23,18 @@ body{margin:0;padding:12px 12px 16px;background:#F2F2F2;color:#212121;
   color:#5F6368;font-size:13px;margin-bottom:8px}
 .sender{font-weight:500;font-size:13px;color:#212121}
 .date{white-space:nowrap}
-.to{color:#5F6368;font-size:12px;margin:-4px 0 10px}
+.to{color:#5F6368;font-size:12px;margin:-4px 0 10px;display:flex;align-items:center}
+.to span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.addr{color:#5F6368;font-weight:400;font-size:12px;margin-left:5px}
+.who{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.caret{border:0;background:none;padding:0 4px;margin-left:2px;color:#5F6368;font-size:11px;
+  line-height:18px;border-radius:4px;transition:transform .15s}
+.caret.open{transform:rotate(180deg)}
+.det{border:1px solid #DDDDDD;border-radius:8px;padding:8px 12px;margin:0 0 12px;font-size:12px}
+.det table{border-collapse:collapse}
+.det th{color:#5F6368;font-weight:400;text-align:right;padding:2px 8px 2px 0;vertical-align:top;white-space:nowrap}
+.det td{padding:2px 0;word-break:break-word}
+.det a{display:inline-block;margin-top:6px;color:#3367D6;text-decoration:none}
 .body img{max-width:100%;height:auto}
 .body table{max-width:100%}
 .body a{color:#3367D6}
@@ -71,12 +83,21 @@ fun buildThreadHtml(d: ThreadDetail): String {
             .map { it.first to shortRecipients(it.second) }
             .filter { it.second.isNotEmpty() }
             .joinToString(", ") { "${it.first} ${it.second}" }
-        val toLine = if (rcpt.isEmpty()) "" else "<div class=\"to\">${htmlEscape(rcpt)}</div>"
+        val toLine = "<div class=\"to\"><span>${htmlEscape(rcpt.ifEmpty { "details" })}</span>" +
+            "<button class=\"caret\" onclick=\"det(this,'d$i')\">&#9660;</button></div>"
+        val rows = m.details.joinToString("") { r ->
+            "<tr><th>${r.label}:</th><td>${if (r.label == "security") "&#128274; " else ""}${htmlEscape(r.value)}</td></tr>"
+        }
+        val detBlock = "<div class=\"det\" id=\"d$i\" style=\"display:none\"><table>$rows</table>" +
+            "<a href=\"https://$ORIGINAL_HOST/${m.id}\">&lt;/&gt; Show original</a></div>"
+        val addr = if (m.senderEmail.isEmpty() || m.senderEmail == m.sender) "" else
+            "<span class=\"addr\">&lt;${htmlEscape(m.senderEmail)}&gt;</span>"
         cards.append(
             """
             <div class="msg">
-              <div class="hdr"><span class="sender">${htmlEscape(m.sender)}</span><span class="date">${htmlEscape(m.date)}</span></div>
+              <div class="hdr"><span class="who"><span class="sender">${htmlEscape(m.sender)}</span>$addr</span><span class="date">${htmlEscape(m.date)}</span></div>
               $toLine
+              $detBlock
               <div class="body">$bodyHtml</div>
               $quotedBlock
               $atts
@@ -89,7 +110,8 @@ fun buildThreadHtml(d: ThreadDetail): String {
         <meta name="viewport" content="width=device-width,initial-scale=1">
         <style>$CSS</style></head><body>$cards
         <script>function tg(id){var e=document.getElementById(id);
-        e.style.display=e.style.display==='none'?'block':'none';}</script>
+        e.style.display=e.style.display==='none'?'block':'none';}
+        function det(b,id){tg(id);b.classList.toggle('open');}</script>
         </body></html>
     """.trimIndent()
 }

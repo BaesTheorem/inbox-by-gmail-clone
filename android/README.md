@@ -81,6 +81,11 @@ Press **Publish app** on the console's Audience page and it stops happening.
   images are served from the attachment endpoint through
   `shouldInterceptRequest`, quoted history sits behind a toggle, attachments
   open in whatever app handles the type
+- Sender details, same as Gmail's: the card header shows the sender's address,
+  and the caret on the recipients line opens the from, reply-to, to, cc, bcc,
+  date, subject, mailed-by, signed-by and security rows. "Show original" opens
+  the raw source with a Share button. `messageDetails` in `Bundling.kt` is the
+  port of `message_details`.
 - Reply and reply-all (never addressed to yourself), compose, threaded with
   In-Reply-To/References, sent as your display name
 - Snoozed / Done / Sent views, Gmail-syntax search, pull to refresh, infinite

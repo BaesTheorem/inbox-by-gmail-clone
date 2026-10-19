@@ -116,6 +116,44 @@ fun formatTime(ms: Long): String {
 
 fun formatWake(ms: Long): String = wakeFmt.format(zdt(ms))
 
+// MARK: Gmail's "show details" rows (port of message_details)
+
+private val fullDateFmt = DateTimeFormatter.ofPattern("MMM d, yyyy, h:mm a", Locale.getDefault())
+private val mailfromRx = Regex("""smtp\.mailfrom=([^\s;]+)""")
+private val dkimRx = Regex("""dkim=pass[^;]*?header\.(?:i|d)=@?([^\s;]+)""")
+private val tlsRx = Regex("""version=TLS|Google Transport Security|\bE?SMTPS\b""")
+
+private fun addrDomain(a: String): String =
+    if ('@' in a) a.substringAfterLast('@').trim(' ', '<', '>').lowercase() else ""
+
+// mailed-by is the SPF envelope domain (smtp.mailfrom, else Return-Path),
+// signed-by the passing DKIM domain aligned with From, security is TLS when
+// Google's own Received hop says so. Rows that don't apply are left out.
+fun messageDetails(headers: List<GHeader>, ms: Long): List<DetailRow> {
+    val fromDom = addrDomain(parseAddr(headerValue(headers, "From")).email)
+    val auth = headers
+        .filter { it.name.equals("authentication-results", ignoreCase = true) && (it.value ?: "").contains("mx.google.com") }
+        .joinToString(" ") { it.value ?: "" }
+    val mailedBy = mailfromRx.find(auth)?.groupValues?.get(1)?.let { v -> addrDomain(v).ifEmpty { v.lowercase() } }
+        ?: if (auth.isNotEmpty()) addrDomain(headerValue(headers, "Return-Path")) else ""
+    val signers = dkimRx.findAll(auth).map { it.groupValues[1].lowercase().substringAfterLast('@') }.toList()
+    val signedBy = signers.firstOrNull { it == fromDom }
+        ?: signers.firstOrNull { fromDom.endsWith(".$it") || it.endsWith(".$fromDom") }
+        ?: signers.firstOrNull() ?: ""
+    val hop = headers.firstOrNull {
+        it.name.equals("received", ignoreCase = true) && (it.value ?: "").contains("by mx.google.com")
+    }?.value
+    val security = if (hop != null && tlsRx.containsMatchIn(hop)) "Standard encryption (TLS)" else ""
+    val date = if (ms > 0) fullDateFmt.format(zdt(ms)) else ""
+    return listOf(
+        "from" to headerValue(headers, "From"), "reply-to" to headerValue(headers, "Reply-To"),
+        "to" to headerValue(headers, "To"), "cc" to headerValue(headers, "Cc"),
+        "bcc" to headerValue(headers, "Bcc"), "date" to date,
+        "subject" to headerValue(headers, "Subject"), "mailed-by" to mailedBy,
+        "signed-by" to signedBy, "security" to security,
+    ).filter { it.second.isNotEmpty() }.map { DetailRow(it.first, it.second) }
+}
+
 fun dateBucket(ms: Long): String {
     val d = zdt(ms)
     val now = ZonedDateTime.now()

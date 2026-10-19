@@ -647,6 +647,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
                     cc = headerValue(headers, "Cc"),
                     bcc = headerValue(headers, "Bcc"),
                     date = com.baestheorem.inbox.gmail.formatTime(ts),
+                    details = com.baestheorem.inbox.gmail.messageDetails(headers, ts),
                     text = body.text,
                     html = split.visible,
                     quotedHtml = split.quoted,

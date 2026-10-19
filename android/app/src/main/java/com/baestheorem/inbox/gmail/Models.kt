@@ -68,6 +68,12 @@ data class GSendAsList(val sendAs: List<GSendAs> = emptyList())
 @Serializable
 data class GAttachmentBody(val data: String? = null, val size: Int? = null)
 
+@Serializable
+data class GRawMessage(val raw: String? = null)
+
+// One row of Gmail's "show details" popup
+data class DetailRow(val label: String, val value: String)
+
 // history.list: one record per mailbox change; `messages` is the union of every
 // message the record touched, which is all the cache invalidation needs.
 @Serializable
@@ -146,6 +152,7 @@ data class MessageDetail(
     val cc: String,
     val bcc: String,
     val date: String,
+    val details: List<DetailRow>,
     val text: String,
     val html: String,
     val quotedHtml: String?,
