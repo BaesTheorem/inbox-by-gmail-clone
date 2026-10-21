@@ -1350,7 +1350,9 @@ def fetch_thread(thread_id):
         # a sent bubble; capture it so the reader can restore it into the reply box.
         if "DRAFT" in m.get("labelIds", []):
             _, dhtml = _decode_body(m.get("payload", {}))
-            draft_msg = (m.get("id"), dhtml)
+            datts = [{**a, "messageId": m.get("id")}
+                     for a in _collect_attachments(m.get("payload", {}))]
+            draft_msg = (m.get("id"), dhtml, datts)
             continue
         headers = m.get("payload", {}).get("headers", [])
         name, email_addr = _parse_addr(_header(headers, "From"))
@@ -1396,7 +1398,8 @@ def fetch_thread(thread_id):
         try:
             for dr in gget("/drafts", maxResults=50).get("drafts", []):
                 if dr.get("message", {}).get("id") == draft_msg[0]:
-                    reply_draft = {"draftId": dr["id"], "html": draft_msg[1]}
+                    reply_draft = {"draftId": dr["id"], "html": draft_msg[1],
+                                   "attachments": draft_msg[2]}
                     break
         except Exception:
             pass
@@ -2397,14 +2400,38 @@ def api_drafts():
 def api_draft(draft_id):
     try:
         dr = gget(f"/drafts/{draft_id}", format="full")
-        payload = dr.get("message", {}).get("payload", {})
+        msg = dr.get("message", {})
+        payload = msg.get("payload", {})
         headers = payload.get("headers", [])
         text, html = _decode_body(payload)
         body = text or re.sub(r"<[^>]+>", "", html or "")
+        # threadId + In-Reply-To let the client open a reply draft in its thread, so the
+        # message it answers stays visible; attachments carry the draft's existing files.
         return jsonify({"draftId": draft_id, "to": _header(headers, "To"),
-                        "subject": _header(headers, "Subject"), "body": body, "bodyHtml": html or None})
+                        "cc": _header(headers, "Cc"), "bcc": _header(headers, "Bcc"),
+                        "subject": _header(headers, "Subject"), "body": body, "bodyHtml": html or None,
+                        "threadId": msg.get("threadId"),
+                        "inReplyTo": _header(headers, "In-Reply-To") or None,
+                        "attachments": [{**a, "messageId": msg.get("id")}
+                                        for a in _collect_attachments(payload)]})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+def _carry_draft_attachments(draft_id, keep=None):
+    """(filename, mime, bytes) for each file on an existing draft, filtered by `keep`."""
+    try:
+        msg = gget(f"/drafts/{draft_id}", format="full").get("message", {})
+    except Exception:
+        log.warning("could not read draft %s to carry attachments", draft_id)
+        return []
+    out = []
+    for a in _collect_attachments(msg.get("payload", {})):
+        if a["drive"] or (keep is not None and a["filename"] not in keep):
+            continue
+        data = gget(f"/messages/{msg.get('id')}/attachments/{a['attachmentId']}").get("data", "")
+        out.append((a["filename"], a["mimeType"], base64.urlsafe_b64decode(data)))
+    return out
 
 
 @app.route("/api/save_draft", methods=["POST"])
@@ -2419,9 +2446,13 @@ def api_save_draft():
     in_reply_to, references = d.get("inReplyTo") or None, d.get("references") or None
     draft_id = d.get("draftId") or None
     try:
+        # An update rebuilds the draft from scratch, so carry over the files it already
+        # holds (ones attached in Gmail or by another client). keepAttachments names the
+        # ones still wanted; absent means keep all, so an older client never drops a file.
+        carried = _carry_draft_attachments(draft_id, d.get("keepAttachments")) if draft_id else []
         raw = _build_raw_message(to, subject, body_text, cc=cc, bcc=bcc,
                                  in_reply_to=in_reply_to, references=references,
-                                 body_html=body_html)
+                                 body_html=body_html, attachments=carried)
         message = {"raw": raw}
         if thread_id:
             message["threadId"] = thread_id

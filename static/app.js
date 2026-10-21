@@ -994,6 +994,13 @@ async function openThread(tid) {
   STATE.replyDraftId = (t.replyDraft && t.replyDraft.draftId) || null;
   if (t.replyDraft && t.replyDraft.html) $("#replyBox").innerHTML = t.replyDraft.html;
   setReplyStatus(STATE.replyDraftId ? "Draft saved" : "");
+  if (t.replyDraft && (t.replyDraft.attachments || []).length) {
+    loadDraftFiles(t.replyDraft.attachments).then((files) => {
+      if ($("#reader").dataset.tid !== tid) return; // user moved on
+      STATE.replyAttachments = files.concat(STATE.replyAttachments || []);
+      renderChips("replyAttachments", "#rAttachments");
+    });
+  }
   $("#readerSubject").textContent = t.subject;
   reader.dataset.tid = tid;
   reader.dataset.rfc = t.rfcMessageId || "";
@@ -1223,6 +1230,7 @@ async function saveReplyDraftNow() {
       threadId: r0.dataset.tid, inReplyTo: r0.dataset.rfc || null,
       references: r0.dataset.rfcChain || null,
       draftId: STATE.replyDraftId || null,
+      keepAttachments: draftFileNames(STATE.replyAttachments),
     });
   } catch (e) { r = null; }
   if (r && r.draftId) { STATE.replyDraftId = r.draftId; setReplyStatus("Draft saved"); }
@@ -1379,6 +1387,7 @@ async function saveDraftNow() {
       html: $("#cBody").innerHTML, body: $("#cBody").innerText,
       cc: $("#cCc").value || null, bcc: $("#cBcc").value || null,
       draftId: STATE.composeDraftId || null,
+      keepAttachments: draftFileNames(STATE.attachments),
     });
   } catch (e) { r = null; }
   if (r && r.draftId) {
@@ -1837,7 +1846,42 @@ $("#composeDiscard").onclick = async () => {
 async function openDraft(draftId) {
   const r = await api("/api/draft/" + draftId);
   if (r.error) { toast("Couldn't open draft"); return; }
+  // A reply draft opens in its thread: the message it answers stays in view, and the
+  // reader restores the draft (text and files) into the reply box.
+  if (r.threadId && r.inReplyTo) { openThread(r.threadId); return; }
   openCompose({ draftId, to: r.to, subject: r.subject, body: r.body, html: r.bodyHtml });
+  if ((r.attachments || []).length) {
+    const files = await loadDraftFiles(r.attachments);
+    if (STATE.composeDraftId !== draftId) return; // compose was closed or reused
+    STATE.attachments = files.concat(STATE.attachments || []);
+    renderAttachChips();
+  }
+}
+// Pull a saved draft's files down as File objects so they show as chips and go out with
+// Send like any other attachment. fromDraft marks them for keepAttachments on autosave.
+let draftFilesPending = 0;
+async function loadDraftFiles(atts) {
+  draftFilesPending++;
+  try { return await fetchDraftFiles(atts); } finally { draftFilesPending--; }
+}
+async function fetchDraftFiles(atts) {
+  const out = [];
+  for (const a of atts.filter((x) => !x.drive)) {
+    try {
+      const resp = await fetch(`/api/attachment/${a.messageId}/${a.attachmentId}?name=${encodeURIComponent(a.filename)}&mime=${encodeURIComponent(a.mimeType)}`);
+      if (!resp.ok) continue;
+      const f = new File([await resp.blob()], a.filename, { type: a.mimeType });
+      f.fromDraft = true;
+      out.push(f);
+    } catch (e) { /* skip a file that won't fetch */ }
+  }
+  return out;
+}
+// null while files are still loading tells the server to keep everything, so an
+// autosave that fires mid-download cannot strip the draft's files.
+function draftFileNames(files) {
+  if (draftFilesPending) return null;
+  return (files || []).filter((f) => f.fromDraft).map((f) => f.name);
 }
 // Rich-text toolbars (compose + reply + signature). execCommand is deprecated but works
 // everywhere, keeps the browser's own undo stack, and acts on whichever contenteditable
