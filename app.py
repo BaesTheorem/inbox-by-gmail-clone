@@ -1349,7 +1349,11 @@ def fetch_thread(thread_id):
         # An autosaved reply rides in the thread as a DRAFT message — don't render it as
         # a sent bubble; capture it so the reader can restore it into the reply box.
         if "DRAFT" in m.get("labelIds", []):
-            _, dhtml = _decode_body(m.get("payload", {}))
+            dtext, dhtml = _decode_body(m.get("payload", {}))
+            if not dhtml and dtext:
+                # A plain-text draft (saved by another client) has no HTML part; show
+                # its text in the reply box instead of an empty editor.
+                dhtml = _htmlmod.escape(dtext).replace("\r\n", "\n").replace("\n", "<br>")
             datts = [{**a, "messageId": m.get("id")}
                      for a in _collect_attachments(m.get("payload", {}))]
             draft_msg = (m.get("id"), dhtml, datts)
