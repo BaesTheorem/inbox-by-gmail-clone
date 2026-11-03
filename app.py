@@ -287,19 +287,28 @@ def _request(method, path, tries=6, **kw):
     for attempt in range(tries):
         try:
             r = s.request(method, url, timeout=30, **kw)
-        except requests.RequestException:
+        except requests.RequestException as e:
             if attempt == tries - 1:
                 raise
-            time.sleep(min(32.0, 2 ** attempt) + random.uniform(0, 0.5))
+            delay = min(32.0, 2 ** attempt) + random.uniform(0, 0.5)
+            log.warning("gmail %s %s: %s, retry %d in %.1fs", method, path, type(e).__name__,
+                        attempt + 1, delay)
+            time.sleep(delay)
             continue
         if r.status_code in (429, 500, 502, 503, 504) or (r.status_code == 403 and _is_rate(r)):
             if attempt == tries - 1:
                 raise GmailHTTPError(r.status_code, r.text)
-            time.sleep(min(32.0, 2 ** attempt) + random.uniform(0, 0.5))
+            delay = min(32.0, 2 ** attempt) + random.uniform(0, 0.5)
+            # Logged because a rate-limit storm was invisible here before: it showed only
+            # as requests that finished late, all at once.
+            log.warning("gmail %s %s: HTTP %s, retry %d in %.1fs", method, path, r.status_code,
+                        attempt + 1, delay)
+            time.sleep(delay)
             continue
         if r.status_code >= 400:
             raise GmailHTTPError(r.status_code, r.text)
         return r
+    raise ValueError(f"_request needs tries >= 1, got {tries}")
 
 
 def gget(path, **params):
