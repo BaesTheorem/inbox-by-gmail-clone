@@ -47,7 +47,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from email.utils import formataddr, parsedate_to_datetime
+from email.utils import formataddr, getaddresses, parsedate_to_datetime
 from html.parser import HTMLParser as _HTMLParser
 from urllib.parse import quote, urlencode, urljoin, urlparse
 
@@ -1556,6 +1556,16 @@ def migrate_db():
         links      TEXT NOT NULL DEFAULT '[]',
         checked_at INTEGER NOT NULL
     )""")
+    # Contact autocomplete (see _refresh_contacts): one row per address you have sent
+    # mail to. contact_sources holds the sent messages a refresh already read, so the
+    # next refresh fetches only mail sent since.
+    conn.execute("""CREATE TABLE IF NOT EXISTS contacts (
+        email     TEXT PRIMARY KEY,
+        address   TEXT NOT NULL,
+        name      TEXT NOT NULL DEFAULT '',
+        last_sent INTEGER NOT NULL DEFAULT 0
+    )""")
+    conn.execute("CREATE TABLE IF NOT EXISTS contact_sources (message_id TEXT PRIMARY KEY)")
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     if "snoozed" in tables:
         now = int(time.time())
@@ -2761,43 +2771,150 @@ def api_settings_post():
     return jsonify({"ok": True})
 
 
-# Contact autocomplete — mined from sent-mail headers (covered by gmail.modify; no
-# extra scope). Cached so typing doesn't refetch on every keystroke.
-_contacts_cache = {"at": 0, "list": []}
-_contacts_lock = threading.Lock()
+# Contact autocomplete, mined from the To/Cc of sent mail (covered by gmail.modify; no
+# extra scope).
+#
+# A keystroke must never wait on Gmail. The first version rebuilt the list inside the
+# request, under a lock, from up to 200 message fetches (83 s in a cold-cache repro).
+# Every keystroke that arrived during a rebuild waited on the lock, and each waiting request
+# held one of the six connections WebKit opens to one host. The SSE stream holds one
+# more, so five keystrokes used up the window's connections, and a thread open or a
+# search queued in the browser until the rebuild ended. Now the list is in SQLite and
+# in memory, a request only reads it, and a stale list refreshes in a background thread
+# that fetches only the sent messages that no earlier refresh read.
+CONTACTS_TTL = 900     # seconds a refresh stays fresh; a keystroke after that starts one
+CONTACTS_SCAN = 200    # newest sent messages each refresh looks at
+# Seconds between fetches. The old rebuild ran 8 at a time (about 58 calls/s), and
+# Gmail refused about one call in six with 403 rateLimitExceeded. During that rebuild a
+# thread fetch took 17 to 33 s instead of under 1 s, most likely in _request's backoff
+# after the same refusals. One call at a time with this gap is at most 5 calls/s.
+CONTACTS_PACE = 0.2
+_contacts = {"list": None, "at": 0.0, "running": False}
+_contacts_lock = threading.Lock()  # guards _contacts; never held across Gmail or disk I/O
 
 
-def _rebuild_contacts():
-    ids = list_ids(label_ids=["SENT"], max_results=200)
-    seen, contacts = set(), []
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        msgs = list(ex.map(_get_meta, ids))
-    for m in msgs:
-        if not m:
-            continue
-        headers = m.get("payload", {}).get("headers", [])
-        for field in ("To", "Cc"):
-            for addr in (_header(headers, field) or "").split(","):
-                name, email_addr = _parse_addr(addr)
-                key = email_addr.lower()
-                if "@" in key and key not in seen:
-                    seen.add(key)
-                    contacts.append({"name": name, "email": email_addr})
-    return contacts
+def _load_contacts():
+    """Every known contact, newest correspondent first."""
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT address, name FROM contacts ORDER BY last_sent DESC").fetchall()
+    finally:
+        conn.close()
+    return [{"name": name, "email": address} for address, name in rows]
+
+
+def _contact_addrs(msg):
+    """(name, address) for each recipient in a sent message's To and Cc."""
+    headers = msg.get("payload", {}).get("headers", [])
+    return [(name.strip(), addr.strip())
+            for name, addr in getaddresses([_header(headers, "To"), _header(headers, "Cc")])
+            if "@" in addr]
+
+
+def _refresh_contacts():
+    """Fold the recipients of recent sent mail into the contacts table. A message that
+    an earlier refresh read is skipped, so after the first run a refresh costs one list
+    call plus one fetch per message sent since. Runs in a background thread only, one
+    paced fetch at a time and with no retries: at the first sign of a rate limit it
+    stops and keeps what it read, and a later refresh continues from there."""
+    t0 = time.monotonic()
+    ok = False
+    try:
+        ids = list_ids(label_ids=["SENT"], max_results=CONTACTS_SCAN)
+        conn = db()
+        try:
+            read_before = {r[0] for r in conn.execute("SELECT message_id FROM contact_sources")}
+        finally:
+            conn.close()
+        todo = [m for m in ids if m not in read_before]
+        fetched, stopped = [], None
+        next_at = time.monotonic()
+        for mid in todo:
+            time.sleep(max(0.0, next_at - time.monotonic()))
+            next_at = time.monotonic() + CONTACTS_PACE
+            try:
+                fetched.append((mid, _request(
+                    "GET", f"/messages/{mid}", tries=1,
+                    params={"format": "metadata", "metadataHeaders": ["To", "Cc"],
+                            "fields": "internalDate,payload/headers"}).json()))
+            except GmailHTTPError as e:
+                if e.status == 404:
+                    continue  # deleted since the list call
+                stopped = f"HTTP {e.status}"  # rate limit or Gmail trouble: yield to the app
+                break
+            except requests.RequestException as e:
+                stopped = type(e).__name__
+                break
+        conn = db()
+        try:
+            with conn:
+                for mid, msg in fetched:
+                    sent = int(msg.get("internalDate") or 0) // 1000
+                    for name, addr in _contact_addrs(msg):
+                        # The newest message sets the spelling and the name (an empty
+                        # name never replaces a known one); last_sent keeps the maximum.
+                        conn.execute(
+                            "INSERT INTO contacts (email, address, name, last_sent) "
+                            "VALUES (?,?,?,?) ON CONFLICT(email) DO UPDATE SET "
+                            "address = CASE WHEN excluded.last_sent >= last_sent "
+                            "  THEN excluded.address ELSE address END, "
+                            "name = CASE WHEN excluded.name != '' AND "
+                            "  (excluded.last_sent >= last_sent OR name = '') "
+                            "  THEN excluded.name ELSE name END, "
+                            "last_sent = MAX(last_sent, excluded.last_sent)",
+                            (addr.lower(), addr, name, sent))
+                    conn.execute("INSERT OR IGNORE INTO contact_sources (message_id) VALUES (?)",
+                                 (mid,))
+                # Only the newest CONTACTS_SCAN ids are ever checked again, so older
+                # source rows are dead weight.
+                if ids:
+                    ph = ",".join("?" * len(ids))
+                    conn.execute(f"DELETE FROM contact_sources WHERE message_id NOT IN ({ph})",
+                                 ids)
+        finally:
+            conn.close()
+        contacts = _load_contacts()
+        with _contacts_lock:
+            _contacts["list"] = contacts
+        ok = stopped is None
+        log.info("contacts refreshed: read %d of %d new sent messages in %.1fs%s, %d contacts",
+                 len(fetched), len(todo), time.monotonic() - t0,
+                 f" (stopped early on {stopped}; resumes in a minute)" if stopped else "",
+                 len(contacts))
+    except Exception:
+        log.exception("contact refresh failed")
+    finally:
+        with _contacts_lock:
+            _contacts["running"] = False
+            # After a failure, try again in a minute instead of after the full TTL.
+            _contacts["at"] = time.time() - (0 if ok else CONTACTS_TTL - 60)
+
+
+def _kick_contacts_refresh(force=False):
+    """Start a background refresh when the list is stale and no refresh is running.
+    Returns True when it started one."""
+    with _contacts_lock:
+        if _contacts["running"]:
+            return False
+        if not force and time.time() - _contacts["at"] < CONTACTS_TTL:
+            return False
+        _contacts["running"] = True
+    threading.Thread(target=_refresh_contacts, name="contacts-refresh", daemon=True).start()
+    return True
 
 
 @app.route("/api/contacts")
 def api_contacts():
     q = (request.args.get("q") or "").strip().lower()
-    now = int(time.time())
     with _contacts_lock:
-        if now - _contacts_cache["at"] > 900 or not _contacts_cache["list"]:
-            try:
-                _contacts_cache["list"] = _rebuild_contacts()
-                _contacts_cache["at"] = now
-            except Exception:
-                log.exception("contact rebuild failed")
-        contacts = _contacts_cache["list"]
+        contacts = _contacts["list"]
+    if contacts is None:  # first request since start: one local read, no Gmail call
+        contacts = _load_contacts()
+        with _contacts_lock:
+            if _contacts["list"] is None:
+                _contacts["list"] = contacts
+    _kick_contacts_refresh()
     if q:
         contacts = [c for c in contacts
                     if q in c["email"].lower() or q in (c["name"] or "").lower()]
@@ -3394,6 +3511,7 @@ def start_background():
         print(f"[auth] deferred: {e}")
     threading.Thread(target=_history_loop, daemon=True).start()
     threading.Thread(target=_unsub_scan_loop, daemon=True).start()
+    _kick_contacts_refresh(force=True)  # fresh suggestions before the first keystroke
 
 
 def run_server():
