@@ -1804,13 +1804,15 @@ function editorForToolbar(btn) {
 })();
 
 // ---------- Contact autocomplete (To / Cc / Bcc) ----------
-let acTimer = null;
+let acTimer = null, acCtl = null;
 async function runAutocomplete(input) {
   const token = (input.value.split(",").pop() || "").trim();
   const dd = $("#acDropdown");
+  if (acCtl) acCtl.abort(); // one request in flight, as in the search box
   if (token.length < 2) { dd.hidden = true; return; }
+  const ctl = (acCtl = new AbortController());
   let r;
-  try { r = await api("/api/contacts?q=" + encodeURIComponent(token)); } catch (e) { return; }
+  try { r = await api("/api/contacts?q=" + encodeURIComponent(token), { signal: ctl.signal }); } catch (e) { return; }
   const list = (r && r.contacts) || [];
   if (!list.length) { dd.hidden = true; return; }
   dd.innerHTML = "";
@@ -1993,10 +1995,13 @@ function pushRecent(q) { q = q.trim(); if (!q) return; let r = recentSearches().
 function removeRecent(q) { try { localStorage.setItem(RECENT_KEY, JSON.stringify(recentSearches().filter((x) => x !== q))); } catch (e) {} }
 function clearSearchBox() { $("#searchInput").value = ""; $("#searchClear").hidden = true; $("#searchSuggest").hidden = true; $("#searchAdvanced").hidden = true; }
 
-let searchSel = -1, searchItems = [], searchContactTimer = null;
+let searchSel = -1, searchItems = [], searchContactTimer = null, searchContactCtl = null;
 
 function runSearch(q) {
   q = (q || "").trim();
+  // A suggestion still on its way would reopen the box over the results.
+  clearTimeout(searchContactTimer);
+  if (searchContactCtl) searchContactCtl.abort();
   $("#searchSuggest").hidden = true; $("#searchAdvanced").hidden = true;
   $("#searchInput").value = q; $("#searchClear").hidden = !q;
   document.querySelectorAll(".nav-item").forEach((x) => x.classList.remove("active"));
@@ -2044,10 +2049,15 @@ function buildSuggestions() {
   if (cq && cq.length >= 2) {
     clearTimeout(searchContactTimer);
     searchContactTimer = setTimeout(async () => {
-      let cs; try { cs = await api("/api/contacts?q=" + encodeURIComponent(cq)); } catch (e) { return; }
-      if (!Array.isArray(cs) || !cs.length || inp.value.trim() !== full) return;
+      // One suggestion request at a time: each waiting request holds one of the few
+      // connections the window has to the server, so a newer keystroke cancels the older one.
+      if (searchContactCtl) searchContactCtl.abort();
+      const ctl = (searchContactCtl = new AbortController());
+      let cs; try { cs = await api("/api/contacts?q=" + encodeURIComponent(cq), { signal: ctl.signal }); } catch (e) { return; }
+      const list = (cs && cs.contacts) || [];
+      if (!list.length || inp.value.trim() !== full || $("#searchSuggest").hidden) return;
       const prefix = mFT ? mFT[1].toLowerCase() : "from:";
-      const citems = cs.slice(0, 5).map((c) => ({ type: "contact", icon: "person", main: c.name || c.email, sub: c.email, value: prefix + c.email + " " }));
+      const citems = list.slice(0, 5).map((c) => ({ type: "contact", icon: "person", main: c.name || c.email, sub: c.email, value: prefix + c.email + " " }));
       renderSuggestions(items.concat(citems));
     }, 160);
   }
