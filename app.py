@@ -895,6 +895,40 @@ def _one_click_post(url, session=None):
         return False, str(e), ""
 
 
+# A sender can advertise RFC 8058 in the header and then point it at a dead route.
+# Shop (noreply@email.shop.app) does this: List-Unsubscribe names
+# shop.app/unsubscribe, which answers 404 "Page not found" to GET and POST, while the
+# body's "Unsubscribe here" tracker redirects to shop.app/email/unsubscribe with the
+# same signed token, and that route accepts the one-click POST (200; a bad token is
+# 401). So when the header's one-click fails, the body link shows the live endpoint.
+def _live_one_click_target(header_url, body_url, max_hops=8):
+    """Follow the body unsubscribe link's redirects without loading the last page, and
+    return the first hop on the header URL's host whose path names an unsubscribe
+    route and is not the header URL itself. None when the chain never reaches one."""
+    host = (urlparse(header_url).hostname or "").lower()
+    if not host or not body_url:
+        return None
+    s = requests.Session()
+    s.headers["User-Agent"] = _BROWSER_UA
+    url = body_url
+    for _ in range(max_hops):
+        if not _is_safe_public_url(url, allow_http=True):
+            return None
+        try:
+            r = s.get(url, timeout=12, allow_redirects=False)
+        except Exception:
+            return None
+        loc = r.headers.get("Location")
+        if r.status_code not in (301, 302, 303, 307, 308) or not loc:
+            return None
+        url = urljoin(url, loc)
+        p = urlparse(url)
+        if ((p.hostname or "").lower() == host and "unsubscribe" in p.path.lower()
+                and url.split("?")[0] != header_url.split("?")[0]):
+            return url if _is_safe_public_url(url) else None
+    return None
+
+
 def _decode_body(payload):
     """Return (text, html) walking the MIME tree."""
     text, html = "", ""
@@ -3130,6 +3164,20 @@ def api_unsubscribe():
             if ok:
                 log.info("unsubscribe %s via %s", mid, steps)
                 return jsonify({"ok": True, "method": "one-click", "confirmed": True, "steps": steps})
+            # 1b. The advertised endpoint is dead (Shop). The body link's redirects
+            #     show the live one; the sender still promised RFC 8058, so a 2xx there
+            #     is the same success signal.
+            if info.get("source") != "body":
+                full = gget(f"/messages/{mid}", format="full")
+                body = find_body_unsubscribe(_decode_body(full.get("payload", {}))[1])
+                live = _live_one_click_target(url, body and body.get("httpsUrl"))
+                if live:
+                    ok, detail, _body = _one_click_post(live)
+                    steps.append("live-one-click:ok" if ok else f"live-one-click:{detail}")
+                    if ok:
+                        log.info("unsubscribe %s via %s", mid, steps)
+                        return jsonify({"ok": True, "method": "one-click", "confirmed": True,
+                                        "steps": steps})
 
         # 2. Drive the confirmation page ourselves: redirects, the confirm form, the
         #    "which address?" box, the reason dropdown, the second confirm screen.

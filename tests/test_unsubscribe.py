@@ -93,3 +93,34 @@ class Resolver(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveOneClickTarget(unittest.TestCase):
+    """Header advertises a dead one-click route; the body tracker redirects to the live one."""
+
+    def _resp(self, code, loc=None):
+        r = mock.Mock(status_code=code)
+        r.headers = {"Location": loc} if loc else {}
+        return r
+
+    def test_finds_live_route_without_loading_it(self):
+        hops = [self._resp(307, "https://shop.example.com/email/unsubscribe?d=tok"),
+                self._resp(302, "/email/unsubscribe/success?d=tok")]
+        with mock.patch.object(app.socket, "getaddrinfo", return_value=PUBLIC), \
+             mock.patch.object(app.requests.Session, "get", side_effect=hops) as get:
+            live = app._live_one_click_target("https://shop.example.com/unsubscribe?d=tok",
+                                              "https://mail.example.com/_t/c/abc")
+        self.assertEqual(live, "https://shop.example.com/email/unsubscribe?d=tok")
+        self.assertEqual(get.call_count, 1)
+
+    def test_other_host_or_same_route_ignored(self):
+        hops = [self._resp(302, "https://elsewhere.example.net/unsubscribe"), self._resp(200)]
+        with mock.patch.object(app.socket, "getaddrinfo", return_value=PUBLIC), \
+             mock.patch.object(app.requests.Session, "get", side_effect=hops):
+            self.assertIsNone(app._live_one_click_target("https://shop.example.com/unsubscribe?d=1",
+                                                         "https://mail.example.com/_t/c/abc"))
+        hops = [self._resp(302, "https://shop.example.com/unsubscribe?d=2"), self._resp(200)]
+        with mock.patch.object(app.socket, "getaddrinfo", return_value=PUBLIC), \
+             mock.patch.object(app.requests.Session, "get", side_effect=hops):
+            self.assertIsNone(app._live_one_click_target("https://shop.example.com/unsubscribe?d=1",
+                                                         "https://mail.example.com/_t/c/abc"))
