@@ -168,10 +168,12 @@ External links *inside emails* are routed to the default browser via pywebview's
   `./setup_notifier.sh` once: it builds **`/Applications/Inbox Notifier.app`**, a
   rebranded copy of a UN notifier app (MIST Notifier from
   [exobrain-harness](https://github.com/BaesTheorem/exobrain-harness) `mist-notifier/`,
-  or any app at `INBOX_UN_SOURCE` that takes the same JSON spec), and asks for
-  notification permission. Click Allow, or turn on **Inbox** in System Settings →
-  Notifications. Until then banners go through the unbranded UN notifier
-  (`INBOX_UN_NOTIFIER`), and as a last resort through terminal-notifier
+  or any app at `INBOX_UN_SOURCE` that takes the same JSON spec), and sends a test
+  banner. Permission is stored per bundle id, so the bundle keeps the id
+  `<launcher id>.notifier` and a rebuild keeps the grant. If the test banner says it
+  was not delivered, turn on **Inbox** in System Settings → Notifications. Until then
+  banners go through the unbranded UN notifier (`INBOX_UN_NOTIFIER`, with its name on
+  them), and as a last resort through terminal-notifier
   (`brew install terminal-notifier`), whose banners show but cannot be clicked. A
   window that the click launches still opens the thread: the server replays a deep
   link for 30 seconds to a page that connects late.

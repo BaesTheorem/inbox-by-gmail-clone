@@ -1799,7 +1799,8 @@ def _scheduler_loop():
 #      takes a JSON spec ("Inbox" name and icon, own row in System Settings →
 #      Notifications). setup_notifier.sh builds it. Override with INBOX_UN_BRANDED.
 #   2. INBOX_UN_NOTIFIER (default /Applications/MIST Notifier.app from the
-#      exobrain-harness repo): same contract, other name and icon.
+#      exobrain-harness repo): same contract, but banners show that app's name.
+#      Only used while (1) is missing or has no notification permission.
 #   3. terminal-notifier: shows the banner, but the click does nothing on macOS 26.
 #
 # Fallback-only option: set INBOX_NOTIFY_SENDER to a local app's bundle id to have
@@ -1810,11 +1811,7 @@ def _scheduler_loop():
 _UN_BRANDED = os.environ.get("INBOX_UN_BRANDED", "/Applications/Inbox Notifier.app")
 _UN_NOTIFIER = os.environ.get("INBOX_UN_NOTIFIER", "/Applications/MIST Notifier.app")
 _UN_SPEC_DIR = os.path.expanduser("~/Library/Caches/inbox-notify")
-_NOTIFIER_BRANDED = os.path.expanduser(
-    "~/Library/Application Support/Inbox/Inbox Notifier.app/Contents/MacOS/terminal-notifier")
-if not os.path.exists(_NOTIFIER_BRANDED):
-    _NOTIFIER_BRANDED = None
-_NOTIFIER = _NOTIFIER_BRANDED or shutil.which("terminal-notifier")
+_NOTIFIER = shutil.which("terminal-notifier")
 _NOTIFY_SENDER = os.environ.get("INBOX_NOTIFY_SENDER")  # fallback path only, see above
 _NOTIFY_ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "favicon.png")
 _notified_ids = set()   # message ids already pushed, so a re-poll never double-fires
@@ -1873,12 +1870,11 @@ def _notify_tn(title, message, subtitle, target, group):
         cmd += ["-group", group]
     if _get_setting("notification_sound", True):
         cmd += ["-sound", "default"]
-    if not _NOTIFIER_BRANDED:
-        # Plain terminal-notifier: dress it up as best we can.
-        if _NOTIFY_SENDER:
-            cmd += ["-sender", _NOTIFY_SENDER]   # show + group under that app (incl. its icon)
-        if os.path.exists(_NOTIFY_ICON):
-            cmd += ["-appIcon", _NOTIFY_ICON]    # bundled Inbox glyph — the default branding
+    # Plain terminal-notifier: dress it up as best we can.
+    if _NOTIFY_SENDER:
+        cmd += ["-sender", _NOTIFY_SENDER]   # show + group under that app (incl. its icon)
+    if os.path.exists(_NOTIFY_ICON):
+        cmd += ["-appIcon", _NOTIFY_ICON]    # bundled Inbox glyph — the default branding
     cmd += ["-execute", f'open "{target}"']
     try:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2038,11 +2034,10 @@ def _notify_otp(code, service, thread_id=None):
            "-group", f"otp-{code}", "-execute", f'"{_OTP_FILL}" {code}']
     if _get_setting("notification_sound", True):
         cmd += ["-sound", "default"]
-    if not _NOTIFIER_BRANDED:
-        if _NOTIFY_SENDER:
-            cmd += ["-sender", _NOTIFY_SENDER]
-        if os.path.exists(_NOTIFY_ICON):
-            cmd += ["-appIcon", _NOTIFY_ICON]
+    if _NOTIFY_SENDER:
+        cmd += ["-sender", _NOTIFY_SENDER]
+    if os.path.exists(_NOTIFY_ICON):
+        cmd += ["-appIcon", _NOTIFY_ICON]
     try:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log.info("otp banner: %s from %s (thread %s)", code, service, thread_id)

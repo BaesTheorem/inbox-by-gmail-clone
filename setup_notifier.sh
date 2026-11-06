@@ -1,43 +1,42 @@
 #!/bin/bash
-# Build the Inbox-branded notifiers, so macOS banners are attributed to "Inbox"
-# (name, real app icon, its own row in System Settings → Notifications):
+# Build /Applications/Inbox Notifier.app, so macOS banners are attributed to
+# "Inbox" (name, real app icon, its own row in System Settings → Notifications)
+# and a click opens the thread.
 #
-#  1. /Applications/Inbox Notifier.app: a rebranded copy of a UN notifier app
-#     (MIST Notifier from the exobrain-harness repo, or $INBOX_UN_SOURCE). It
-#     posts through UNUserNotificationCenter, the only API whose banner clicks
-#     still run on macOS 26, so a click opens the thread. It must live in
-#     /Applications: usernoted refuses UN callers from other paths.
-#  2. ~/Library/Application Support/Inbox/Inbox Notifier.app: a rebranded
-#     terminal-notifier, the fallback. Its banners show, but clicks do nothing
-#     on macOS 26.
+# It is a rebranded copy of a UN notifier app: MIST Notifier from the
+# exobrain-harness repo (mist-notifier/), or $INBOX_UN_SOURCE, any app that takes
+# the same JSON spec and `post <path>` CLI. It must post through
+# UNUserNotificationCenter, because on macOS 26 a click on a legacy
+# NSUserNotification banner (terminal-notifier) never runs its action. It must
+# live in /Applications, because usernoted refuses UN callers from other paths.
 #
-# app.py prefers (1), then the unbranded UN notifier, then (2).
+# The bundle id is <launcher id>.notifier, derived from /Applications/Inbox.app
+# and never hardcoded: a machine-specific id can embed a real name, which must
+# never land in this public repo. Notification permission is stored per bundle
+# id, so a rebuild keeps the grant. Older versions of this script put a
+# terminal-notifier copy with the same id in ~/Library/Application Support/Inbox;
+# it is removed so the two bundles do not compete for the id.
 #
-# The bundle id is derived at build time from the installed launcher
-# (/Applications/Inbox.app) and never hardcoded here: a machine-specific id can
-# embed a real name, which must never land in this public repo.
-#
-# Idempotent. Rerun after `brew upgrade terminal-notifier` to pick up the new
-# binary. Pass --no-test to skip the test banner at the end.
+# Idempotent. Pass --no-test to skip the test banner at the end.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DEST_DIR="$HOME/Library/Application Support/Inbox"
-DEST="$DEST_DIR/Inbox Notifier.app"
 LAUNCHER="/Applications/Inbox.app"
+DEST="/Applications/Inbox Notifier.app"
+LEGACY="$HOME/Library/Application Support/Inbox/Inbox Notifier.app"
+SRC="${INBOX_UN_SOURCE:-/Applications/MIST Notifier.app}"
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
-# 1. Locate the stock terminal-notifier.app (brew keg or a direct .app install)
-TN_BIN="$(command -v terminal-notifier || true)"
-[ -n "$TN_BIN" ] || { echo "terminal-notifier not found — brew install terminal-notifier" >&2; exit 1; }
-TN_REAL="$(readlink -f "$TN_BIN")"
-if [[ "$TN_REAL" == *".app/Contents/MacOS/"* ]]; then
-  TN_APP="${TN_REAL%/Contents/MacOS/*}"          # binary lives inside the bundle
-else
-  TN_APP="${TN_REAL%/bin/*}/terminal-notifier.app"  # brew: .app is a sibling of bin/
+[ -d "$SRC" ] || {
+  echo "No UN notifier at $SRC. Install MIST Notifier (exobrain-harness/mist-notifier)" >&2
+  echo "or set INBOX_UN_SOURCE. Without one, banners cannot be clicked on macOS 26." >&2
+  exit 1; }
+if pgrep -f "$DEST/Contents/MacOS" >/dev/null 2>&1; then
+  echo "Inbox Notifier is running. Not rebuilding under it; re-run in a minute." >&2
+  exit 1
 fi
-[ -d "$TN_APP" ] || { echo "couldn't locate terminal-notifier.app near $TN_REAL" >&2; exit 1; }
 
-# 2. Pick the icon: the launcher's real icon, else one built from the repo favicon
+# 1. Icon: the launcher's real icon, else one built from the repo favicon
 ICNS="$LAUNCHER/Contents/Resources/icon.icns"
 if [ ! -f "$ICNS" ]; then
   TMP="$(mktemp -d)"
@@ -49,15 +48,21 @@ if [ ! -f "$ICNS" ]; then
   ICNS="$TMP/icon.icns"
 fi
 
-# 3. Pick the bundle id: <launcher id>.notifier, else a generic local id
+# 2. Bundle id
 BASE_ID="$(defaults read "$LAUNCHER/Contents/Info" CFBundleIdentifier 2>/dev/null || true)"
 NOTIFIER_ID="${BASE_ID:+$BASE_ID.notifier}"
 NOTIFIER_ID="${NOTIFIER_ID:-local.inbox-clone.notifier}"
 
-# 4. Copy + rebrand + re-sign
-mkdir -p "$DEST_DIR"
+# 3. Retire the legacy terminal-notifier copy that held the same id
+if [ -d "$LEGACY" ]; then
+  "$LSREGISTER" -u "$LEGACY" 2>/dev/null || true
+  rm -rf "$LEGACY"
+  echo "Removed legacy terminal-notifier copy: $LEGACY"
+fi
+
+# 4. Copy, rebrand, sign with a real identity when one exists, register
 rm -rf "$DEST"
-cp -R "$TN_APP" "$DEST"
+cp -R "$SRC" "$DEST"
 PLIST="$DEST/Contents/Info.plist"
 plist_set() {
   /usr/libexec/PlistBuddy -c "Set :$1 $2" "$PLIST" 2>/dev/null \
@@ -65,48 +70,26 @@ plist_set() {
 }
 plist_set CFBundleIdentifier "$NOTIFIER_ID"
 plist_set CFBundleName Inbox
-cp "$ICNS" "$DEST/Contents/Resources/icon.icns"
-plist_set CFBundleIconFile icon.icns
-rm -f "$DEST/Contents/Resources/Terminal.icns"
-codesign --force --deep --sign - "$DEST" 2>/dev/null
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST"
-
+plist_set CFBundleDisplayName Inbox
+ICON_FILE="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" "$PLIST" 2>/dev/null || echo AppIcon)"
+cp "$ICNS" "$DEST/Contents/Resources/${ICON_FILE%.icns}.icns"
+IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+  | awk -F'"' '/Apple Development/{print $2; exit}')
+codesign --force --sign "${IDENTITY:--}" "$DEST"
+"$LSREGISTER" -f "$DEST"
 echo "Built: $DEST ($NOTIFIER_ID)"
-echo "Restart the Inbox app so it picks up the branded notifier."
 
-# 5. The UN notifier: copy, rebrand, sign with a real identity when one exists.
-UN_SRC="${INBOX_UN_SOURCE:-/Applications/MIST Notifier.app}"
-UN_DEST="/Applications/Inbox Notifier.app"
-UN_ID="${BASE_ID:+$BASE_ID.un-notifier}"
-UN_ID="${UN_ID:-local.inbox-clone.un-notifier}"
-if [ -d "$UN_SRC" ]; then
-  rm -rf "$UN_DEST"
-  cp -R "$UN_SRC" "$UN_DEST"
-  UPLIST="$UN_DEST/Contents/Info.plist"
-  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $UN_ID" "$UPLIST"
-  /usr/libexec/PlistBuddy -c "Set :CFBundleName Inbox" "$UPLIST"
-  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Inbox" "$UPLIST" 2>/dev/null \
-    || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Inbox" "$UPLIST"
-  UICON="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" "$UPLIST" 2>/dev/null || echo AppIcon)"
-  cp "$ICNS" "$UN_DEST/Contents/Resources/${UICON%.icns}.icns"
-  IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
-    | awk -F'"' '/Apple Development/{print $2; exit}')
-  codesign --force --sign "${IDENTITY:--}" "$UN_DEST"
-  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$UN_DEST"
-  echo "Built: $UN_DEST ($UN_ID)"
-  if [ "${1:-}" != "--no-test" ]; then
-    # One-time permission prompt. Click Allow on the banner it raises.
-    open -a "$UN_DEST" --args auth
-    echo "Click Allow on the Inbox permission banner (clickable new-mail banners need it)."
-  fi
-else
-  echo "No UN notifier at $UN_SRC: banner clicks will not work on macOS 26." >&2
-  echo "Install MIST Notifier (exobrain-harness/mist-notifier) or set INBOX_UN_SOURCE." >&2
-fi
-
-# 6. Test banner (also triggers the one-time notification-permission grant)
+# 5. Test banner. On a first build this raises the one-time permission prompt.
 if [ "${1:-}" != "--no-test" ]; then
-  "$DEST/Contents/MacOS/terminal-notifier" \
-    -title "Inbox" -message "Notifications are now Inbox-branded" -group setup-test
-  echo "If no banner appeared, allow Inbox under System Settings → Notifications."
+  SPEC="$(mktemp -t inbox-notify).json"
+  echo '{"title":"Inbox","body":"Notifications are Inbox-branded. Click to open Inbox.","link":"inboxclone://","id":"inbox-setup-test"}' > "$SPEC"
+  open -n -a "$DEST" --args post "$SPEC"
+  for _ in $(seq 1 30); do [ -f "$SPEC.result" ] && break; sleep 0.2; done
+  if grep -q '"ok":true' "$SPEC.result" 2>/dev/null; then
+    echo "Test banner sent."
+  else
+    echo "Not delivered ($(cat "$SPEC.result" 2>/dev/null || echo no result))."
+    echo "Allow the prompt, or turn on Inbox in System Settings → Notifications."
+  fi
+  rm -f "$SPEC" "$SPEC.result"
 fi
