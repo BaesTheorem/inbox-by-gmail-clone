@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import formataddr, getaddresses, parsedate_to_datetime
 from html.parser import HTMLParser as _HTMLParser
-from urllib.parse import quote, urlencode, urljoin, urlparse
+from urllib.parse import quote, unquote, urlencode, urljoin, urlparse
 
 import random
 from concurrent.futures import ThreadPoolExecutor
@@ -1791,18 +1791,25 @@ def _scheduler_loop():
 # ----------------------------------------------------------------------------
 # Native push notifications — Inbox-branded macOS banners on new unread mail
 # ----------------------------------------------------------------------------
-# Fired by the history poller below. Banners are sent through "Inbox Notifier.app"
-# (a rebranded terminal-notifier copy built once by setup_notifier.sh), so
-# Notification Center attributes them to "Inbox" with the real app icon and gives
-# them their own row in System Settings → Notifications. Without that bundle we
-# fall back to plain terminal-notifier dressed up with the bundled favicon
-# (which macOS attributes to terminal-notifier / Terminal).
+# Fired by the history poller below. A click must open the thread, and on macOS 26
+# only UNUserNotificationCenter banners run their click action: terminal-notifier
+# rides the legacy NSUserNotification API and its -execute never fires. So banners
+# go, in order, through:
+#   1. /Applications/Inbox Notifier.app: a rebranded copy of a UN notifier app that
+#      takes a JSON spec ("Inbox" name and icon, own row in System Settings →
+#      Notifications). setup_notifier.sh builds it. Override with INBOX_UN_BRANDED.
+#   2. INBOX_UN_NOTIFIER (default /Applications/MIST Notifier.app from the
+#      exobrain-harness repo): same contract, other name and icon.
+#   3. terminal-notifier: shows the banner, but the click does nothing on macOS 26.
 #
 # Fallback-only option: set INBOX_NOTIFY_SENDER to a local app's bundle id to have
 # plain terminal-notifier banners show that app's name. Left unset in the repo on
 # purpose — a bundle id is machine-specific and can embed a real name, which must
 # never land in this public repo. (setup_notifier.sh derives the branded bundle's
 # id from the installed launcher at build time for the same reason.)
+_UN_BRANDED = os.environ.get("INBOX_UN_BRANDED", "/Applications/Inbox Notifier.app")
+_UN_NOTIFIER = os.environ.get("INBOX_UN_NOTIFIER", "/Applications/MIST Notifier.app")
+_UN_SPEC_DIR = os.path.expanduser("~/Library/Caches/inbox-notify")
 _NOTIFIER_BRANDED = os.path.expanduser(
     "~/Library/Application Support/Inbox/Inbox Notifier.app/Contents/MacOS/terminal-notifier")
 if not os.path.exists(_NOTIFIER_BRANDED):
@@ -1814,9 +1821,48 @@ _notified_ids = set()   # message ids already pushed, so a re-poll never double-
 _NOTIFIED_CAP = 500
 
 
-def _notify(title, message, subtitle=None, thread_id=None, group=None):
-    """Fire one Inbox-branded macOS notification. Fire-and-forget; never blocks the
-    poller. No-op if no notifier is installed."""
+def _un_apps():
+    """UN notifier apps that exist, Inbox-branded first."""
+    return [a for a in dict.fromkeys((_UN_BRANDED, _UN_NOTIFIER)) if a and os.path.isdir(a)]
+
+
+def _post_un(app_path, spec):
+    """Post one banner through a UN notifier app (JSON spec, `post <path>` CLI).
+    True when the app reported delivery. False (not installed, permission still
+    pending or denied, timeout) sends the caller to the next notifier."""
+    os.makedirs(_UN_SPEC_DIR, exist_ok=True)
+    spec_path = os.path.join(_UN_SPEC_DIR, f"{secrets.token_hex(6)}.json")
+    result = spec_path + ".result"
+    try:
+        with open(spec_path, "w") as f:
+            json.dump(spec, f)
+        subprocess.run(["/usr/bin/open", "-n", "-a", app_path, "--args", "post", spec_path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        for _ in range(40):   # the app writes {"ok": ...} next to the spec, then exits
+            if os.path.exists(result):
+                break
+            time.sleep(0.2)
+        with open(result) as f:
+            ok = json.load(f).get("ok") is True
+    except Exception:  # noqa: BLE001 - any failure means "try the next notifier"
+        log.info("banner via %s failed", app_path)
+        ok = False
+    finally:
+        for p in (spec_path, result):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    return ok
+
+
+def _post_any_un(spec):
+    """Try each installed UN notifier in order; True on the first delivery."""
+    return any(_post_un(a, spec) for a in _un_apps())
+
+
+def _notify_tn(title, message, subtitle, target, group):
+    """terminal-notifier fallback: the banner shows, the click is dead on macOS 26."""
     if not _NOTIFIER:
         return
     cmd = [_NOTIFIER, "-title", title, "-message", message]
@@ -1833,9 +1879,6 @@ def _notify(title, message, subtitle=None, thread_id=None, group=None):
             cmd += ["-sender", _NOTIFY_SENDER]   # show + group under that app (incl. its icon)
         if os.path.exists(_NOTIFY_ICON):
             cmd += ["-appIcon", _NOTIFY_ICON]    # bundled Inbox glyph — the default branding
-    # -execute wins over -sender for the click action: deep-link to the exact thread,
-    # or just raise the app for a summary banner. The link handler serves both forms.
-    target = f"inboxclone://thread/{thread_id}" if thread_id else "inboxclone://"
     cmd += ["-execute", f'open "{target}"']
     try:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1843,10 +1886,35 @@ def _notify(title, message, subtitle=None, thread_id=None, group=None):
         log.exception("notify failed")
 
 
+def _notify_spec(title, message, subtitle, target, group, sound):
+    """The UN notifier spec for one mail banner. `group` doubles as the replace id,
+    so new mail on a thread swaps out its stale banner instead of stacking."""
+    spec = {"title": title, "body": message, "link": target,
+            "group": "inbox-mail", "sound": "default" if sound else "none"}
+    if subtitle:
+        spec["subtitle"] = subtitle
+    if group:
+        spec["id"] = f"inbox-{group}"
+    return spec
+
+
+def _notify(title, message, subtitle=None, thread_id=None, group=None):
+    """Fire one Inbox banner whose click opens the thread (or raises the app for a
+    summary banner). Runs on its own thread so the poller never waits on it."""
+    target = f"inboxclone://thread/{thread_id}" if thread_id else "inboxclone://"
+    spec = _notify_spec(title, message, subtitle, target, group,
+                        _get_setting("notification_sound", True))
+
+    def send():
+        if not _post_any_un(spec):
+            _notify_tn(title, message, subtitle, target, group)
+    threading.Thread(target=send, name="notify", daemon=True).start()
+
+
 def _notify_new_mail(message_ids):
     """Push a banner for genuinely-new unread inbox mail. Collapses a burst into one
     summary so a bulk sync never floods the screen."""
-    if not _NOTIFIER or not _get_setting("notifications", True):
+    if not (_NOTIFIER or _un_apps()) or not _get_setting("notifications", True):
         return
     fresh = [mid for mid in message_ids if mid not in _notified_ids]
     if not fresh:
@@ -1903,8 +1971,6 @@ def _notify_new_mail(message_ids):
 # exobrain-harness repo, or any app at INBOX_UN_NOTIFIER with the same contract),
 # code banners go through it, and terminal-notifier is the fallback.
 _OTP_FILL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "otp-fill.sh")
-_UN_NOTIFIER = os.environ.get("INBOX_UN_NOTIFIER", "/Applications/MIST Notifier.app")
-_OTP_SPEC_DIR = os.path.expanduser("~/Library/Caches/inbox-otp")
 _OTP_FIELDS = ("id,threadId,internalDate,labelIds,payload(mimeType,headers,body/data,"
                "parts(mimeType,body/data,parts(mimeType,body/data,parts(mimeType,body/data))))")
 _otp_seen = set()
@@ -1913,7 +1979,7 @@ _OTP_MAX_AGE = 15 * 60   # ignore codes older than this (a backfill after sleep)
 
 def _otp_scan(message_ids):
     """Detect one-time codes in freshly arrived mail and banner each one."""
-    if not _NOTIFIER or not _get_setting("otp_banners", True):
+    if not (_NOTIFIER or _un_apps()) or not _get_setting("otp_banners", True):
         return
     for mid in message_ids:
         if mid in _otp_seen:
@@ -1946,39 +2012,14 @@ def _otp_scan(message_ids):
 
 
 def _notify_otp_un(code, service, thread_id=None):
-    """Post the code banner through the UN notifier app. True when it reported
+    """Post the code banner through a UN notifier app. True when it reported
     delivery; False sends the caller to the terminal-notifier fallback."""
-    if not os.path.isdir(_UN_NOTIFIER):
-        return False
-    os.makedirs(_OTP_SPEC_DIR, exist_ok=True)
-    spec_path = os.path.join(_OTP_SPEC_DIR, f"{code}-{int(time.time() * 1000)}.json")
     spec = {"title": f"Code {code} from {service}",
             "body": "Click to type it into the active field (also copied)",
             "link": f"cmd:{shlex.quote(_OTP_FILL)} {code}",
-            "id": f"otp-{code}", "group": "inbox-otp"}
-    if _get_setting("notification_sound", True):
-        spec["sound"] = "default"
-    try:
-        with open(spec_path, "w") as f:
-            json.dump(spec, f)
-        subprocess.run(["/usr/bin/open", "-n", "-a", _UN_NOTIFIER, "--args", "post", spec_path],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        result = spec_path + ".result"
-        for _ in range(30):   # the app writes {"ok": ...} next to the spec, then exits
-            if os.path.exists(result):
-                break
-            time.sleep(0.2)
-        with open(result) as f:
-            ok = json.load(f).get("ok") is True
-    except Exception:
-        log.exception("otp banner via %s failed", _UN_NOTIFIER)
-        ok = False
-    finally:
-        for p in (spec_path, spec_path + ".result"):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+            "id": f"otp-{code}", "group": "inbox-otp",
+            "sound": "default" if _get_setting("notification_sound", True) else "none"}
+    ok = _post_any_un(spec)
     if ok:
         log.info("otp banner: %s from %s (thread %s, UN notifier)", code, service, thread_id)
     return ok
@@ -2014,7 +2055,13 @@ def _notify_otp(code, service, thread_id=None):
 # ----------------------------------------------------------------------------
 POLL_INTERVAL = 8  # seconds
 SYNC = {"version": 0, "history_id": None}
-_focus = {"tid": None, "v": 0}  # deep-link "open this thread" signal, pushed over SSE
+# Deep-link signals pushed over SSE: "open this thread" (inboxclone://) and "open
+# compose with these fields" (mailto:). Each carries its time, so a window that
+# connects just after the link arrived (the link handler launched it) still gets
+# it; see _SIGNAL_REPLAY.
+_focus = {"tid": None, "v": 0, "t": 0.0}
+_compose = {"fields": None, "v": 0, "t": 0.0}
+_SIGNAL_REPLAY = 30   # seconds a fresh SSE client replays a pending signal
 
 
 def _history_loop():
@@ -2253,12 +2300,21 @@ def api_stream():
     """Server-Sent Events: emit on mailbox change (version) or a deep-link focus request."""
     def gen():
         last = SYNC["version"]
-        last_focus = _focus["v"]
+        now = time.time()
+        # A signal from the last few seconds was meant for this window: the link
+        # handler raised it before the page connected. Replay it once.
+        last_focus = _focus["v"] - 1 if _focus["tid"] and now - _focus["t"] < _SIGNAL_REPLAY \
+            else _focus["v"]
+        last_compose = _compose["v"] - 1 if _compose["fields"] and now - _compose["t"] < _SIGNAL_REPLAY \
+            else _compose["v"]
         yield "retry: 4000\n\n"
         while True:
             if _focus["v"] != last_focus:
                 last_focus = _focus["v"]
                 yield f"data: {json.dumps({'focus': _focus['tid']})}\n\n"
+            elif _compose["v"] != last_compose:
+                last_compose = _compose["v"]
+                yield f"data: {json.dumps({'compose': _compose['fields']})}\n\n"
             elif SYNC["version"] != last:
                 last = SYNC["version"]
                 yield f"data: {json.dumps({'version': last})}\n\n"
@@ -2274,8 +2330,49 @@ def api_stream():
 def api_open_thread():
     """A deep link asks the running window to surface a thread (pushed via SSE)."""
     _focus["tid"] = (request.json or {}).get("threadId")
+    _focus["t"] = time.time()
     _focus["v"] += 1
     return jsonify({"ok": True})
+
+
+def parse_mailto(url):
+    """RFC 6068 mailto: URL -> compose fields {to, cc, bcc, subject, body}.
+    Addresses in the path and in a `to=` header join; header names are
+    case-insensitive; unknown headers (In-Reply-To and others) are dropped."""
+    url = (url or "").strip()
+    if not url.lower().startswith("mailto:"):
+        return None
+    rest = url[len("mailto:"):]
+    path, _, query = rest.partition("?")
+    fields = {"to": [], "cc": [], "bcc": [], "subject": "", "body": ""}
+    if path:
+        fields["to"].append(unquote(path))
+    # Split by hand: parse_qsl would turn "+" into a space, but RFC 6068 keeps "+"
+    # literal (spaces arrive as %20).
+    for pair in filter(None, query.split("&")):
+        k, _, v = pair.partition("=")
+        k, v = unquote(k).lower(), unquote(v)
+        if k in ("to", "cc", "bcc") and v:
+            fields[k].append(v)
+        elif k in ("subject", "body") and not fields[k]:
+            fields[k] = v
+    for k in ("to", "cc", "bcc"):
+        addrs = [a.strip() for part in fields[k] for a in part.split(",") if a.strip()]
+        fields[k] = ", ".join(dict.fromkeys(addrs))
+    return fields
+
+
+@app.route("/api/compose", methods=["POST"])
+def api_compose():
+    """The mailto: handler asks the running window to open compose (pushed via SSE)."""
+    url = (request.get_json(silent=True) or {}).get("url") or request.form.get("url", "")
+    fields = parse_mailto(url)
+    if fields is None:
+        return jsonify({"ok": False, "error": "not a mailto: URL"}), 400
+    _compose["fields"] = fields
+    _compose["t"] = time.time()
+    _compose["v"] += 1
+    return jsonify({"ok": True, "fields": fields})
 
 
 def _limit_arg(default=50):

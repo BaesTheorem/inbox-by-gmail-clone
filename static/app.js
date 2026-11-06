@@ -1305,9 +1305,9 @@ function openCompose(opts = {}) {
   STATE.scheduleAt = 0;
   $("#composeTitle").textContent = opts.draftId ? "Draft" : (opts.subject && opts.subject.startsWith("Fwd:") ? "Forward" : "New message");
   $("#cTo").value = opts.to || "";
-  $("#cCc").value = ""; $("#cBcc").value = "";
-  $("#cCc").hidden = true; $("#cBcc").hidden = true;
-  $("#cCcToggle").style.display = ""; $("#cBccToggle").style.display = "";
+  $("#cCc").value = opts.cc || ""; $("#cBcc").value = opts.bcc || "";
+  $("#cCc").hidden = !opts.cc; $("#cBcc").hidden = !opts.bcc;
+  $("#cCcToggle").style.display = opts.cc ? "none" : ""; $("#cBccToggle").style.display = opts.bcc ? "none" : "";
   $("#cSubject").value = opts.subject || "";
   const body = opts.html || (opts.body ? esc(opts.body).replace(/\n/g, "<br>") : "");
   const sig = STATE.settings.signature;
@@ -2730,6 +2730,8 @@ function startStream() {
       try { msg = JSON.parse(e.data); } catch (_) {}
       // Deep link asked us to surface a specific thread (from the inboxclone:// handler)
       if (msg.focus) { openThread(msg.focus); return; }
+      // A mailto: link (Inbox is the default mail app) asked for a prefilled compose.
+      if (msg.compose) { openCompose(msg.compose); return; }
       // Mailbox changed server-side (new mail / label change). Refresh the current view
       // silently: no loading flash, and scroll anchoring keeps the conversation you're
       // looking at pinned in place so arriving/vanishing mail never jerks the viewport.

@@ -81,6 +81,15 @@ ensures Inbox.app is running, then `POST /api/open_thread`; the SPA receives a `
 event over SSE and opens that thread (falls back to the Gmail web permalink if the app
 can't start). A bare `inboxclone://` just opens/raises the app (used by summary
 notifications).
+## Default email app
+`./setup_link_handler.sh --default` builds the link handler, registers it for
+`mailto:` as well as `inboxclone://`, and makes it the default email app (macOS can ask
+you to confirm). A `mailto:` link anywhere (a browser, a PDF, Contacts) then opens
+Inbox with a prefilled compose: to, cc, bcc, subject and body per RFC 6068
+(`parse_mailto` in `app.py`, `tests/test_mailto.py`). If the server cannot start, the
+link goes to Gmail's web compose. To undo, pick another app in Mail → Settings →
+General → Default email reader.
+
 External links *inside emails* are routed to the default browser via pywebview's
 `js_api.open_external` (WKWebView can't open new tabs itself).
 
@@ -152,16 +161,20 @@ External links *inside emails* are routed to the default browser via pywebview's
 - **Desktop notifications**: when the live-sync poller sees new *unread* inbox mail it
   fires a full macOS banner attributed to **Inbox** (sender as title, subject as subtitle,
   body snippet as the message, real app icon, optional sound); clicking opens that exact
-  thread via `inboxclone://`. Repeated mail on one thread replaces its stale banner
-  (`-group`), and a burst collapses into one summary banner whose click raises the app.
-  Toggles in Settings → "Desktop notifications for new mail" / "Play sound with
-  notifications". Requires `terminal-notifier` (`brew install terminal-notifier`) plus a
-  one-time `./setup_notifier.sh`, which builds **Inbox Notifier.app** (a rebranded
-  terminal-notifier copy in `~/Library/Application Support/Inbox/`) so Notification Center
-  shows the Inbox name/icon and gives the app its own row in System Settings →
-  Notifications. Without that bundle it falls back to plain terminal-notifier with the
-  favicon pasted in (attributed to Terminal); `export INBOX_NOTIFY_SENDER=<app-bundle-id>`
-  can dress up that fallback.
+  thread via `inboxclone://`. Repeated mail on one thread replaces its stale banner, and
+  a burst collapses into one summary banner whose click raises the app. Toggles in
+  Settings → "Desktop notifications for new mail" / "Play sound with notifications".
+  On macOS 26 only `UNUserNotificationCenter` banners run their click, so run
+  `./setup_notifier.sh` once: it builds **`/Applications/Inbox Notifier.app`**, a
+  rebranded copy of a UN notifier app (MIST Notifier from
+  [exobrain-harness](https://github.com/BaesTheorem/exobrain-harness) `mist-notifier/`,
+  or any app at `INBOX_UN_SOURCE` that takes the same JSON spec), and asks for
+  notification permission. Click Allow, or turn on **Inbox** in System Settings →
+  Notifications. Until then banners go through the unbranded UN notifier
+  (`INBOX_UN_NOTIFIER`), and as a last resort through terminal-notifier
+  (`brew install terminal-notifier`), whose banners show but cannot be clicked. A
+  window that the click launches still opens the thread: the server replays a deep
+  link for 30 seconds to a page that connects late.
 - **Verification-code banners.** When a one-time code arrives by email (a login code,
   a sign-in verification, an activation code) the poller raises a banner that leads with
   the code: "Code 482913 from GitHub". Clicking it runs `otp-fill.sh`, which copies the

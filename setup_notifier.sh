@@ -1,9 +1,17 @@
 #!/bin/bash
-# Build "Inbox Notifier.app" — a rebranded copy of terminal-notifier — so macOS
-# banners are attributed to "Inbox" (name, real app icon, its own row in System
-# Settings → Notifications) instead of terminal-notifier/Terminal. app.py prefers
-# this bundle automatically when it exists; without it, banners fall back to plain
-# terminal-notifier with the favicon pasted in.
+# Build the Inbox-branded notifiers, so macOS banners are attributed to "Inbox"
+# (name, real app icon, its own row in System Settings → Notifications):
+#
+#  1. /Applications/Inbox Notifier.app: a rebranded copy of a UN notifier app
+#     (MIST Notifier from the exobrain-harness repo, or $INBOX_UN_SOURCE). It
+#     posts through UNUserNotificationCenter, the only API whose banner clicks
+#     still run on macOS 26, so a click opens the thread. It must live in
+#     /Applications: usernoted refuses UN callers from other paths.
+#  2. ~/Library/Application Support/Inbox/Inbox Notifier.app: a rebranded
+#     terminal-notifier, the fallback. Its banners show, but clicks do nothing
+#     on macOS 26.
+#
+# app.py prefers (1), then the unbranded UN notifier, then (2).
 #
 # The bundle id is derived at build time from the installed launcher
 # (/Applications/Inbox.app) and never hardcoded here: a machine-specific id can
@@ -66,7 +74,37 @@ codesign --force --deep --sign - "$DEST" 2>/dev/null
 echo "Built: $DEST ($NOTIFIER_ID)"
 echo "Restart the Inbox app so it picks up the branded notifier."
 
-# 5. Test banner (also triggers the one-time notification-permission grant)
+# 5. The UN notifier: copy, rebrand, sign with a real identity when one exists.
+UN_SRC="${INBOX_UN_SOURCE:-/Applications/MIST Notifier.app}"
+UN_DEST="/Applications/Inbox Notifier.app"
+UN_ID="${BASE_ID:+$BASE_ID.un-notifier}"
+UN_ID="${UN_ID:-local.inbox-clone.un-notifier}"
+if [ -d "$UN_SRC" ]; then
+  rm -rf "$UN_DEST"
+  cp -R "$UN_SRC" "$UN_DEST"
+  UPLIST="$UN_DEST/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $UN_ID" "$UPLIST"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleName Inbox" "$UPLIST"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Inbox" "$UPLIST" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Inbox" "$UPLIST"
+  UICON="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" "$UPLIST" 2>/dev/null || echo AppIcon)"
+  cp "$ICNS" "$UN_DEST/Contents/Resources/${UICON%.icns}.icns"
+  IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk -F'"' '/Apple Development/{print $2; exit}')
+  codesign --force --sign "${IDENTITY:--}" "$UN_DEST"
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$UN_DEST"
+  echo "Built: $UN_DEST ($UN_ID)"
+  if [ "${1:-}" != "--no-test" ]; then
+    # One-time permission prompt. Click Allow on the banner it raises.
+    open -a "$UN_DEST" --args auth
+    echo "Click Allow on the Inbox permission banner (clickable new-mail banners need it)."
+  fi
+else
+  echo "No UN notifier at $UN_SRC: banner clicks will not work on macOS 26." >&2
+  echo "Install MIST Notifier (exobrain-harness/mist-notifier) or set INBOX_UN_SOURCE." >&2
+fi
+
+# 6. Test banner (also triggers the one-time notification-permission grant)
 if [ "${1:-}" != "--no-test" ]; then
   "$DEST/Contents/MacOS/terminal-notifier" \
     -title "Inbox" -message "Notifications are now Inbox-branded" -group setup-test
