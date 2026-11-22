@@ -124,7 +124,12 @@ External links *inside emails* are routed to the default browser via pywebview's
   response says in words that you are off the list; (4) **the page again in a real
   WebKit engine**, offscreen, for opt-outs that only exist once the page's scripts have
   run: it ticks the opt-out control, types your address, presses the confirm button and
-  reads the result (in-process under the desktop shell's AppKit loop, otherwise in a
+  reads the result. A control there can be a real button, a link, or a bare `div` or
+  `span` that only a pointer cursor marks as a button (Alibaba's preference page is
+  built that way). The driver skips greyed-out controls, remembers what it pressed so a
+  page that wants several presses in a row (opt out, save, "are you sure?") moves
+  forward, for up to six rounds, and catches a result message that shows for a moment
+  and then goes away (in-process under the desktop shell's AppKit loop, otherwise in a
   helper process that starts its own, so the launchd server gets this rung too); (5) the
   `mailto:` route, sent from your account; (6) the browser, and only once all of that
   has failed. Every hop is SSRF-checked (publicly-resolving host; plain `http://` click

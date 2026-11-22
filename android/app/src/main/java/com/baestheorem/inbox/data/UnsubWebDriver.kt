@@ -32,7 +32,7 @@ data class UnsubWebOutcome(
 
 object UnsubWebDriver {
 
-    private const val MAX_ROUNDS = 4
+    private const val MAX_ROUNDS = 6
     private const val LOAD_SETTLE_MS = 1_200L    // scripts finish drawing
     private const val AFTER_CLICK_MS = 2_500L    // the XHR or nav a click starts
 
@@ -162,10 +162,13 @@ object UnsubWebDriver {
 (function () {
   var SUBMITTED = __SUBMITTED__;
   var EMAIL = __EMAIL__;
-  var DONE = /you(?:'ve| have) been (?:successfully )?(?:unsubscribed|removed|opted[\s\-]?out)|(?:has|have) been (?:successfully )?(?:unsubscribed|removed from)|(?:successfully|now) (?:unsubscribed|opted[\s\-]?out)|unsubscri(?:be|ption)[^.]{0,20}(?:was )?(?:success|complete|confirmed)|you(?:'re| are) (?:now )?(?:unsubscribed|opted[\s\-]?out)|you will no longer receive|no longer (?:be )?subscribed|removed from (?:our|the|this|that) (?:mailing |e-?mail |distribution )?list|opt[\s\-]?out (?:is )?(?:complete|successful|confirmed)/i;
+  var DONE = /you(?:'ve| have) been (?:successfully )?(?:unsubscribed|removed|opted[\s\-]?out)|(?:has|have) been (?:successfully )?(?:unsubscribed|removed from)|(?:successfully|now) (?:unsubscribed|opted[\s\-]?out)|unsubscri(?:be|ption)[^.]{0,20}(?:was )?(?:success|complete|confirmed)|you(?:'re| are) (?:now )?(?:unsubscribed|opted[\s\-]?out)|you will no longer receive|no longer (?:be )?subscribed|removed from (?:our|the|this|that) (?:mailing |e-?mail |distribution )?list|(?:subscription|preferences) (?:has|have) been (?:successfully )?(?:cancell?ed|updated|saved|removed)|opt[\s\-]?out (?:is )?(?:complete|successful|confirmed)/i;
   var CONFIRM = /unsubscrib|opt[\s\-]?out|remove\s+(?:me|my|this)|yes[,!\s]|confirm|stop\s+(?:receiving|all|these)|no\s+longer\s+(?:wish|want)|(?:update|save)\s+(?:my\s+)?(?:e-?mail\s+)?preferences/i;
   var AVOID = /keep me|stay subscribed|remain subscribed|resubscribe|go back|cancel|no,? (?:thanks|keep)|sign in|log in|create account|privacy|terms|contact us/i;
   var OPTOUT = /unsub|opt[\s\-]?out|remove|stop|\bnone\b|no[\s_\-]?e-?mail/i;
+  // Wording that names the opt-out itself, as opposed to "save" or "confirm".
+  var DIRECT = /unsubscrib|opt[\s\-]?out|remove\s+(?:me|my|this)|stop\s+(?:receiving|all|these)/i;
+  var SEMANTIC = 'button, input[type=submit], input[type=button], a[href], [role=button]';
 
   // Layout-based, so it still works in an offscreen web view that never paints.
   function shown(el) {
@@ -179,22 +182,87 @@ object UnsubWebDriver {
             (el.getAttribute('aria-label') || '') + ' ' +
             (el.getAttribute('title') || '')).replace(/\s+/g, ' ').trim();
   }
+  // A greyed-out control: the attribute, the ARIA state, or a "disable(d)" class word.
+  function disabled(el) {
+    return !!el.disabled || el.getAttribute('aria-disabled') === 'true' ||
+           /(?:^|[\s_\-])disabled?(?![a-z])/i.test(String(el.getAttribute('class') || ''));
+  }
+  function wanted(el) {
+    var t = label(el);
+    return !!t && shown(el) && !disabled(el) && CONFIRM.test(t) && !AVOID.test(t);
+  }
 
   var text = (document.body && document.body.innerText) || '';
-  var controls = [].slice.call(document.querySelectorAll(
-      'button, input[type=submit], input[type=button], a[href], [role=button]'))
-    .filter(function (e) {
-      var t = label(e);
-      return t && shown(e) && CONFIRM.test(t) && !AVOID.test(t);
-    });
-  // A real button beats a footer link that happens to say "unsubscribe".
-  controls.sort(function (a, b) {
-    var rank = function (e) { return e.tagName === 'A' ? 1 : 0; };
-    return rank(a) - rank(b);
+  var controls = [].slice.call(document.querySelectorAll(SEMANTIC)).filter(wanted);
+
+  // Pages built from a component kit often draw a button as a bare div or span with
+  // a click handler and nothing semantic on it (Alibaba's preference page does). The
+  // pointer cursor is the tell. Short text only, the innermost match only, and never
+  // inside a label, where a click would untick the box ticked below.
+  var bare = [].slice.call(document.querySelectorAll('body *')).filter(function (e) {
+    if ((e.textContent || '').length > 80) return false;
+    if (e.closest(SEMANTIC + ', label, select, textarea, script, style')) return false;
+    if (e.querySelector(SEMANTIC + ', input, select, textarea')) return false;
+    if (!wanted(e) || label(e).length > 40) return false;
+    return window.getComputedStyle(e).cursor === 'pointer';
   });
+  bare = bare.filter(function (e) {
+    return !bare.some(function (o) { return o !== e && e.contains(o); });
+  });
+  controls = controls.concat(bare);
+
+  // What this walk already pressed on this page, so a page that wants several presses
+  // in a row (opt out, then save, then "are you sure?") moves forward, not in a circle.
+  var KEY = '__inboxUnsubPressed';
+  var pressed = [];
+  try { pressed = JSON.parse(window.sessionStorage.getItem(KEY) || '[]'); }
+  catch (e) { pressed = window[KEY] || []; }
+  function mark(el) { return location.pathname + '|' + label(el).slice(0, 60); }
+  function remember(el) {
+    pressed.push(mark(el));
+    window[KEY] = pressed;
+    try { window.sessionStorage.setItem(KEY, JSON.stringify(pressed)); } catch (e) {}
+  }
+
+  // A real button beats a bare element, and both beat a footer link that happens to
+  // say "unsubscribe". Within a kind: not yet pressed first, then the control that
+  // names the opt-out before one that only saves or confirms, then page order.
+  function kind(e) {
+    if (e.tagName === 'A') return 2;
+    return bare.indexOf(e) >= 0 ? 1 : 0;
+  }
+  var order = controls.map(function (e, i) {
+    return { el: e, key: [kind(e) === 2 ? 1 : 0, pressed.indexOf(mark(e)) >= 0 ? 1 : 0,
+                          DIRECT.test(label(e)) ? 0 : 1, kind(e), i] };
+  });
+  order.sort(function (a, b) {
+    for (var k = 0; k < a.key.length; k++) {
+      if (a.key[k] !== b.key[k]) return a.key[k] - b.key[k];
+    }
+    return 0;
+  });
+  controls = order.map(function (o) { return o.el; });
+
+  // A result that shows only for a moment (a toast, a dialog that shuts itself) can
+  // come and go between two rounds, so the page is watched from the first press on.
+  var SEEN = '__inboxUnsubSeenDone';
+  function watch() {
+    if (window[SEEN] !== undefined || !window.MutationObserver || !document.body) return;
+    window[SEEN] = false;
+    var due = null;
+    var mo = new MutationObserver(function () {
+      if (due) return;
+      due = setTimeout(function () {
+        due = null;
+        if (DONE.test(document.body.innerText || '')) { window[SEEN] = true; mo.disconnect(); }
+      }, 100);
+    });
+    mo.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true });
+  }
 
   // Same rule as the HTML resolver: the done wording only counts once something has
   // been pressed, or when there is nothing left to press.
+  if (window[SEEN] === true) return 'done';
   if (DONE.test(text) && (SUBMITTED || controls.length === 0)) return 'done';
 
   [].slice.call(document.querySelectorAll('input[type=email], input[type=text]'))
@@ -214,6 +282,8 @@ object UnsubWebDriver {
 
   if (!controls.length) return 'nothing';
   var chosen = label(controls[0]).slice(0, 60);
+  remember(controls[0]);
+  watch();
   controls[0].click();
   return 'clicked:' + chosen;
 })()

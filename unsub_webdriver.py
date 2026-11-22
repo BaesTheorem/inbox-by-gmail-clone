@@ -37,10 +37,13 @@ DRIVER_JS = r"""
 (function () {
   var SUBMITTED = __SUBMITTED__;
   var EMAIL = __EMAIL__;
-  var DONE = /you(?:'ve| have) been (?:successfully )?(?:unsubscribed|removed|opted[\s\-]?out)|(?:has|have) been (?:successfully )?(?:unsubscribed|removed from)|(?:successfully|now) (?:unsubscribed|opted[\s\-]?out)|unsubscri(?:be|ption)[^.]{0,20}(?:was )?(?:success|complete|confirmed)|you(?:'re| are) (?:now )?(?:unsubscribed|opted[\s\-]?out)|you will no longer receive|no longer (?:be )?subscribed|removed from (?:our|the|this|that) (?:mailing |e-?mail |distribution )?list|opt[\s\-]?out (?:is )?(?:complete|successful|confirmed)/i;
+  var DONE = /you(?:'ve| have) been (?:successfully )?(?:unsubscribed|removed|opted[\s\-]?out)|(?:has|have) been (?:successfully )?(?:unsubscribed|removed from)|(?:successfully|now) (?:unsubscribed|opted[\s\-]?out)|unsubscri(?:be|ption)[^.]{0,20}(?:was )?(?:success|complete|confirmed)|you(?:'re| are) (?:now )?(?:unsubscribed|opted[\s\-]?out)|you will no longer receive|no longer (?:be )?subscribed|removed from (?:our|the|this|that) (?:mailing |e-?mail |distribution )?list|(?:subscription|preferences) (?:has|have) been (?:successfully )?(?:cancell?ed|updated|saved|removed)|opt[\s\-]?out (?:is )?(?:complete|successful|confirmed)/i;
   var CONFIRM = /unsubscrib|opt[\s\-]?out|remove\s+(?:me|my|this)|yes[,!\s]|confirm|stop\s+(?:receiving|all|these)|no\s+longer\s+(?:wish|want)|(?:update|save)\s+(?:my\s+)?(?:e-?mail\s+)?preferences/i;
   var AVOID = /keep me|stay subscribed|remain subscribed|resubscribe|go back|cancel|no,? (?:thanks|keep)|sign in|log in|create account|privacy|terms|contact us/i;
   var OPTOUT = /unsub|opt[\s\-]?out|remove|stop|\bnone\b|no[\s_\-]?e-?mail/i;
+  // Wording that names the opt-out itself, as opposed to "save" or "confirm".
+  var DIRECT = /unsubscrib|opt[\s\-]?out|remove\s+(?:me|my|this)|stop\s+(?:receiving|all|these)/i;
+  var SEMANTIC = 'button, input[type=submit], input[type=button], a[href], [role=button]';
 
   // Layout-based, so it still works in an offscreen web view that never paints.
   function shown(el) {
@@ -54,22 +57,87 @@ DRIVER_JS = r"""
             (el.getAttribute('aria-label') || '') + ' ' +
             (el.getAttribute('title') || '')).replace(/\s+/g, ' ').trim();
   }
+  // A greyed-out control: the attribute, the ARIA state, or a "disable(d)" class word.
+  function disabled(el) {
+    return !!el.disabled || el.getAttribute('aria-disabled') === 'true' ||
+           /(?:^|[\s_\-])disabled?(?![a-z])/i.test(String(el.getAttribute('class') || ''));
+  }
+  function wanted(el) {
+    var t = label(el);
+    return !!t && shown(el) && !disabled(el) && CONFIRM.test(t) && !AVOID.test(t);
+  }
 
   var text = (document.body && document.body.innerText) || '';
-  var controls = [].slice.call(document.querySelectorAll(
-      'button, input[type=submit], input[type=button], a[href], [role=button]'))
-    .filter(function (e) {
-      var t = label(e);
-      return t && shown(e) && CONFIRM.test(t) && !AVOID.test(t);
-    });
-  // A real button beats a footer link that happens to say "unsubscribe".
-  controls.sort(function (a, b) {
-    var rank = function (e) { return e.tagName === 'A' ? 1 : 0; };
-    return rank(a) - rank(b);
+  var controls = [].slice.call(document.querySelectorAll(SEMANTIC)).filter(wanted);
+
+  // Pages built from a component kit often draw a button as a bare div or span with
+  // a click handler and nothing semantic on it (Alibaba's preference page does). The
+  // pointer cursor is the tell. Short text only, the innermost match only, and never
+  // inside a label, where a click would untick the box ticked below.
+  var bare = [].slice.call(document.querySelectorAll('body *')).filter(function (e) {
+    if ((e.textContent || '').length > 80) return false;
+    if (e.closest(SEMANTIC + ', label, select, textarea, script, style')) return false;
+    if (e.querySelector(SEMANTIC + ', input, select, textarea')) return false;
+    if (!wanted(e) || label(e).length > 40) return false;
+    return window.getComputedStyle(e).cursor === 'pointer';
   });
+  bare = bare.filter(function (e) {
+    return !bare.some(function (o) { return o !== e && e.contains(o); });
+  });
+  controls = controls.concat(bare);
+
+  // What this walk already pressed on this page, so a page that wants several presses
+  // in a row (opt out, then save, then "are you sure?") moves forward, not in a circle.
+  var KEY = '__inboxUnsubPressed';
+  var pressed = [];
+  try { pressed = JSON.parse(window.sessionStorage.getItem(KEY) || '[]'); }
+  catch (e) { pressed = window[KEY] || []; }
+  function mark(el) { return location.pathname + '|' + label(el).slice(0, 60); }
+  function remember(el) {
+    pressed.push(mark(el));
+    window[KEY] = pressed;
+    try { window.sessionStorage.setItem(KEY, JSON.stringify(pressed)); } catch (e) {}
+  }
+
+  // A real button beats a bare element, and both beat a footer link that happens to
+  // say "unsubscribe". Within a kind: not yet pressed first, then the control that
+  // names the opt-out before one that only saves or confirms, then page order.
+  function kind(e) {
+    if (e.tagName === 'A') return 2;
+    return bare.indexOf(e) >= 0 ? 1 : 0;
+  }
+  var order = controls.map(function (e, i) {
+    return { el: e, key: [kind(e) === 2 ? 1 : 0, pressed.indexOf(mark(e)) >= 0 ? 1 : 0,
+                          DIRECT.test(label(e)) ? 0 : 1, kind(e), i] };
+  });
+  order.sort(function (a, b) {
+    for (var k = 0; k < a.key.length; k++) {
+      if (a.key[k] !== b.key[k]) return a.key[k] - b.key[k];
+    }
+    return 0;
+  });
+  controls = order.map(function (o) { return o.el; });
+
+  // A result that shows only for a moment (a toast, a dialog that shuts itself) can
+  // come and go between two rounds, so the page is watched from the first press on.
+  var SEEN = '__inboxUnsubSeenDone';
+  function watch() {
+    if (window[SEEN] !== undefined || !window.MutationObserver || !document.body) return;
+    window[SEEN] = false;
+    var due = null;
+    var mo = new MutationObserver(function () {
+      if (due) return;
+      due = setTimeout(function () {
+        due = null;
+        if (DONE.test(document.body.innerText || '')) { window[SEEN] = true; mo.disconnect(); }
+      }, 100);
+    });
+    mo.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true });
+  }
 
   // Same rule as the HTML resolver: the done wording only counts once something has
   // been pressed, or when there is nothing left to press.
+  if (window[SEEN] === true) return 'done';
   if (DONE.test(text) && (SUBMITTED || controls.length === 0)) return 'done';
 
   [].slice.call(document.querySelectorAll('input[type=email], input[type=text]'))
@@ -89,6 +157,8 @@ DRIVER_JS = r"""
 
   if (!controls.length) return 'nothing';
   var chosen = label(controls[0]).slice(0, 60);
+  remember(controls[0]);
+  watch();
   controls[0].click();
   return 'clicked:' + chosen;
 })()
@@ -96,7 +166,7 @@ DRIVER_JS = r"""
 
 _LOAD_SETTLE = 1.2      # seconds after didFinish before the scripts have drawn the page
 _AFTER_CLICK = 2.5      # seconds after a click, for the XHR or the navigation it kicked off
-_MAX_ROUNDS = 4
+_MAX_ROUNDS = 6        # opt out, save, "are you sure?", then read the result
 _TOTAL_BUDGET = 30.0
 
 _host_ok_memo = {}
@@ -203,7 +273,7 @@ def _drive_in_helper(url, email):
         return out
 
 
-def _helper_main(url, email):
+def _helper_main(url, email, html=None):
     """Entry point of the helper process: bring up an AppKit loop that shows nothing,
     drive the page on a worker thread, print the result, exit."""
     from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
@@ -216,7 +286,7 @@ def _helper_main(url, email):
                 break
             _sleep(0.05)
         try:
-            res = _drive_here(url, email)
+            res = _drive_here(url, email, html=html)
         except Exception as e:
             res = {"ok": False, "confirmed": False, "steps": [], "error": str(e)}
         sys.stdout.write(json.dumps(res) + "\n")
@@ -227,7 +297,9 @@ def _helper_main(url, email):
     app.run()
 
 
-def _drive_here(url, email=None):
+def _drive_here(url, email=None, html=None):
+    """html, when given, is loaded in place of url with no network: the tests drive
+    the script against fixture pages this way."""
     out = {"ok": False, "confirmed": False, "steps": [], "error": None}
     if not _loop_running():
         out["error"] = "no AppKit run loop"
@@ -291,7 +363,10 @@ def _drive_here(url, email=None):
         wv = WKWebView.alloc().initWithFrame_configuration_(NSMakeRect(0, 0, 1024, 768), cfg)
         wv.setNavigationDelegate_(nav)
         state["webview"] = wv
-        wv.loadRequest_(NSURLRequest.requestWithURL_(NSURL.URLWithString_(url)))
+        if html is not None:
+            wv.loadHTMLString_baseURL_(html, None)
+        else:
+            wv.loadRequest_(NSURLRequest.requestWithURL_(NSURL.URLWithString_(url)))
 
     nav = _Nav.alloc().init()
     deadline = threading.Event()
@@ -300,9 +375,10 @@ def _drive_here(url, email=None):
     timer.start()
     try:
         on_main(build)
-        if not state["loaded"].wait(timeout=12):
-            out["error"] = "page never loaded"
-            return out
+        # didFinish waits for every subresource, and one stalled tracker holds it
+        # back long after the page itself drew. So a slow finish is not a failure:
+        # go on and let the script judge what is in the document.
+        state["loaded"].wait(timeout=12)
         if state["error"]:
             out["error"] = state["error"]
             return out
@@ -393,8 +469,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Drive an unsubscribe page in a WebKit engine.")
     ap.add_argument("--drive", nargs=2, metavar=("URL", "EMAIL"),
                     help="load URL, press through the opt-out, print one JSON line")
+    ap.add_argument("--drive-html", metavar="FILE",
+                    help="the same walk over a local HTML file, for the tests")
     args = ap.parse_args()
-    if args.drive:
+    if args.drive_html:
+        with open(args.drive_html, encoding="utf-8") as fh:
+            _helper_main("about:blank", None, html=fh.read())
+    elif args.drive:
         _helper_main(args.drive[0], args.drive[1] or None)
     else:
         ap.print_help()

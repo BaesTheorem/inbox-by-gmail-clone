@@ -1,16 +1,26 @@
 """Unsubscribe ladder rules: the SSRF guard's scheme handling, the scripted-page
 detector, and the resolver's refusal to believe static wording on a page whose
 opt-out runs in a script. Fixtures are synthetic, shaped like the pages that
-calibrated them (a click tracker that 302s to a FullRail-style page)."""
+calibrated them (a click tracker that 302s to a FullRail-style page).
 
+The WebKit driver's script is run for real, in the helper process, against the
+pages in tests/fixtures (shaped like Alibaba's preference page, whose controls are
+bare divs). Those tests skip where no interpreter can import WebKit."""
+
+import json
 import os
+import re
 import socket
+import subprocess
 import sys
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app  # noqa: E402
+import unsub_webdriver  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PUBLIC = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
 PRIVATE = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 443))]
@@ -124,3 +134,44 @@ class LiveOneClickTarget(unittest.TestCase):
              mock.patch.object(app.requests.Session, "get", side_effect=hops):
             self.assertIsNone(app._live_one_click_target("https://shop.example.com/unsubscribe?d=1",
                                                          "https://mail.example.com/_t/c/abc"))
+
+
+def _drive_fixture(name):
+    cmd = unsub_webdriver._helper()
+    if not cmd:
+        raise unittest.SkipTest("no interpreter with WebKit")
+    r = subprocess.run(cmd + ["--drive-html", os.path.join(ROOT, "tests", "fixtures", name)],
+                       capture_output=True, text=True, timeout=90, check=False)
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+class WebKitDriver(unittest.TestCase):
+    def test_bare_div_controls_pressed_in_order(self):
+        # Opt out, save (greyed out until the opt-out is pressed), confirm the dialog,
+        # then catch a result message that is gone before the next round.
+        res = _drive_fixture("unsub_div_controls.html")
+        self.assertEqual(res["steps"], ["js:clicked:Unsubscribe from all",
+                                        "js:clicked:Save preferences",
+                                        "js:clicked:Unsubscribe", "js:confirmed"])
+        self.assertTrue(res["ok"] and res["confirmed"])
+
+    def test_heading_and_checkbox_label_are_not_buttons(self):
+        res = _drive_fixture("unsub_label_not_button.html")
+        self.assertEqual(res["steps"], ["js:nothing"])
+        self.assertFalse(res["ok"])
+
+
+class DriverScriptParity(unittest.TestCase):
+    """The Android app runs the same script. (The iOS app lives in its own repo.)"""
+
+    def test_android_copy_matches(self):
+        kt = os.path.join(ROOT, "android", "app", "src", "main", "java", "com",
+                          "baestheorem", "inbox", "data", "UnsubWebDriver.kt")
+        with open(kt, encoding="utf-8") as fh:
+            m = re.search(r'const val DRIVER_JS = """(.*?)"""', fh.read(), re.DOTALL)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), unsub_webdriver.DRIVER_JS)
+
+    def test_script_survives_a_kotlin_raw_string(self):
+        # "$" starts a template in a Kotlin raw string.
+        self.assertNotIn("$", unsub_webdriver.DRIVER_JS)

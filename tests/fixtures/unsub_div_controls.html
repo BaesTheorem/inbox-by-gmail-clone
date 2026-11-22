@@ -1,0 +1,44 @@
+<!doctype html>
+<!-- A preference page in the style of a component kit: every control is a div with a
+     click handler. Three presses finish it: opt out, save, then the "are you sure?"
+     dialog. The result message then shows for 0.6 s only. -->
+<html><body>
+<h1>Email preferences</h1>
+<p>After you have unsubscribed, please allow up to seven days for changes to take effect.</p>
+<div id="root">
+  <div class="sw" id="sw">All marketing emails: <span id="state">on</span></div>
+  <div class="link" id="all" style="cursor:pointer">Unsubscribe from all</div>
+  <div class="wrap"><div class="btn btn--disable" id="save" style="cursor:pointer">Save preferences</div></div>
+  <div id="dialog" style="display:none">
+    <div>Are you sure?</div>
+    <div id="back" style="cursor:pointer">Go back</div>
+    <div id="yes" style="cursor:pointer"><span>Unsubscribe</span></div>
+  </div>
+  <div id="result"></div>
+  <div id="log"></div>
+</div>
+<a href="https://example.com/unsubscribe-everything">Unsubscribe from other lists</a>
+<script>
+  var log = [];
+  function note(s) { log.push(s); document.getElementById('log').textContent = log.join(','); }
+  var off = false, save = document.getElementById('save');
+  document.getElementById('all').onclick = function () {
+    off = true; note('all');
+    document.getElementById('state').textContent = 'off';
+    save.className = 'btn';
+  };
+  save.onclick = function () {
+    if (!off) { note('save-while-disabled'); return; }
+    note('save'); document.getElementById('dialog').style.display = 'block';
+  };
+  document.getElementById('back').onclick = function () { note('back'); };
+  document.getElementById('yes').onclick = function () {
+    note('yes');
+    document.getElementById('dialog').style.display = 'none';
+    // The result is a toast: gone again before the driver's next round reads the page.
+    var result = document.getElementById('result');
+    result.textContent = 'Your email preferences have been updated successfully.';
+    setTimeout(function () { result.textContent = ''; }, 600);
+  };
+</script>
+</body></html>
