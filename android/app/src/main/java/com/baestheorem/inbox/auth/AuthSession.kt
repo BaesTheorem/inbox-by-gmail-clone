@@ -84,7 +84,11 @@ object AuthSession {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (isActive) _state.value = State.Failed(e.message ?: "Sign-in failed.")
+                if (isActive) {
+                    _state.value = State.Failed(e.message ?: "Sign-in failed.")
+                    // The reason is on the wizard, not in the tab, so show the wizard.
+                    bringAppForward(app)
+                }
             } finally {
                 session = null
             }
