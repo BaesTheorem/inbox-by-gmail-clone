@@ -6,6 +6,10 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.baestheorem.inbox.gmail.Recipient
+import com.baestheorem.inbox.gmail.ReplyPresets
+import com.baestheorem.inbox.gmail.ReplyRecipients
+import com.baestheorem.inbox.gmail.computeReplyPresets
 import com.baestheorem.inbox.gmail.AuthExpiredException
 import com.baestheorem.inbox.gmail.Bundles
 import com.baestheorem.inbox.gmail.BundleGroup
@@ -646,6 +650,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
                     to = headerValue(headers, "To"),
                     cc = headerValue(headers, "Cc"),
                     bcc = headerValue(headers, "Bcc"),
+                    replyTo = headerValue(headers, "Reply-To"),
                     date = com.baestheorem.inbox.gmail.formatTime(ts),
                     details = com.baestheorem.inbox.gmail.messageDetails(headers, ts),
                     text = body.text,
@@ -678,39 +683,25 @@ class MailStore(app: Application) : AndroidViewModel(app) {
         return ParsedThread(detail, bodyHit)
     }
 
-    /**
-     * Never address a reply to yourself: pick the newest message from the other
-     * side; reply-all folds in everyone else on that message minus you.
-     */
-    fun replyRecipients(d: ThreadDetail, all: Boolean): Pair<String, String> {
-        val me = userEmail.value.lowercase()
-        val last = d.messages.lastOrNull { it.senderEmail.lowercase() != me }
-            ?: d.messages.lastOrNull()
-            ?: return "" to ""
-        val to = last.senderEmail
-        if (!all) return to to ""
-        val ccList = mutableListOf<String>()
-        for (raw in (last.to + "," + last.cc).split(",")) {
-            val addr = parseAddr(raw).email
-            val low = addr.lowercase()
-            if (addr.isNotEmpty() && low != me && low != to.lowercase() &&
-                ccList.none { it.lowercase() == low }
-            ) ccList.add(addr)
-        }
-        return to to ccList.joinToString(", ")
+    /** The Reply and Reply-all presets for the newest message (rules in ReplyRecipients.kt). */
+    fun replyPresets(d: ThreadDetail): ReplyPresets {
+        val last = d.messages.lastOrNull() ?: return ReplyPresets()
+        return computeReplyPresets(
+            from = if (last.senderEmail.isEmpty()) "" else "${last.sender} <${last.senderEmail}>",
+            replyTo = last.replyTo, to = last.to, cc = last.cc, me = userEmail.value,
+        )
     }
 
-    fun replyAllAvailable(d: ThreadDetail): Boolean = replyRecipients(d, true).second.isNotEmpty()
-
-    suspend fun sendReply(detail: ThreadDetail, body: String, replyAll: Boolean) {
-        val (to, cc) = replyRecipients(detail, replyAll)
-        if (to.isEmpty()) throw GmailException(0, "no recipient")
+    suspend fun sendReply(detail: ThreadDetail, body: String, recipients: ReplyRecipients) {
+        if (recipients.isEmpty) throw GmailException(0, "no recipient")
+        fun join(l: List<Recipient>) = l.joinToString(", ") { it.email }
         val subj = if (detail.subject.lowercase().startsWith("re:")) detail.subject
         else "Re: " + detail.subject
         val raw = buildRawMessage(
-            to = to, cc = cc.ifEmpty { null }, subject = subj, body = body,
+            to = join(recipients.to), cc = join(recipients.cc).ifEmpty { null }, subject = subj, body = body,
             fromName = displayName.value, fromEmail = userEmail.value,
             inReplyTo = detail.rfcMessageId, references = detail.allRfcIds.joinToString(" "),
+            bcc = join(recipients.bcc).ifEmpty { null },
         )
         GmailClient.send(raw, detail.id)
     }

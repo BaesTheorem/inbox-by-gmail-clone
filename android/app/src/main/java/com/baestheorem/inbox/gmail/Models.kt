@@ -151,6 +151,7 @@ data class MessageDetail(
     val to: String,
     val cc: String,
     val bcc: String,
+    val replyTo: String,
     val date: String,
     val details: List<DetailRow>,
     val text: String,

@@ -60,6 +60,9 @@ import com.baestheorem.inbox.gmail.ATTACH_HOST
 import com.baestheorem.inbox.gmail.ORIGINAL_HOST
 import com.baestheorem.inbox.gmail.CID_HOST
 import com.baestheorem.inbox.gmail.GmailClient
+import com.baestheorem.inbox.gmail.Recipient
+import com.baestheorem.inbox.gmail.ReplyPresets
+import com.baestheorem.inbox.gmail.ReplyRecipients
 import com.baestheorem.inbox.gmail.ThreadDetail
 import com.baestheorem.inbox.gmail.ThreadSummary
 import com.baestheorem.inbox.gmail.UnsubInfo
@@ -85,7 +88,9 @@ fun ThreadScreen(
     var detail by remember(threadId) { mutableStateOf<ThreadDetail?>(null) }
     var pinned by remember(threadId) { mutableStateOf(false) }
     var replyText by remember(threadId) { mutableStateOf("") }
-    var replyAll by remember(threadId) { mutableStateOf(false) }
+    var recipients by remember(threadId) { mutableStateOf(ReplyRecipients()) }
+    var presets by remember(threadId) { mutableStateOf(ReplyPresets()) }
+    var showRecipients by remember { mutableStateOf(false) }
     var sending by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     var confirmUnsub by remember { mutableStateOf(false) }
@@ -96,6 +101,8 @@ fun ThreadScreen(
             val d = store.loadThread(threadId)
             detail = d
             pinned = d.pinned
+            presets = store.replyPresets(d)
+            recipients = presets.reply
         } catch (e: IOException) {
             store.showSnack("Couldn't load thread (${store.shortError(e)})")
             onClose()
@@ -184,19 +191,18 @@ fun ThreadScreen(
             d.unsub?.let { u -> UnsubBanner(d, u) { confirmUnsub = true } }
             Box(Modifier.weight(1f)) { ThreadWebView(store, d) { originalId = it } }
             ReplyBar(
-                store = store,
-                detail = d,
                 text = replyText,
                 onText = { replyText = it },
-                replyAll = replyAll,
-                onToggleReplyAll = { replyAll = !replyAll },
+                recipients = recipients,
+                presets = presets,
+                onRecipients = { showRecipients = true },
                 sending = sending,
                 onSend = {
                     val body = replyText
                     sending = true
                     scope.launch {
                         try {
-                            store.sendReply(d, body, replyAll)
+                            store.sendReply(d, body, recipients)
                             replyText = ""
                             store.showSnack("Sent")
                         } catch (e: IOException) {
@@ -210,6 +216,9 @@ fun ThreadScreen(
     }
 
     originalId?.let { OriginalDialog(store, it) { originalId = null } }
+    if (showRecipients) {
+        ReplyRecipientsSheet(recipients, presets, onChange = { recipients = it }) { showRecipients = false }
+    }
 
     if (confirmUnsub && detail?.unsub != null) {
         val d = detail!!
@@ -286,34 +295,49 @@ private fun UnsubBanner(d: ThreadDetail, u: UnsubInfo, onAct: () -> Unit) {
     }
 }
 
-/** Bordered editor plus the 44dp blue send square. */
+/** Recipients line, then the bordered editor plus the 44dp blue send square. */
 @Composable
 private fun ReplyBar(
-    store: MailStore,
-    detail: ThreadDetail,
     text: String,
     onText: (String) -> Unit,
-    replyAll: Boolean,
-    onToggleReplyAll: () -> Unit,
+    recipients: ReplyRecipients,
+    presets: ReplyPresets,
+    onRecipients: () -> Unit,
     sending: Boolean,
     onSend: () -> Unit,
 ) {
-    val canSend = text.isNotBlank() && !sending
+    val canSend = text.isNotBlank() && !recipients.isEmpty && !sending
+    // "To Ann, Bob · Cc Cy": who the reply goes to. A tap opens the editor.
+    fun names(l: List<Recipient>) = l.joinToString(", ") { it.name.substringBefore(' ') }
+    val parts = buildList {
+        if (recipients.to.isNotEmpty()) add("To " + names(recipients.to))
+        if (recipients.cc.isNotEmpty()) add("Cc " + names(recipients.cc))
+        if (recipients.bcc.isNotEmpty()) add("Bcc " + names(recipients.bcc))
+    }
+    val all = presets.allDiffers && recipients.matches(presets.all)
     Column(Modifier.background(Theme.cardBg).imePadding().navigationBarsPadding()) {
         Box(Modifier.fillMaxWidth().height(1.dp).background(Theme.divider))
         Row(
-            Modifier.fillMaxWidth().padding(12.dp),
+            Modifier.fillMaxWidth().height(36.dp)
+                .clickable(onClickLabel = "Reply recipients", onClick = onRecipients)
+                .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            MIcon(if (all) "reply_all" else "reply", size = 18)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                if (parts.isEmpty()) "Add a recipient" else parts.joinToString(" · "),
+                style = robotoStyle(13),
+                color = if (parts.isEmpty()) Color(0xFFD93025) else Theme.textSecondary,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            MIcon("expand_more", size = 18)
+        }
+        Row(
+            Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
-            if (store.replyAllAvailable(detail)) {
-                Box(
-                    Modifier.size(width = 36.dp, height = 44.dp).clickable(onClick = onToggleReplyAll),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    MIcon("people", size = 20, color = if (replyAll) Theme.blue else Theme.textSecondary)
-                }
-                Spacer(Modifier.width(8.dp))
-            }
             Box(
                 Modifier
                     .weight(1f)
@@ -330,7 +354,7 @@ private fun ReplyBar(
                 )
                 if (text.isEmpty()) {
                     Text(
-                        if (replyAll) "Reply all…" else "Reply…",
+                        "Reply…",
                         style = robotoStyle(14),
                         color = Theme.textFaint,
                     )

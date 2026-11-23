@@ -86,7 +86,9 @@ Press **Publish app** on the console's Audience page and it stops happening.
   date, subject, mailed-by, signed-by and security rows. "Show original" opens
   the raw source with a Share button. `messageDetails` in `Bundling.kt` is the
   port of `message_details`.
-- Reply and reply-all (never addressed to yourself), compose, threaded with
+- Reply with the recipients you choose: the line above the reply box shows To, Cc
+  and Bcc, and a tap opens an editor (Reply and Reply-all presets, remove, add, move
+  between fields). You are never a recipient. Compose, threaded with
   In-Reply-To/References, sent as your display name
 - Snoozed / Done / Sent views, Gmail-syntax search, pull to refresh, infinite
   scroll, the pinned-only app-bar switch, undo snackbar

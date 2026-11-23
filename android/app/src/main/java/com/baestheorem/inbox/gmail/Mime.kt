@@ -182,10 +182,12 @@ fun buildRawMessage(
     fromEmail: String,
     inReplyTo: String?,
     references: String?,
+    bcc: String? = null,
 ): String {
     val lines = mutableListOf<String>()
-    lines.add("To: $to")
+    if (to.isNotEmpty()) lines.add("To: $to") // a reply can go to Cc or Bcc only
     if (!cc.isNullOrEmpty()) lines.add("Cc: $cc")
+    if (!bcc.isNullOrEmpty()) lines.add("Bcc: $bcc") // Gmail strips it from the delivered copy
     if (fromEmail.isNotEmpty()) lines.add("From: ${formatFromAddr(fromName, fromEmail)}")
     lines.add("Subject: ${encodeHeaderText(subject)}")
     if (!inReplyTo.isNullOrEmpty()) {
