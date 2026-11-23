@@ -88,7 +88,8 @@ Press **Publish app** on the console's Audience page and it stops happening.
   port of `message_details`.
 - Reply with the recipients you choose: the line above the reply box shows To, Cc
   and Bcc, and a tap opens an editor (Reply and Reply-all presets, remove, add, move
-  between fields). You are never a recipient. Compose, threaded with
+  between fields). You are never a recipient. The reply carries the message it answers
+  below your text as a plain-text quote. Compose, threaded with
   In-Reply-To/References, sent as your display name
 - Snoozed / Done / Sent views, Gmail-syntax search, pull to refresh, infinite
   scroll, the pinned-only app-bar switch, undo snackbar

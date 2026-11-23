@@ -56,4 +56,10 @@ class ReplyRecipientsTest {
         assertFalse(isEmailAddress("notanaddress"))
         assertFalse(isEmailAddress("a b@c.d"))
     }
+
+    @Test fun replyCarriesTheAnsweredMessageAsAQuote() {
+        val t = quotedReplyText("ok", "Ann Lee", "ann@x.com", "Nov 23, 2026, 2:05 PM", "hi\r\nthere\n")
+        assertEquals("ok\n\nOn Nov 23, 2026, 2:05 PM, Ann Lee <ann@x.com> wrote:\n> hi\n> there", t)
+        assertEquals("ok\n\nann@x.com wrote:\n> hi", quotedReplyText("ok", "ann@x.com", "ann@x.com", "", "hi"))
+    }
 }

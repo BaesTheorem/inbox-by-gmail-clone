@@ -1368,6 +1368,9 @@ async function sendReply() {
   fd.append("threadId", r.dataset.tid);
   fd.append("inReplyTo", r.dataset.rfc);
   fd.append("references", r.dataset.rfcChain || "");
+  // The server puts this message below the reply as the quoted text.
+  const tm = (STATE.threadCache[r.dataset.tid] || {}).messages || [];
+  if (tm.length) fd.append("quoteMessageId", tm[tm.length - 1].id);
   if (r.dataset.alias && $("#replyViaAliasChk").checked) fd.append("viaAlias", r.dataset.alias);
   if (STATE.replyDraftId) fd.append("draftId", STATE.replyDraftId); // server deletes the autosaved draft on send
   (STATE.replyAttachments || []).forEach((f) => fd.append("attachments", f, f.name));

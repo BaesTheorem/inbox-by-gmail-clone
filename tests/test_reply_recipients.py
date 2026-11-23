@@ -67,3 +67,20 @@ def test_dotted_and_tagged_forms_of_my_gmail_address_are_me():
     assert emails(r["all"]["cc"]) == ["bob@x.com"]
     r = app.reply_recipients(H(From="m.e@gmail.com", To="ann@x.com"), ME)
     assert emails(r["reply"]["to"]) == ["ann@x.com"]
+
+
+def test_reply_quote_is_gmail_markup_and_the_reader_folds_it():
+    hdr = H(From="Ann Lee <ann@x.com>", Date="Mon, 23 Nov 2026 20:05:00 +0000")
+    q_text, q_html = app.reply_quote(hdr, "hi\nthere", "<html><head><style>p{}</style></head><body><p>hi</p><script>x()</script></body></html>")
+    assert "Ann Lee <ann@x.com> wrote:" in q_text and "> hi\n> there" in q_text
+    assert "On " in q_text and "2026" in q_text
+    assert 'class="gmail_quote"' in q_html and "<p>hi</p>" in q_html
+    assert "<script" not in q_html and "<head" not in q_html and "Ann Lee &lt;ann@x.com&gt;" in q_html
+    visible, quoted = app.split_quoted_html("<div>my answer</div>" + q_html)
+    assert "my answer" in visible and "<p>hi</p>" not in visible and "<p>hi</p>" in quoted
+
+
+def test_reply_quote_of_a_plain_text_message():
+    q_text, q_html = app.reply_quote(H(From="ann@x.com"), "a < b", "")
+    assert q_text.strip().startswith("ann@x.com wrote:") and "> a < b" in q_text
+    assert "a &lt; b" in q_html

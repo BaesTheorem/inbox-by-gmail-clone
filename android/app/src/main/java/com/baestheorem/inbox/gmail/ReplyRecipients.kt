@@ -135,3 +135,15 @@ fun computeReplyPresets(from: String, replyTo: String, to: String, cc: String, m
     }
     return ReplyPresets(ReplyRecipients(to = primary), ReplyRecipients(to = primary, cc = others))
 }
+
+/**
+ * The reply text with the answered message below it as a quote ("On …, X wrote:" and
+ * "> " lines), as Gmail does. A person added to the recipients can then read what the
+ * reply is about. The phone sends plain text, so the quote is plain text.
+ */
+fun quotedReplyText(body: String, sender: String, email: String, date: String, text: String): String {
+    val who = if (sender.isEmpty() || sender == email) email else "$sender <$email>"
+    val attr = if (date.isEmpty()) "$who wrote:" else "On $date, $who wrote:"
+    val lines = text.replace("\r\n", "\n").trim().split("\n").joinToString("\n") { "> $it" }
+    return "$body\n\n$attr\n$lines"
+}

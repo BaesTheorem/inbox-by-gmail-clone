@@ -1554,6 +1554,55 @@ def reply_recipients(headers, me, also_me=()):
     return {"reply": {"to": primary, "cc": []}, "all": {"to": primary, "cc": others}}
 
 
+_QUOTE_STYLE = "margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex"
+
+
+def reply_quote(headers, text, html):
+    """The message a reply answers, as the quote that goes below the new text.
+    Returns (plain, html). The markup is Gmail's (div.gmail_quote + blockquote), so
+    Gmail and this app's reader fold it behind the "show quoted text" control."""
+    name, addr = _parse_addr(_header(headers, "From"))
+    who = name if name == addr or not addr else "%s <%s>" % (name, addr)
+    when = ""
+    try:
+        dt = parsedate_to_datetime(_header(headers, "Date"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        when = dt.astimezone().strftime("%a, %b %-d, %Y at %-I:%M %p")
+    except Exception:
+        pass
+    attr = ("On %s, %s wrote:" % (when, who)) if when else "%s wrote:" % who
+    if html:
+        # Keep the body's content only: a second <html>/<head> inside a message breaks
+        # some clients, and a script has no business in a quote.
+        body = re.search(r"<body[^>]*>(.*)</body>", html, re.I | re.S)
+        inner = body.group(1) if body else re.sub(r"</?(html|head|body)[^>]*>|<!doctype[^>]*>", "", html, flags=re.I)
+        inner = re.sub(r"<script\b.*?</script>", "", inner, flags=re.I | re.S)
+    else:
+        inner = _htmlmod.escape(text or "").replace("\r\n", "\n").replace("\n", "<br>")
+    plain = text or _htmlmod.unescape(re.sub(r"<[^>]+>", " ", html or ""))
+    q_text = "\n\n%s\n%s" % (attr, "\n".join("> " + ln for ln in plain.replace("\r\n", "\n").split("\n")))
+    q_html = ('<br><div class="gmail_quote"><div dir="ltr" class="gmail_attr">%s<br></div>'
+              '<blockquote class="gmail_quote" style="%s">%s</blockquote></div>'
+              % (_htmlmod.escape(attr), _QUOTE_STYLE, inner))
+    return q_text, q_html
+
+
+def _add_reply_quote(message_id, body_text, body_html):
+    """Append the quote of `message_id` to a reply. A failed fetch must not stop the
+    send, so the reply then goes out without the quote."""
+    try:
+        m = gget(f"/messages/{message_id}", format="full")
+        text, html = _decode_body(m.get("payload", {}))
+        q_text, q_html = reply_quote(m.get("payload", {}).get("headers", []), text, html)
+    except Exception:
+        log.warning("could not quote message %s in the reply", message_id)
+        return body_text, body_html
+    if not body_html:
+        body_html = _htmlmod.escape(body_text or "").replace("\n", "<br>")
+    return (body_text or "") + q_text, body_html + q_html
+
+
 def _build_raw_message(to, subject, body, cc=None, bcc=None, in_reply_to=None,
                        references=None, body_html=None, attachments=None):
     """Build an RFC 2822 message and return its base64url-encoded form.
@@ -2865,6 +2914,7 @@ def api_send():
         draft_id = f.get("draftId") or None
         send_at = f.get("sendAt") or None
         via_alias = f.get("viaAlias") or None
+        quote_id = f.get("quoteMessageId") or None
         attachments = [(fl.filename, fl.mimetype, fl.read()) for fl in request.files.getlist("attachments")]
     else:
         d = request.json or {}
@@ -2876,6 +2926,7 @@ def api_send():
         draft_id, attachments = d.get("draftId"), []
         send_at = d.get("sendAt")
         via_alias = d.get("viaAlias")
+        quote_id = d.get("quoteMessageId")
     # Send through an alias: encode every recipient so addy relays it as the alias
     # and the contact never sees the real Gmail address.
     if via_alias:
@@ -2885,6 +2936,10 @@ def api_send():
         if bcc:
             bcc = _addy_encode_to(bcc, via_alias)
     try:
+        # A reply carries the message it answers below the new text, as Gmail does, so
+        # a person added to the recipients can read what the reply is about.
+        if quote_id:
+            body_text, body_html = _add_reply_quote(quote_id, body_text, body_html)
         raw = _build_raw_message(to, subject, body_text, cc=cc, bcc=bcc,
                                  in_reply_to=in_reply_to, references=references,
                                  body_html=body_html, attachments=attachments)

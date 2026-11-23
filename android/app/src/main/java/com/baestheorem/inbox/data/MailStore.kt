@@ -10,6 +10,7 @@ import com.baestheorem.inbox.gmail.Recipient
 import com.baestheorem.inbox.gmail.ReplyPresets
 import com.baestheorem.inbox.gmail.ReplyRecipients
 import com.baestheorem.inbox.gmail.computeReplyPresets
+import com.baestheorem.inbox.gmail.quotedReplyText
 import com.baestheorem.inbox.gmail.AuthExpiredException
 import com.baestheorem.inbox.gmail.Bundles
 import com.baestheorem.inbox.gmail.BundleGroup
@@ -697,8 +698,14 @@ class MailStore(app: Application) : AndroidViewModel(app) {
         fun join(l: List<Recipient>) = l.joinToString(", ") { it.email }
         val subj = if (detail.subject.lowercase().startsWith("re:")) detail.subject
         else "Re: " + detail.subject
+        val last = detail.messages.lastOrNull()
+        val quoted = if (last == null) body else quotedReplyText(
+            body = body, sender = last.sender, email = last.senderEmail,
+            date = last.details.firstOrNull { it.label == "date" }?.value ?: last.date,
+            text = last.text.ifEmpty { com.baestheorem.inbox.gmail.stripTags(last.html + (last.quotedHtml ?: "")) },
+        )
         val raw = buildRawMessage(
-            to = join(recipients.to), cc = join(recipients.cc).ifEmpty { null }, subject = subj, body = body,
+            to = join(recipients.to), cc = join(recipients.cc).ifEmpty { null }, subject = subj, body = quoted,
             fromName = displayName.value, fromEmail = userEmail.value,
             inReplyTo = detail.rfcMessageId, references = detail.allRfcIds.joinToString(" "),
             bcc = join(recipients.bcc).ifEmpty { null },
