@@ -1387,7 +1387,8 @@ def fetch_thread(thread_id):
     unsub_mid = None
     muted = False
     alias = None  # the addy alias this thread arrived to, if any (for reply-via-alias)
-    draft_msg = None  # (message_id, html) of an unsent reply draft living in this thread
+    draft_msg = None  # (message_id, html, files, recipients) of an unsent reply draft in this thread
+    last_headers = []  # headers of the newest real message: the one a reply answers
     for m in thread.get("messages", []):
         # An autosaved reply rides in the thread as a DRAFT message — don't render it as
         # a sent bubble; capture it so the reader can restore it into the reply box.
@@ -1399,9 +1400,13 @@ def fetch_thread(thread_id):
                 dhtml = _htmlmod.escape(dtext).replace("\r\n", "\n").replace("\n", "<br>")
             datts = [{**a, "messageId": m.get("id")}
                      for a in _collect_attachments(m.get("payload", {}))]
-            draft_msg = (m.get("id"), dhtml, datts)
+            dh = m.get("payload", {}).get("headers", [])
+            draft_msg = (m.get("id"), dhtml, datts,
+                         {k: _addr_list(_header(dh, h))
+                          for k, h in (("to", "To"), ("cc", "Cc"), ("bcc", "Bcc"))})
             continue
         headers = m.get("payload", {}).get("headers", [])
+        last_headers = headers
         name, email_addr = _parse_addr(_header(headers, "From"))
         subject = subject or _header(headers, "Subject")
         text, html = _decode_body(m.get("payload", {}))
@@ -1446,7 +1451,7 @@ def fetch_thread(thread_id):
             for dr in gget("/drafts", maxResults=50).get("drafts", []):
                 if dr.get("message", {}).get("id") == draft_msg[0]:
                     reply_draft = {"draftId": dr["id"], "html": draft_msg[1],
-                                   "attachments": draft_msg[2]}
+                                   "attachments": draft_msg[2], **draft_msg[3]}
                     break
         except Exception:
             pass
@@ -1465,6 +1470,9 @@ def fetch_thread(thread_id):
         "unsubMessageId": unsub_mid,
         "alias": alias,
         "replyDraft": reply_draft,
+        # Reply and Reply-all presets; the reader shows them as editable chips.
+        "replyTargets": reply_recipients(last_headers, _user_email,
+                                         [alias["alias"]] if alias else []),
     }
 
 
@@ -1496,13 +1504,64 @@ def mark_read(thread_id):
         pass
 
 
+def _addr_list(*values):
+    """Header values -> [{"name", "email"}], in order, one entry per address.
+    getaddresses reads quoted names that hold a comma ("Doe, Jane" <j@x.com>)."""
+    out, seen = [], set()
+    for name, addr in getaddresses([v for v in values if v]):
+        addr = addr.strip()
+        if "@" not in addr or addr.lower() in seen:
+            continue
+        seen.add(addr.lower())
+        out.append({"name": name.strip() or addr, "email": addr})
+    return out
+
+
+def _mailbox_key(addr):
+    """One key per mailbox. Gmail ignores dots and a +tag in the local part, so
+    a.b+x@gmail.com and ab@gmail.com are the same inbox."""
+    local, _, domain = (addr or "").strip().lower().rpartition("@")
+    if domain in ("gmail.com", "googlemail.com"):
+        local, domain = local.split("+", 1)[0].replace(".", ""), "gmail.com"
+    return local + "@" + domain
+
+
+def reply_recipients(headers, me, also_me=()):
+    """The two recipient presets for a reply to the message with these headers.
+
+    Returns {"reply": {"to", "cc"}, "all": {"to", "cc"}}, each a list of
+    {"name", "email"}. The rules are Gmail's:
+    - Reply goes to Reply-To when the sender set one, otherwise to From.
+    - Reply all adds the other To and Cc addresses as Cc.
+    - A reply to a message I sent goes to the people I sent it to (To stays To,
+      Cc stays Cc). A reply to its From would go to me and to no other person.
+    - My own addresses (the account, its dotted and +tag forms, and the alias
+      the thread arrived to) are never recipients.
+    """
+    mine = {_mailbox_key(a) for a in (me, *also_me) if a}
+    not_me = lambda lst: [a for a in lst if _mailbox_key(a["email"]) not in mine]  # noqa: E731
+    sender = _addr_list(_header(headers, "From"))
+    to, cc = not_me(_addr_list(_header(headers, "To"))), not_me(_addr_list(_header(headers, "Cc")))
+    from_me = bool(sender) and _mailbox_key(sender[0]["email"]) in mine
+    if from_me:
+        return {"reply": {"to": to or cc, "cc": []},
+                "all": {"to": to or cc, "cc": cc if to else []}}
+    primary = not_me(_addr_list(_header(headers, "Reply-To"))) or not_me(sender)
+    taken = {a["email"].lower() for a in primary}
+    others = [a for a in to + cc if a["email"].lower() not in taken]
+    if not primary:  # no usable sender: the other recipients are all that is left
+        return {"reply": {"to": others[:1], "cc": []}, "all": {"to": others, "cc": []}}
+    return {"reply": {"to": primary, "cc": []}, "all": {"to": primary, "cc": others}}
+
+
 def _build_raw_message(to, subject, body, cc=None, bcc=None, in_reply_to=None,
                        references=None, body_html=None, attachments=None):
     """Build an RFC 2822 message and return its base64url-encoded form.
     Shared by the immediate-send path and the Deferred Action Engine (send-later /
     undo-send), so message content is captured at the moment the user hit Send."""
     msg = EmailMessage()
-    msg["To"] = to
+    if to:                          # a reply can go to Cc or Bcc only
+        msg["To"] = to
     if cc:
         msg["Cc"] = cc
     if bcc:

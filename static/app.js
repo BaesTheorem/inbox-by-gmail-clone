@@ -985,6 +985,8 @@ async function openThread(tid) {
   $("#replyBox").innerHTML = "";
   STATE.replyAttachments = [];
   renderChips("replyAttachments", "#rAttachments");
+  STATE.replyTargets = null;
+  setReplyRcpt({});
   reader.hidden = false;
   const t = await api("/api/thread/" + tid);
   STATE.threadCache[tid] = t;
@@ -1020,26 +1022,12 @@ async function openThread(tid) {
     $("#replyViaAliasChk").checked = false;
     aliasWrap.hidden = true;
   }
-  // Reply vs Reply-all recipient sets (minus self)
-  const last = t.messages[t.messages.length - 1] || {};
-  const me = (STATE.email || "").toLowerCase();
-  const parseAddrs = (s) => (s || "").split(/,\s*/).map((a) => {
-    const m = a.match(/<([^>]+)>/); return (m ? m[1] : a).trim();
-  }).filter(Boolean);
-  // Normally reply to whoever sent the last message. But if that last message was
-  // one *I* sent (I'm the most recent writer in the thread), replying to its sender
-  // addresses the mail back to myself and the real correspondent never receives it,
-  // silently and with no bounce. In that case reply to whoever I last wrote to.
-  const lastFromMe = last.senderEmail && last.senderEmail.toLowerCase() === me;
-  const counterparties = [...parseAddrs(last.to), ...parseAddrs(last.cc)]
-    .filter((a) => a.toLowerCase() !== me);
-  reader.dataset.to = (lastFromMe ? counterparties[0] : last.senderEmail) || counterparties[0] || "";
-  const all = new Set([last.senderEmail, ...parseAddrs(last.to), ...parseAddrs(last.cc)]);
-  [...all].forEach((a) => { if (a && a.toLowerCase() === me) all.delete(a); });
-  all.delete("");
-  reader.dataset.toAll = [...all].join(", ");
-  // Show "Reply all" only when there's more than one other recipient
-  $("#replySendAll").hidden = all.size <= 1;
+  // Recipients: the server sends the Reply and Reply-all presets. A saved draft keeps
+  // the recipients it was saved with, so an edit made before a reload is not lost.
+  STATE.replyTargets = t.replyTargets || null;
+  const dr = t.replyDraft || {};
+  const drHas = ["to", "cc", "bcc"].some((f) => (dr[f] || []).length);
+  setReplyRcpt(drHas ? dr : (t.replyTargets || {}).reply || {});
   $("#readerMute").querySelector(".material-icons").textContent = t.muted ? "volume_up" : "volume_off";
   const body = $("#readerBody");
   body.innerHTML = "";
@@ -1168,14 +1156,158 @@ function handleSendResult(res) {
   return false;
 }
 
-async function sendReply(all) {
+// ---------- Reply recipients (To / Cc / Bcc chips) ----------
+// STATE.reply = { to, cc, bcc }, each a list of { name, email }. The two mode buttons
+// load a preset; after that every chip can be removed and any address added.
+const RCPT = { to: "#rTo", cc: "#rCc", bcc: "#rBcc" };
+const RCPT_ROW = { cc: "#rCcRow", bcc: "#rBccRow" };
+const EMAIL_RE = /^[^\s@<>,;"]+@[^\s@<>,;"]+\.[^\s@<>,;"]+$/;
+const rcptInput = (f) => $(RCPT[f]).querySelector("input");
+const rcptJoin = (list) => list.map((a) => a.email).join(", ");
+function setReplyRcpt(lists) {
+  STATE.reply = { to: [...(lists.to || [])], cc: [...(lists.cc || [])], bcc: [...(lists.bcc || [])] };
+  STATE.replyShow = {}; // rows the user opened with the Cc / Bcc buttons
+  Object.keys(RCPT).forEach((f) => { rcptInput(f).value = ""; rcptInput(f).classList.remove("bad"); });
+  renderReplyRcpt();
+}
+// Which preset the current recipients equal: "reply", "all", or null after a manual edit.
+function replyRcptMode() {
+  const T = STATE.replyTargets, R = STATE.reply;
+  if (!T || R.bcc.length) return null;
+  const key = (l) => l.map((a) => a.email.toLowerCase()).sort().join(",");
+  const same = (p) => key(p.to || []) === key(R.to) && key(p.cc || []) === key(R.cc);
+  return same(T.reply) ? "reply" : same(T.all) ? "all" : null;
+}
+function renderReplyRcpt() {
+  const R = STATE.reply;
+  Object.keys(RCPT).forEach((f) => {
+    const field = $(RCPT[f]), input = rcptInput(f);
+    field.querySelectorAll(".rcpt-chip").forEach((c) => c.remove());
+    R[f].forEach((a, i) => {
+      const chip = document.createElement("span");
+      chip.className = "rcpt-chip";
+      chip.title = a.email;
+      chip.innerHTML = `<span>${esc(a.name || a.email)}</span><button type="button" title="Remove ${esc(a.email)}"><i class="material-icons">close</i></button>`;
+      chip.querySelector("button").onmousedown = (e) => e.preventDefault(); // keep the input's focus
+      chip.querySelector("button").onclick = (e) => {
+        e.stopPropagation();
+        R[f].splice(i, 1); renderReplyRcpt(); scheduleReplyDraftSave(); input.focus();
+      };
+      field.insertBefore(chip, input);
+    });
+  });
+  ["cc", "bcc"].forEach((f) => {
+    const open = R[f].length > 0 || !!STATE.replyShow[f];
+    $(RCPT_ROW[f]).hidden = !open;
+    $(f === "cc" ? "#rCcToggle" : "#rBccToggle").hidden = open;
+  });
+  const T = STATE.replyTargets, mode = replyRcptMode();
+  // Reply all is offered only when it reaches a person that Reply does not.
+  const allDiffers = !!T && (T.all.cc.length > 0 || T.all.to.length !== T.reply.to.length);
+  $("#replyModeAll").hidden = !allDiffers;
+  $("#replyModeOne").classList.toggle("on", mode === "reply");
+  $("#replyModeAll").classList.toggle("on", mode === "all");
+}
+// Add one address to a field. An address lives in one field only, so an address typed
+// into Cc that is already in To moves to Cc.
+function addRcpt(f, a) {
+  const R = STATE.reply, k = a.email.toLowerCase();
+  Object.keys(RCPT).forEach((g) => { R[g] = R[g].filter((x) => x.email.toLowerCase() !== k); });
+  R[f].push({ name: a.name || a.email, email: a.email });
+}
+// Turn the typed text of a field into chips. Text that is not an address stays in the
+// input, marked red. Returns that text ("" when all of it became chips).
+function commitRcptInput(f) {
+  const input = rcptInput(f);
+  const rest = [];
+  let added = false;
+  input.value.split(/[,;\n]+/).map((p) => p.trim()).filter(Boolean).forEach((p) => {
+    const m = p.match(/^"?([^"<]*?)"?\s*<([^<>]+)>$/);
+    const email = (m ? m[2] : p).trim(), name = m ? m[1].trim() : "";
+    if (EMAIL_RE.test(email)) { addRcpt(f, { name, email }); added = true; }
+    else rest.push(p);
+  });
+  input.value = rest.join(", ");
+  input.classList.toggle("bad", rest.length > 0);
+  if (added) { renderReplyRcpt(); scheduleReplyDraftSave(); }
+  return input.value;
+}
+Object.keys(RCPT).forEach((f) => {
+  const field = $(RCPT[f]), input = rcptInput(f);
+  field.addEventListener("mousedown", (e) => { if (e.target === field) { e.preventDefault(); input.focus(); } });
+  input.addEventListener("input", () => {
+    input.classList.remove("bad");
+    clearTimeout(acTimer);
+    acTimer = setTimeout(() => runAutocomplete(input, {
+      anchor: field,
+      onPick: (c) => { input.value = ""; addRcpt(f, c); renderReplyRcpt(); scheduleReplyDraftSave(); input.focus(); },
+    }), 150);
+  });
+  input.addEventListener("keydown", (e) => {
+    const dd = $("#acDropdown");
+    const items = dd.hidden ? [] : [...dd.querySelectorAll(".ac-item")];
+    if (items.length && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      e.preventDefault();
+      const cur = items.findIndex((it) => it.classList.contains("sel"));
+      const next = (cur + (e.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+      items.forEach((it, i) => it.classList.toggle("sel", i === next));
+      items[next].scrollIntoView({ block: "nearest" });
+      return;
+    }
+    if (e.key === "Escape" && items.length) { e.stopPropagation(); dd.hidden = true; return; }
+    if (e.key === "Enter" || e.key === "," || e.key === ";" || (e.key === "Tab" && input.value.trim())) {
+      // A full address is taken as typed; a partial one takes the highlighted suggestion.
+      const typed = input.value.trim();
+      if (e.key !== "Tab" || typed) e.preventDefault();
+      clearTimeout(acTimer);
+      if (acCtl) acCtl.abort();
+      const sel = items.find((it) => it.classList.contains("sel"));
+      if (sel && !EMAIL_RE.test(typed) && e.key !== "," && e.key !== ";") sel.dispatchEvent(new MouseEvent("mousedown", { cancelable: true }));
+      else commitRcptInput(f);
+      dd.hidden = true;
+      return;
+    }
+    if (e.key === "Backspace" && !input.value && STATE.reply[f].length) {
+      STATE.reply[f].pop(); renderReplyRcpt(); scheduleReplyDraftSave();
+    }
+  });
+  input.addEventListener("paste", () => setTimeout(() => { if (/[,;\n]|@/.test(input.value)) commitRcptInput(f); }, 0));
+  input.addEventListener("blur", () => setTimeout(() => {
+    if (document.activeElement === input) return; // focus came back (a chip was removed)
+    $("#acDropdown").hidden = true;
+    commitRcptInput(f);
+  }, 150));
+});
+$("#rCcToggle").onclick = () => { STATE.replyShow.cc = true; renderReplyRcpt(); rcptInput("cc").focus(); };
+$("#rBccToggle").onclick = () => { STATE.replyShow.bcc = true; renderReplyRcpt(); rcptInput("bcc").focus(); };
+function loadReplyPreset(name) {
+  const T = STATE.replyTargets;
+  if (!T) return;
+  setReplyRcpt(T[name]);
+  scheduleReplyDraftSave();
+}
+setReplyRcpt({});
+$("#replyModeOne").onclick = () => loadReplyPreset("reply");
+$("#replyModeAll").onclick = () => loadReplyPreset("all");
+
+async function sendReply() {
   const r = $("#reader");
   const box = $("#replyBox");
   if (!box.innerText.trim() && !(STATE.replyAttachments || []).length) return;
+  // Text still in a recipient input must become a chip, or the send stops here: mail
+  // must never go out without an address the user typed.
+  for (const f of Object.keys(RCPT)) {
+    const left = commitRcptInput(f);
+    if (left) { toast(`"${left}" is not an email address`); rcptInput(f).focus(); return; }
+  }
+  const R = STATE.reply;
+  if (!R.to.length && !R.cc.length && !R.bcc.length) { toast("Add at least one recipient"); rcptInput("to").focus(); return; }
   clearTimeout(replyDraftTimer); // cancel pending autosave so it can't resurrect after send
   const subj = r.dataset.subject.startsWith("Re:") ? r.dataset.subject : "Re: " + r.dataset.subject;
   const fd = new FormData();
-  fd.append("to", all ? (r.dataset.toAll || r.dataset.to) : r.dataset.to);
+  fd.append("to", rcptJoin(R.to));
+  if (R.cc.length) fd.append("cc", rcptJoin(R.cc));
+  if (R.bcc.length) fd.append("bcc", rcptJoin(R.bcc));
   fd.append("subject", subj);
   fd.append("html", box.innerHTML);
   fd.append("text", box.innerText);
@@ -1185,12 +1317,12 @@ async function sendReply(all) {
   if (r.dataset.alias && $("#replyViaAliasChk").checked) fd.append("viaAlias", r.dataset.alias);
   if (STATE.replyDraftId) fd.append("draftId", STATE.replyDraftId); // server deletes the autosaved draft on send
   (STATE.replyAttachments || []).forEach((f) => fd.append("attachments", f, f.name));
-  const btns = [$("#replySend"), $("#replySendAll")];
-  btns.forEach((b) => (b.disabled = true));
+  const btn = $("#replySend");
+  btn.disabled = true;
   let res;
   try { res = await (await fetch("/api/send", { method: "POST", body: fd })).json(); }
   catch (e) { res = { error: String(e) }; }
-  btns.forEach((b) => (b.disabled = false));
+  btn.disabled = false;
   if (handleSendResult(res)) {
     const tid = r.dataset.tid;
     STATE.replyDraftId = null; setReplyStatus("");
@@ -1199,8 +1331,7 @@ async function sendReply(all) {
               (res.undoWindow || 0) * 1000 + 900);
   }
 }
-$("#replySend").onclick = () => sendReply(false);
-$("#replySendAll").onclick = () => sendReply(true);
+$("#replySend").onclick = () => sendReply();
 // ---------- Reply autosave (mirrors compose) ----------
 let replyDraftTimer = null, replySaving = false, replyDirty = false;
 function setReplyStatus(t) { const e = $("#replySaveStatus"); if (e) e.textContent = t; }
@@ -1225,7 +1356,8 @@ async function saveReplyDraftNow() {
   let r = null;
   try {
     r = await post("/api/save_draft", {
-      to: r0.dataset.to || "", subject: replySubject(),
+      to: rcptJoin(STATE.reply.to), cc: rcptJoin(STATE.reply.cc) || null,
+      bcc: rcptJoin(STATE.reply.bcc) || null, subject: replySubject(),
       html: $("#replyBox").innerHTML, body: $("#replyBox").innerText,
       threadId: r0.dataset.tid, inReplyTo: r0.dataset.rfc || null,
       references: r0.dataset.rfcChain || null,
@@ -1805,8 +1937,10 @@ function editorForToolbar(btn) {
 
 // ---------- Contact autocomplete (To / Cc / Bcc) ----------
 let acTimer = null, acCtl = null;
-async function runAutocomplete(input) {
-  const token = (input.value.split(",").pop() || "").trim();
+// opts.onPick(contact) takes the pick itself (the reply chips); without it the pick is
+// written into the comma-separated input (compose). opts.anchor places the dropdown.
+async function runAutocomplete(input, opts = {}) {
+  const token = (opts.onPick ? input.value : input.value.split(",").pop() || "").trim();
   const dd = $("#acDropdown");
   if (acCtl) acCtl.abort(); // one request in flight, as in the search box
   if (token.length < 2) { dd.hidden = true; return; }
@@ -1816,12 +1950,13 @@ async function runAutocomplete(input) {
   const list = (r && r.contacts) || [];
   if (!list.length) { dd.hidden = true; return; }
   dd.innerHTML = "";
-  list.forEach((c) => {
+  list.forEach((c, i) => {
     const item = document.createElement("div");
-    item.className = "ac-item";
+    item.className = "ac-item" + (opts.onPick && i === 0 ? " sel" : "");
     item.innerHTML = `<span class="ac-name">${esc(c.name || c.email)}</span><span class="ac-email">${esc(c.email)}</span>`;
     item.onmousedown = (e) => {
       e.preventDefault();
+      if (opts.onPick) { dd.hidden = true; opts.onPick(c); return; }
       const parts = input.value.split(",");
       parts[parts.length - 1] = c.email;
       input.value = parts.join(", ").replace(/^\s+/, "") + ", ";
@@ -1829,9 +1964,12 @@ async function runAutocomplete(input) {
     };
     dd.appendChild(item);
   });
-  const rect = input.getBoundingClientRect();
-  dd.style.left = rect.left + "px"; dd.style.top = (rect.bottom + 2) + "px"; dd.style.width = rect.width + "px";
+  const rect = (opts.anchor || input).getBoundingClientRect();
+  dd.style.left = rect.left + "px"; dd.style.width = rect.width + "px";
+  // The reply bar sits at the bottom of the window, so its list opens upward.
   dd.hidden = false;
+  const h = dd.offsetHeight;
+  dd.style.top = (rect.bottom + 2 + h > window.innerHeight ? Math.max(4, rect.top - 2 - h) : rect.bottom + 2) + "px";
 }
 ["#cTo", "#cCc", "#cBcc"].forEach((s) => {
   const el = $(s);

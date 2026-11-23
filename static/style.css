@@ -481,3 +481,23 @@ body.scroll-locked{position:fixed;left:0;right:0;width:100%;overflow:hidden}
 .from-row{display:flex;align-items:center;gap:8px}
 .from-label{font-size:13px;color:var(--text-secondary);width:38px;flex-shrink:0}
 #cFrom{flex:1;height:34px;border:1px solid var(--divider);background:var(--bg-card);color:var(--text-primary);font-size:13px;padding:0 8px}
+
+/* Reply recipients: To / Cc / Bcc as chips above the reply editor */
+.reply-rcpt{border-bottom:1px solid var(--divider);padding:4px 4px 4px 4px;font-size:13px}
+.rr-row{display:flex;align-items:flex-start;gap:6px;min-height:30px}
+.rr-row.rr-extra{padding-left:68px}
+.rr-mode{display:inline-flex;flex-shrink:0}
+.rr-mode .tb-btn.on{color:var(--inbox-blue);background:rgba(66,133,244,.12)}
+.rr-label{flex-shrink:0;width:26px;line-height:30px;color:var(--text-secondary)}
+.rr-field{flex:1;min-width:0;display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:3px 0;cursor:text}
+.rr-field input{flex:1;min-width:120px;border:0;outline:none;background:none;color:var(--text-primary);font:inherit;height:24px;padding:0}
+.rr-field input.bad{color:#d93025}
+.rcpt-chip{display:inline-flex;align-items:center;gap:2px;background:#F1F3F4;border:1px solid #E0E0E0;border-radius:12px;
+  padding:0 2px 0 9px;height:24px;font-size:12px;color:#3c4043;max-width:240px}
+.rcpt-chip span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rcpt-chip button{background:none;border:0;padding:0;cursor:pointer;color:#80868b;display:inline-flex;border-radius:50%}
+.rcpt-chip button:hover{color:#d93025}
+.rcpt-chip button .material-icons{font-size:15px}
+.reply-rcpt .cc-toggles{padding:0 8px;line-height:30px}
+.ac-item.sel{background:rgba(66,133,244,.1)}
+:root[data-theme="dark"] .rcpt-chip{background:#33363a;border-color:#44474b;color:#cfd2d6}

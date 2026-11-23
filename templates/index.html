@@ -9,7 +9,7 @@
 <link rel="apple-touch-icon" href="/static/favicon.png">
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css?v=60">
+<link rel="stylesheet" href="/static/style.css?v=61">
 </head>
 <body>
 <header class="appbar">
@@ -136,6 +136,28 @@
   <div class="reader-body" id="readerBody"></div>
   <div class="reader-reply">
     <div class="reply-editor">
+      <div class="reply-rcpt" id="replyRcpt">
+        <div class="rr-row">
+          <div class="rr-mode">
+            <button type="button" class="tb-btn" id="replyModeOne" title="Reply to the sender"><i class="material-icons">reply</i></button>
+            <button type="button" class="tb-btn" id="replyModeAll" title="Reply to all"><i class="material-icons">reply_all</i></button>
+          </div>
+          <span class="rr-label">To</span>
+          <div class="rr-field" id="rTo" data-field="to"><input autocomplete="off" spellcheck="false" aria-label="To"></div>
+          <div class="cc-toggles">
+            <button type="button" id="rCcToggle">Cc</button>
+            <button type="button" id="rBccToggle">Bcc</button>
+          </div>
+        </div>
+        <div class="rr-row rr-extra" id="rCcRow" hidden>
+          <span class="rr-label">Cc</span>
+          <div class="rr-field" id="rCc" data-field="cc"><input autocomplete="off" spellcheck="false" aria-label="Cc"></div>
+        </div>
+        <div class="rr-row rr-extra" id="rBccRow" hidden>
+          <span class="rr-label">Bcc</span>
+          <div class="rr-field" id="rBcc" data-field="bcc"><input autocomplete="off" spellcheck="false" aria-label="Bcc"></div>
+        </div>
+      </div>
       <div class="compose-toolbar reply-toolbar">
         <button type="button" class="tb-btn" data-cmd="bold" title="Bold (⌘B)"><i class="material-icons">format_bold</i></button>
         <button type="button" class="tb-btn" data-cmd="italic" title="Italic (⌘I)"><i class="material-icons">format_italic</i></button>
@@ -158,8 +180,7 @@
       <div id="rAttachments" class="attach-list"></div>
       <input type="file" id="rFiles" multiple hidden>
     </div>
-    <button class="send-btn wide" id="replySend"><i class="material-icons">send</i> Reply</button>
-    <button class="send-btn wide" id="replySendAll" hidden><i class="material-icons">reply_all</i> All</button>
+    <button class="send-btn wide" id="replySend"><i class="material-icons">send</i> Send</button>
   </div>
 </div>
 
@@ -354,6 +375,6 @@
 <div class="snackbar" id="snackbar" hidden><span id="snackText"></span><button id="snackUndo">UNDO</button></div>
 
 <script>window.OPEN_THREAD = {{ open_thread|tojson }};</script>
-<script src="/static/app.js?v=68"></script>
+<script src="/static/app.js?v=69"></script>
 </body>
 </html>
