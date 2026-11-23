@@ -1188,6 +1188,23 @@ function renderReplyRcpt() {
       chip.className = "rcpt-chip";
       chip.title = a.email;
       chip.innerHTML = `<span>${esc(a.name || a.email)}</span><button type="button" title="Remove ${esc(a.email)}"><i class="material-icons">close</i></button>`;
+      chip.dataset.i = i;
+      chip.draggable = true;
+      chip.addEventListener("dragstart", (e) => {
+        rcptDrag = { f, i };
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", a.email);
+        chip.classList.add("dragging");
+        // Open the empty Cc and Bcc rows as drop targets. This must occur after the
+        // drag starts: a layout change in dragstart cancels the drag in WebKit.
+        setTimeout(() => {
+          if (!rcptDrag) return;
+          $("#replyRcpt").classList.add("drag-on");
+          Object.values(RCPT_ROW).forEach((sel) => ($(sel).hidden = false));
+        }, 0);
+      });
+      chip.addEventListener("dragend", endRcptDrag);
+      chip.querySelector("button").draggable = false;
       chip.querySelector("button").onmousedown = (e) => e.preventDefault(); // keep the input's focus
       chip.querySelector("button").onclick = (e) => {
         e.stopPropagation();
@@ -1208,6 +1225,43 @@ function renderReplyRcpt() {
   $("#replyModeOne").classList.toggle("on", mode === "reply");
   $("#replyModeAll").classList.toggle("on", mode === "all");
 }
+// Drag a chip to a different field (Cc to To), or to a new position in its own field.
+// A drop on a chip puts the dragged one before it. A drop on the row puts it last.
+let rcptDrag = null;
+function endRcptDrag() {
+  rcptDrag = null;
+  $("#replyRcpt").classList.remove("drag-on");
+  document.querySelectorAll(".rr-row.drop").forEach((r) => r.classList.remove("drop"));
+  renderReplyRcpt();
+}
+function moveRcpt(fromF, i, toF, before) {
+  const R = STATE.reply;
+  const [a] = R[fromF].splice(i, 1);
+  if (!a) return;
+  let at = before == null ? R[toF].length : before;
+  if (fromF === toF && before != null && i < before) at -= 1; // the list is one shorter now
+  R[toF].splice(at, 0, a);
+}
+Object.keys(RCPT).forEach((f) => {
+  const row = $(RCPT[f]).closest(".rr-row");
+  row.addEventListener("dragover", (e) => {
+    if (!rcptDrag) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    row.classList.add("drop");
+  });
+  row.addEventListener("dragleave", (e) => { if (!row.contains(e.relatedTarget)) row.classList.remove("drop"); });
+  row.addEventListener("drop", (e) => {
+    if (!rcptDrag) return;
+    e.preventDefault();
+    const over = e.target.closest(".rcpt-chip");
+    const d = rcptDrag;
+    moveRcpt(d.f, d.i, f, over ? Number(over.dataset.i) : null);
+    endRcptDrag();
+    scheduleReplyDraftSave();
+  });
+});
+
 // Add one address to a field. An address lives in one field only, so an address typed
 // into Cc that is already in To moves to Cc.
 function addRcpt(f, a) {

@@ -105,7 +105,7 @@ External links *inside emails* are routed to the default browser via pywebview's
   Applies to inbox, snoozed, done, and search; live-sync refresh keeps the loaded depth.
 - Compose + inline reply (Gmail API send, threaded)
 - Reply recipients as To / Cc / Bcc chips: the Reply and Reply-all buttons load a preset
-  (Reply-To wins over From), then you can remove any person or add one with contact suggestions
+  (Reply-To wins over From), then you can remove any person, add one with contact suggestions, or drag a chip to a different field
 - Send-to-Things with `inboxclone://` backlink + Gmail fallback (right-most action everywhere)
 - **Multi-select**: hover a card's avatar to reveal a checkbox; selecting shows a top
   bulk-action bar (Pin / Snooze / Done / Send to Things) acting on all selected at once.

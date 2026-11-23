@@ -501,3 +501,7 @@ body.scroll-locked{position:fixed;left:0;right:0;width:100%;overflow:hidden}
 .reply-rcpt .cc-toggles{padding:0 8px;line-height:30px}
 .ac-item.sel{background:rgba(66,133,244,.1)}
 :root[data-theme="dark"] .rcpt-chip{background:#33363a;border-color:#44474b;color:#cfd2d6}
+.rcpt-chip{cursor:grab}
+.rcpt-chip.dragging{opacity:.4}
+.rr-row.drop{background:rgba(66,133,244,.1);border-radius:6px}
+.reply-rcpt.drag-on .rr-field{min-height:30px}
