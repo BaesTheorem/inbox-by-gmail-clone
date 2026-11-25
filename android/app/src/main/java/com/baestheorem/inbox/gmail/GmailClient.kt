@@ -410,6 +410,24 @@ object GmailClient {
         null
     }
 
+    /**
+     * To and Cc of one sent message, for the contact list (ContactStore). One try and no
+     * backoff: the caller paces itself and stops at the first refusal. A thread open
+     * outranks this, as it does list work.
+     */
+    suspend fun recipientHeaders(id: String): GMessage {
+        waitForIdle()
+        return get(
+            "/messages/$id",
+            listOf(
+                "format" to "metadata", "metadataHeaders" to "To", "metadataHeaders" to "Cc",
+                "fields" to "id,internalDate,payload/headers",
+            ),
+            tries = 1,
+            serializer = GMessage.serializer(),
+        )
+    }
+
     /** Concurrent metadata fetch, capped at 8 in flight to stay under the per-second quota. */
     suspend fun batchMeta(ids: List<String>): List<GMessage> {
         val out = mutableListOf<GMessage>()

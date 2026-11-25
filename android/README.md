@@ -88,8 +88,12 @@ Press **Publish app** on the console's Audience page and it stops happening.
   port of `message_details`.
 - Reply with the recipients you choose: the line above the reply box shows To, Cc
   and Bcc, and a tap opens an editor (Reply and Reply-all presets, remove, add, move
-  between fields). You are never a recipient. The reply carries the message it answers
-  below your text as a plain-text quote. Compose, threaded with
+  between fields). You are never a recipient. Typing in a recipient field (here or
+  in Compose) suggests people you have sent mail to, as on the Mac: the list is mined
+  from the To and Cc of your 200 newest sent messages (`data/ContactStore.kt`), kept
+  in the app's files dir, refreshed in the background at most every 15 minutes, and a
+  send from the phone adds its recipients at once. The reply carries the message it
+  answers below your text as a plain-text quote. Compose, threaded with
   In-Reply-To/References, sent as your display name
 - Snoozed / Done / Sent views, Gmail-syntax search, pull to refresh, infinite
   scroll, the pinned-only app-bar switch, undo snackbar

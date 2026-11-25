@@ -35,6 +35,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -217,7 +218,7 @@ fun ThreadScreen(
 
     originalId?.let { OriginalDialog(store, it) { originalId = null } }
     if (showRecipients) {
-        ReplyRecipientsSheet(recipients, presets, onChange = { recipients = it }) { showRecipients = false }
+        ReplyRecipientsSheet(recipients, presets, onChange = { recipients = it }, me = store.userEmail.collectAsState().value) { showRecipients = false }
     }
 
     if (confirmUnsub && detail?.unsub != null) {

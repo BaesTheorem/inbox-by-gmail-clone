@@ -18,6 +18,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -28,7 +29,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import com.baestheorem.inbox.data.ContactStore
 import com.baestheorem.inbox.data.MailStore
+import com.baestheorem.inbox.gmail.parseAddrList
 import kotlinx.coroutines.launch
 import java.io.IOException
 
@@ -40,6 +43,15 @@ fun ComposeScreen(store: MailStore, onClose: () -> Unit) {
     var body by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
     val canSend = to.contains("@") && !sending
+    // Suggestions for the address being typed: people already in the field and the
+    // account itself stay out.
+    val contacts by ContactStore.contacts.collectAsState()
+    val me by store.userEmail.collectAsState()
+    val suggestions = remember(to, contacts, me) {
+        val taken = parseAddrList(to).map { it.key }.toMutableSet()
+        taken.add(me.lowercase())
+        ContactStore.suggestions(lastAddressToken(to), taken)
+    }
 
     Column(Modifier.fillMaxSize().background(Theme.cardBg).statusBarsPadding().imePadding()) {
         Row(
@@ -72,7 +84,8 @@ fun ComposeScreen(store: MailStore, onClose: () -> Unit) {
             }
         }
         Divider()
-        Field("To", to, { to = it }, KeyboardType.Email)
+        Field("To", to, { to = it; ContactStore.refreshIfStale() }, KeyboardType.Email)
+        ContactSuggestions(suggestions) { to = replaceLastAddressToken(to, it.email) }
         Divider()
         Field("Subject", subject, { subject = it }, KeyboardType.Text)
         Divider()

@@ -2,6 +2,7 @@ package com.baestheorem.inbox
 
 import android.app.Application
 import com.baestheorem.inbox.auth.AuthStore
+import com.baestheorem.inbox.data.ContactStore
 import com.baestheorem.inbox.data.Prefs
 import com.baestheorem.inbox.data.SnoozeStore
 import com.baestheorem.inbox.data.SwipeConfig
@@ -19,6 +20,7 @@ class InboxApplication : Application() {
         GmailClient.init(this)
         SnoozeStore.init(this)
         UnsubScanCache.init(this)
+        ContactStore.init(this)
         SwipeConfig.init(this)
         Prefs.init(this)
         Notifications.ensureChannels(this)

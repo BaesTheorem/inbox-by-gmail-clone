@@ -27,6 +27,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -41,6 +42,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.baestheorem.inbox.data.ContactStore
 import com.baestheorem.inbox.gmail.RcptField
 import com.baestheorem.inbox.gmail.Recipient
 import com.baestheorem.inbox.gmail.ReplyPresets
@@ -57,11 +59,21 @@ fun ReplyRecipientsSheet(
     recipients: ReplyRecipients,
     presets: ReplyPresets,
     onChange: (ReplyRecipients) -> Unit,
+    me: String = "",   // the account's address, never suggested
     onDismiss: () -> Unit,
 ) {
     val state = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val typed = remember { mutableStateMapOf<RcptField, String>() }
     val bad = remember { mutableStateMapOf<RcptField, Boolean>() }
+    val contacts by ContactStore.contacts.collectAsState()
+
+    // Suggestions for the address being typed in a field. People already in any field
+    // and the account itself stay out.
+    fun suggestions(f: RcptField): List<com.baestheorem.inbox.data.Contact> {
+        val taken = (recipients.to + recipients.cc + recipients.bcc).map { it.key }.toMutableSet()
+        taken.add(me.lowercase())
+        return ContactStore.suggestions(lastAddressToken(typed[f] ?: ""), taken)
+    }
 
     // Typed text becomes recipients. Text that is not an address stays, in red.
     fun commit(f: RcptField, current: ReplyRecipients): ReplyRecipients {
@@ -125,7 +137,7 @@ fun ReplyRecipientsSheet(
                     val text = typed[f] ?: ""
                     BasicTextField(
                         value = text,
-                        onValueChange = { typed[f] = it; bad[f] = false },
+                        onValueChange = { typed[f] = it; bad[f] = false; ContactStore.refreshIfStale() },
                         singleLine = true,
                         textStyle = robotoStyle(15).copy(color = if (bad[f] == true) badRed else Theme.textPrimary),
                         cursorBrush = SolidColor(Theme.blue),
@@ -137,6 +149,12 @@ fun ReplyRecipientsSheet(
                         modifier = Modifier.fillMaxWidth(),
                     )
                     if (text.isEmpty()) Text("Add an address", style = robotoStyle(15), color = Theme.textFaint)
+                }
+                // A pick becomes a chip; addresses typed before it in the same field do too.
+                ContactSuggestions(remember(typed[f], contacts, recipients) { suggestions(f) }) { c ->
+                    typed[f] = (typed[f] ?: "").substringBeforeLast(',', "")
+                    val next = commit(f, recipients).add(Recipient(c.label, c.email), f)
+                    onChange(next)
                 }
                 Box(Modifier.fillMaxWidth().height(1.dp).background(Theme.divider))
             }

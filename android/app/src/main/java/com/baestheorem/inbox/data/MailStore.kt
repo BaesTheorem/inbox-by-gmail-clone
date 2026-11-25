@@ -6,6 +6,7 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.baestheorem.inbox.gmail.parseAddrList
 import com.baestheorem.inbox.gmail.Recipient
 import com.baestheorem.inbox.gmail.ReplyPresets
 import com.baestheorem.inbox.gmail.ReplyRecipients
@@ -107,6 +108,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
                 Log.w("MailStore", "profile lookup failed", e)
             }
             refresh()
+            ContactStore.refreshIfStale(force = true)  // fresh suggestions before the first keystroke
         }
     }
 
@@ -711,6 +713,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
             bcc = join(recipients.bcc).ifEmpty { null },
         )
         GmailClient.send(raw, detail.id)
+        ContactStore.noteSent(recipients.to + recipients.cc + recipients.bcc)
     }
 
     suspend fun sendNew(to: String, subject: String, body: String) {
@@ -720,6 +723,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
             inReplyTo = null, references = null,
         )
         GmailClient.send(raw, null)
+        ContactStore.noteSent(parseAddrList(to))
     }
 
     // MARK: Unsubscribe (RFC 2369 / RFC 8058, port of api_unsubscribe)
