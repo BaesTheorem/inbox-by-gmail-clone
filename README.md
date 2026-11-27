@@ -93,6 +93,21 @@ General → Default email reader.
 External links *inside emails* are routed to the default browser via pywebview's
 `js_api.open_external` (WKWebView can't open new tabs itself).
 
+## Gmail quota
+Gmail charges about 50 units for each message or draft get (measured in Cloud
+Monitoring, 2026-11). The published table says 5. The limit is 6,000 units per
+minute per user. The Mac app, the iPhone app and the Android app spend from the
+same 6,000. Thus one minute holds approximately 120 message gets.
+
+- `_request` keeps a rolling-minute budget (`QUOTA_FG_BUDGET`). Background
+  scans stop at `QUOTA_BG_BUDGET`, so a click always has room.
+- After a quota 403, all threads wait 15 seconds. They do not back off one at a
+  time.
+- List-row metadata is in `snooze.db` (`meta_cache`). A restart does not refetch
+  the lists. On start, the history since the stored id removes the rows that
+  changed.
+- A background warm-up fills Snoozed, Done, Sent and Drafts after each start.
+
 ## Implemented
 - Inbox list with Bundles, Pin (★), Done (archive), Snooze (real, scheduler-backed)
 - **Snoozed** view (with wake-time labels) and **Done** view (recently archived)

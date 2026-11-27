@@ -333,7 +333,7 @@ class MailStore(app: Application) : AndroidViewModel(app) {
                 val info = html?.let { findBodyUnsubscribe(it) }
                 UnsubScanCache.put(mid, info?.httpsUrl ?: "")
                 if (info != null) found = true
-                delay(250) // gentle on the quota
+                delay(1500) // a get costs ~50 of Gmail's 6,000 units/min per user, shared with the other apps
             }
             if (found) withContext(Dispatchers.Main) { applyScansToLoadedRows() }
         }

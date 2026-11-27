@@ -29,6 +29,7 @@ try:
 except ImportError:
     pass  # cosmetic process name only; never block startup on it
 import base64
+import functools
 import html as _htmlmod
 import ipaddress
 import json
@@ -42,7 +43,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import threading
 import time
 from datetime import datetime, timezone
@@ -281,10 +282,89 @@ def _is_rate(resp):
     return "rateLimitExceeded" in resp.text or "Quota exceeded" in resp.text
 
 
+# Gmail's real price list, measured in Cloud Monitoring on 2026-11-26: a message or
+# draft get costs about 50 "Total Query Cost" units (the published table says 5), a
+# thread get about 100, a list about 5, a history poll 2. The limit is 6,000 units per
+# minute per user, and the iPhone and Android apps spend from the same 6,000. Without a
+# budget one cold list (50 gets) plus its 50 body scans went over the limit, and every
+# request then sat in exponential backoff for half a minute.
+QUOTA_FG_BUDGET = 5400   # units per rolling minute this process may spend (Gmail: 6,000)
+QUOTA_BG_BUDGET = 3000   # background stops here: a cold list (2,500) still fits
+_quota_lock = threading.Lock()
+_quota_log = deque()     # (monotonic time, units)
+_quota_hold = {"until": 0.0}
+_bg = threading.local()  # .on = True in background threads (scans, warm-up, contacts)
+_ITEM_PATH = re.compile(r"^/(messages|drafts)/[^/]+$")
+
+
+def _background_work(fn):
+    """Run fn inside the background budget, and put the thread's flag back after."""
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        prev = getattr(_bg, "on", False)
+        _bg.on = True
+        try:
+            return fn(*a, **kw)
+        finally:
+            _bg.on = prev
+    return wrapper
+
+
+def _quota_cost(method, path):
+    if method == "GET" and _ITEM_PATH.match(path):
+        return 50
+    if method == "GET" and path.startswith("/threads/"):
+        return 100
+    if path.endswith("/send"):
+        return 100
+    return 5
+
+
+def _quota_spent(now):
+    while _quota_log and now - _quota_log[0][0] >= 60:
+        _quota_log.popleft()
+    return sum(u for _, u in _quota_log)
+
+
+def _quota_take(cost):
+    """Block until this process's rolling-minute spend leaves room for `cost`."""
+    budget = QUOTA_BG_BUDGET if getattr(_bg, "on", False) else QUOTA_FG_BUDGET
+    while True:
+        with _quota_lock:
+            now = time.monotonic()
+            spent = _quota_spent(now)
+            hold = _quota_hold["until"] - now
+            if hold <= 0 and (spent + cost <= budget or not _quota_log):
+                _quota_log.append((now, cost))
+                return
+            wait = hold if hold > 0 else 60 - (now - _quota_log[0][0]) + 0.05
+        time.sleep(min(max(wait, 0.05), 2.0))
+
+
+def _quota_exceeded(seconds=15.0):
+    """Gmail said no: every thread waits, so a storm of 8 workers backing off on their
+    own does not keep the minute's counter full."""
+    with _quota_lock:
+        _quota_hold["until"] = max(_quota_hold["until"], time.monotonic() + seconds)
+
+
+def _error_response(e):
+    """JSON error for the web client. A quota refusal gets one plain sentence, not
+    Gmail's raw 403 body."""
+    text = str(e)
+    if "Quota exceeded" in text or "rateLimitExceeded" in text:
+        return jsonify({"error": "Gmail's per-minute limit was reached. "
+                                 "This list loads again in about a minute.",
+                        "quota": True}), 503
+    return jsonify({"error": text}), 500
+
+
 def _request(method, path, tries=6, **kw):
     s = get_session()
     url = BASE + path
+    cost = _quota_cost(method, path)
     for attempt in range(tries):
+        _quota_take(cost)
         try:
             r = s.request(method, url, timeout=30, **kw)
         except requests.RequestException as e:
@@ -296,6 +376,8 @@ def _request(method, path, tries=6, **kw):
             time.sleep(delay)
             continue
         if r.status_code in (429, 500, 502, 503, 504) or (r.status_code == 403 and _is_rate(r)):
+            if r.status_code in (403, 429):
+                _quota_exceeded()
             if attempt == tries - 1:
                 raise GmailHTTPError(r.status_code, r.text)
             delay = min(32.0, 2 ** attempt) + random.uniform(0, 0.5)
@@ -1252,8 +1334,8 @@ _LIST_FIELDS = ("id,threadId,internalDate,labelIds,snippet,"
 # repaint does not need to re-download all 50 rows -- it needs to re-download the rows
 # whose labels actually changed. The history poller already knows exactly which ids
 # those are, and every local mutation funnels through modify_thread, so both evict here.
-# Before this cache every silent refresh cost 5 quota units per visible row, which is
-# what pushed the app past Gmail's 15,000-units-per-minute-per-user ceiling.
+# Before this cache every silent refresh cost a get (about 50 quota units) per visible
+# row, which is what pushed the app past Gmail's per-user ceiling (see QUOTA_FG_BUDGET).
 _META_CAP = 3000
 _meta_cache = OrderedDict()      # mid -> message dict
 _meta_tids = {}                  # tid -> set(mid), so a thread mutation evicts its messages
@@ -1262,6 +1344,8 @@ _meta_lock = threading.Lock()
 
 def _meta_evict(mids):
     """Drop cached metadata for these message ids (their labels may have moved)."""
+    mids = [m for m in mids if m]
+    _meta_db_delete(mids)
     with _meta_lock:
         for mid in mids:
             msg = _meta_cache.pop(mid, None)
@@ -1281,7 +1365,111 @@ def _meta_evict_thread(tid):
         _meta_evict(mids)
 
 
+# The cache also lives in SQLite, so a server restart does not cost a cold refetch of
+# every list (50 gets is 2,500 units). The stored history id is the anchor: on start,
+# the history since that id evicts whatever moved while the server was down, and a
+# too-old anchor (Gmail keeps about a week) clears the whole table.
+_META_DB_KEEP = 5000
+
+
+def _meta_db_delete(mids):
+    if not mids:
+        return
+    conn = db()
+    try:
+        for i in range(0, len(mids), 400):
+            chunk = mids[i:i + 400]
+            conn.execute(f"DELETE FROM meta_cache WHERE message_id IN ({','.join('?' * len(chunk))})",
+                         chunk)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _meta_db_put(mid, msg):
+    conn = db()
+    try:
+        conn.execute("INSERT OR REPLACE INTO meta_cache (message_id, body, at) VALUES (?, ?, ?)",
+                     (mid, json.dumps(msg), int(time.time())))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _meta_clear():
+    with _meta_lock:
+        _meta_cache.clear()
+        _meta_tids.clear()
+    conn = db()
+    try:
+        conn.execute("DELETE FROM meta_cache")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _history_changed_ids(history):
+    """Message ids whose labels or existence changed in a page of users.history."""
+    return {m.get("id") for h in history
+            for key in ("messages", "messagesAdded", "labelAdded", "labelRemoved",
+                        "messagesDeleted")
+            for rec in (h.get(key) or [])
+            for m in ([rec] if key == "messages" else [rec.get("message", {})])
+            if m.get("id")}
+
+
+def _meta_restore():
+    """Load the stored cache and evict what changed since its history id. Returns the
+    history id the poller continues from, or None to start fresh."""
+    conn = db()
+    try:
+        conn.execute("DELETE FROM meta_cache WHERE message_id NOT IN (SELECT message_id "
+                     "FROM meta_cache ORDER BY at DESC LIMIT ?)", (_META_DB_KEEP,))
+        conn.commit()
+        rows = conn.execute("SELECT message_id, body FROM meta_cache ORDER BY at DESC LIMIT ?",
+                            (_META_CAP,)).fetchall()[::-1]   # oldest first: LRU order
+    finally:
+        conn.close()
+    anchor = _get_setting("meta_history_id")
+    if not rows:
+        return None
+    if not anchor:
+        _meta_clear()
+        return None
+    changed, latest, token = set(), anchor, None
+    try:
+        while True:
+            params = {"startHistoryId": anchor,
+                      "historyTypes": ["messageAdded", "labelAdded", "labelRemoved"]}
+            if token:
+                params["pageToken"] = token
+            resp = gget("/history", **params)
+            changed |= _history_changed_ids(resp.get("history") or [])
+            latest = resp.get("historyId", latest)
+            token = resp.get("nextPageToken")
+            if not token:
+                break
+    except GmailHTTPError as e:
+        if e.status == 404:   # anchor older than Gmail keeps: nothing in the table is safe
+            _meta_clear()
+            return None
+        raise
+    with _meta_lock:
+        for mid, body in rows:
+            if mid in changed:
+                continue
+            msg = json.loads(body)
+            _meta_cache[mid] = msg
+            if msg.get("threadId"):
+                _meta_tids.setdefault(msg["threadId"], set()).add(mid)
+    _meta_db_delete(list(changed))
+    log.info("meta cache restored: %d rows, %d changed since history %s",
+             len(_meta_cache), len(changed), anchor)
+    return latest
+
+
 def _meta_put(mid, msg):
+    _meta_db_put(mid, msg)
     with _meta_lock:
         _meta_cache[mid] = msg
         _meta_cache.move_to_end(mid)
@@ -1317,7 +1505,7 @@ def summarize_ids(ids, outgoing=False):
     if not outgoing:
         load_bundle_labels()
     # Concurrent fetches (requests/urllib3 is thread-safe). gget retries rate-limits
-    # internally; a small worker cap keeps us under the per-second quota.
+    # internally; the per-minute budget in _request (QUOTA_FG_BUDGET) does the pacing.
     with ThreadPoolExecutor(max_workers=8) as ex:
         msgs = list(ex.map(_get_meta, ids))
 
@@ -1681,6 +1869,9 @@ def migrate_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_da_fire ON deferred_actions (fire_at) WHERE status='pending'")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_da_thread ON deferred_actions (thread_id) WHERE status='pending'")
     conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    # List-row metadata (see _meta_restore): survives a restart, evicted by history
+    conn.execute("CREATE TABLE IF NOT EXISTS meta_cache (message_id TEXT PRIMARY KEY, "
+                 "body TEXT NOT NULL, at INTEGER NOT NULL)")
     # Cache of the body-buried unsubscribe scan (per message): https_url='' means scanned,
     # no opt-out link found. Lets inbox list rows show the Unsubscribe banner without
     # re-downloading each body — the scan runs once, on arrival or first sight.
@@ -2081,6 +2272,7 @@ _otp_seen = set()
 _OTP_MAX_AGE = 15 * 60   # ignore codes older than this (a backfill after sleep)
 
 
+@_background_work
 def _otp_scan(message_ids):
     """Detect one-time codes in freshly arrived mail and banner each one."""
     if not (_NOTIFIER or _un_apps()) or not _get_setting("otp_banners", True):
@@ -2172,6 +2364,7 @@ def _history_loop():
         try:
             if SYNC["history_id"] is None:
                 SYNC["history_id"] = gget("/profile").get("historyId")
+                _set_setting("meta_history_id", SYNC["history_id"])
             else:
                 try:
                     resp = gget("/history", startHistoryId=SYNC["history_id"],
@@ -2181,14 +2374,7 @@ def _history_loop():
                         # Someone (another client, a filter, Gmail itself) moved labels.
                         # Drop those rows from the metadata cache so the next repaint
                         # refetches exactly them and nothing else.
-                        _meta_evict({m.get("id") for h in resp["history"]
-                                     for key in ("messages", "messagesAdded",
-                                                 "labelAdded", "labelRemoved",
-                                                 "messagesDeleted")
-                                     for rec in (h.get(key) or [])
-                                     for m in ([rec] if key == "messages"
-                                               else [rec.get("message", {})])
-                                     if m.get("id")})
+                        _meta_evict(list(_history_changed_ids(resp["history"])))
                         # Scan newly-arrived inbox mail for body-buried unsubscribe links now,
                         # so the banner is ready in the list row by the time it's viewed.
                         added = [ma["message"]["id"]
@@ -2199,11 +2385,16 @@ def _history_loop():
                             enqueue_unsub_scan(added)
                             _notify_new_mail(added)
                             threading.Thread(target=_otp_scan, args=(added,), daemon=True).start()
-                    SYNC["history_id"] = resp.get("historyId", SYNC["history_id"])
+                    new_id = resp.get("historyId", SYNC["history_id"])
+                    if new_id != SYNC["history_id"]:
+                        _set_setting("meta_history_id", new_id)
+                    SYNC["history_id"] = new_id
                 except GmailHTTPError as he:
                     # 404 = startHistoryId too old; reset cursor and force a refresh
                     if he.status == 404:
+                        _meta_clear()
                         SYNC["history_id"] = gget("/profile").get("historyId")
+                        _set_setting("meta_history_id", SYNC["history_id"])
                         SYNC["version"] += 1
                     else:
                         raise
@@ -2298,6 +2489,7 @@ def enqueue_unsub_scan(ids):
         _unsub_q.put(i)
 
 
+@_background_work
 def _unsub_scan_loop():
     found_pending = False
     while True:
@@ -2320,7 +2512,7 @@ def _unsub_scan_loop():
         if found_pending and _unsub_q.empty():
             SYNC["version"] += 1
             found_pending = False
-        time.sleep(0.05)  # gentle on the Gmail per-second quota
+        time.sleep(0.05)  # the quota budget in _request does the real pacing
 
 
 def apply_body_unsub(rows):
@@ -2520,7 +2712,7 @@ def api_inbox():
                 rows += [r for r in summarize_ids(star_ids)
                          if r["pinned"] and r["id"] not in seen_tids]
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
     try:
         total, unread = inbox_totals()
     except Exception:
@@ -2573,7 +2765,7 @@ def api_snoozed():
         return jsonify({"items": rows, "email": _user_email, "limit": limit,
                         "fetched": len(ids), "nextPageToken": next_token})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/done_list")
@@ -2587,7 +2779,7 @@ def api_done_list():
         return jsonify({"items": rows, "email": _user_email, "limit": limit,
                         "fetched": len(ids), "nextPageToken": next_token})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/sent")
@@ -2601,7 +2793,7 @@ def api_sent():
         return jsonify({"items": rows, "email": _user_email, "limit": limit,
                         "fetched": len(ids), "nextPageToken": next_token})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/search")
@@ -2617,7 +2809,7 @@ def api_search():
         return jsonify({"items": rows, "email": _user_email, "query": q, "limit": limit,
                         "fetched": len(ids), "nextPageToken": next_token})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/drafts")
@@ -2650,7 +2842,7 @@ def api_drafts():
         items.sort(key=lambda r: int(r["ts"]), reverse=True)
         return jsonify({"items": items, "email": _user_email, "fetched": len(items), "nextPageToken": None})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/draft/<draft_id>")
@@ -2672,7 +2864,7 @@ def api_draft(draft_id):
                         "attachments": [{**a, "messageId": msg.get("id")}
                                         for a in _collect_attachments(payload)]})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 def _carry_draft_attachments(draft_id, keep=None):
@@ -2717,7 +2909,7 @@ def api_save_draft():
         res = gput(f"/drafts/{draft_id}", json=body) if draft_id else gpost("/drafts", json=body)
         return jsonify({"ok": True, "draftId": res.get("id")})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/discard_draft", methods=["POST"])
@@ -2726,7 +2918,7 @@ def api_discard_draft():
         gdelete(f"/drafts/{request.json['draftId']}")
         return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/thread/<thread_id>")
@@ -2736,7 +2928,7 @@ def api_thread(thread_id):
         mark_read(thread_id)
         return jsonify(data)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/original/<message_id>")
@@ -2747,7 +2939,7 @@ def api_original(message_id):
         src = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "replace")
         return Response(src, mimetype="text/plain; charset=utf-8")
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/attachment/<message_id>/<attachment_id>")
@@ -2763,7 +2955,7 @@ def api_attachment(message_id, attachment_id):
         return Response(content, mimetype=mime,
                         headers={"Content-Disposition": f'{disp}; filename="{name}"'})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 _SAFE_IMG_MIME = re.compile(r"^image/[a-z0-9.+-]{1,32}$", re.I)
@@ -2785,7 +2977,7 @@ def api_inline(message_id, attachment_id):
             "Cache-Control": "private, max-age=3600",
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/done", methods=["POST"])
@@ -2880,7 +3072,7 @@ def api_relabel():
             created_filter = ensure_filter(sender, target_id)
         return jsonify({"ok": True, "bundle": bundle, "filtered": created_filter})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 def _addy_encode_to(addr_str, alias):
@@ -2977,7 +3169,7 @@ def api_send():
         return jsonify({"ok": True})
     except Exception as e:
         log.exception("send failed")
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/cancel_send", methods=["POST"])
@@ -3052,6 +3244,7 @@ def _contact_addrs(msg):
             if "@" in addr]
 
 
+@_background_work
 def _refresh_contacts():
     """Fold the recipients of recent sent mail into the contacts table. A message that
     an earlier refresh read is skipped, so after the first run a refresh costs one list
@@ -3176,7 +3369,7 @@ def api_mute():
         return jsonify({"ok": True})
     except Exception as e:
         log.exception("mute failed")
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/mark", methods=["POST"])
@@ -3192,7 +3385,7 @@ def api_mark():
             modify_thread(tid, add=["UNREAD"])
         return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/spam", methods=["POST"])
@@ -3208,7 +3401,7 @@ def api_spam():
         return jsonify({"ok": True})
     except Exception as e:
         log.exception("mark spam failed")
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/not_spam", methods=["POST"])
@@ -3221,7 +3414,7 @@ def api_not_spam():
         modify_thread(tid, add=["INBOX"], remove=["SPAM"])
         return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/bulk_spam", methods=["POST"])
@@ -3243,7 +3436,7 @@ def api_blocked():
     try:
         return jsonify({"blocked": list_blocked_senders()})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/block", methods=["POST"])
@@ -3278,7 +3471,7 @@ def api_block():
                         "already": bool(existing), "trashed": trashed})
     except Exception as e:
         log.exception("block sender failed")
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/unblock", methods=["POST"])
@@ -3299,7 +3492,7 @@ def api_unblock():
         return jsonify({"ok": True, "removed": removed})
     except Exception as e:
         log.exception("unblock sender failed")
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/followup", methods=["POST"])
@@ -3445,7 +3638,7 @@ def api_unsubscribe():
                             "confirmed": False, "steps": steps})
         return jsonify({"error": "no unsubscribe route worked", "steps": steps}), 400
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 @app.route("/api/to_things", methods=["POST"])
@@ -3553,7 +3746,7 @@ def api_undo_things():
             return jsonify({"error": (out.stderr or "osascript failed").strip()}), 500
         return jsonify({"ok": True, "removed": (out.stdout or "").strip()})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return _error_response(e)
 
 
 # ---------- addy.io aliases (disposable email) ----------
@@ -3754,6 +3947,40 @@ def api_alias_delete():
             else (jsonify({"error": "delete failed (%s)" % sc}), 400))
 
 
+@_background_work
+def _warm_lists():
+    """Fill the metadata cache for the first page of Snoozed, Done, Sent and Drafts in
+    the background, inside the background budget, so opening them is a cache read."""
+    queries = [{"label_ids": None, "snoozed": True},
+               {"q": "-in:inbox -in:sent -in:draft -in:trash -in:spam -in:chats"},
+               {"label_ids": ["SENT"]}]
+    for qd in queries:
+        try:
+            if qd.pop("snoozed", False):
+                qd["label_ids"] = [ensure_label("Snoozed")]
+            for mid in list_ids(max_results=50, **qd):
+                _get_meta(mid)
+        except Exception:
+            log.exception("list warm-up failed")
+    try:
+        for dr in gget("/drafts", maxResults=50).get("drafts", []):
+            mid = (dr.get("message") or {}).get("id")
+            if mid:
+                _get_meta(mid)
+    except Exception:
+        log.exception("drafts warm-up failed")
+
+
+def _start_sync():
+    try:
+        SYNC["history_id"] = _meta_restore()
+    except Exception:
+        log.exception("meta cache restore failed; starting cold")
+        _meta_clear()
+    threading.Thread(target=_history_loop, daemon=True).start()
+    threading.Thread(target=_warm_lists, name="warm-lists", daemon=True).start()
+
+
 def start_background():
     """Migrate the DB, start the Deferred Action Engine, trigger auth, poll history."""
     migrate_db()
@@ -3763,7 +3990,7 @@ def start_background():
         get_service()
     except Exception as e:
         print(f"[auth] deferred: {e}")
-    threading.Thread(target=_history_loop, daemon=True).start()
+    threading.Thread(target=_start_sync, name="sync-start", daemon=True).start()
     threading.Thread(target=_unsub_scan_loop, daemon=True).start()
     _kick_contacts_refresh(force=True)  # fresh suggestions before the first keystroke
 

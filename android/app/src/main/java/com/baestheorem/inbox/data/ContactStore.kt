@@ -40,7 +40,9 @@ object ContactStore {
     private const val TAG = "ContactStore"
     const val TTL_MS = 900_000L      // a refresh stays fresh this long
     const val SCAN = 200             // newest sent messages each refresh looks at
-    const val PACE_MS = 200L         // between fetches, at most 5 calls/s
+    // Between fetches: a get costs ~50 of Gmail's 6,000 units/min per user, shared with the other apps.
+    // At 200 ms a first scan of 200 messages asked for ~15,000 units a minute.
+    const val PACE_MS = 1500L
     const val MIN_QUERY = 2          // characters before the list shows
 
     private val json = Json { ignoreUnknownKeys = true }
