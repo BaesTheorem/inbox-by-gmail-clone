@@ -73,6 +73,8 @@ class MailStore(app: Application) : AndroidViewModel(app) {
     val userEmail = MutableStateFlow("")
     val displayName = MutableStateFlow("")
     val deepLinkThreadId = MutableStateFlow<String?>(null)
+    /** An open compose screen: the FAB sets an empty draft, a mailto: intent a filled one. */
+    val composeDraft = MutableStateFlow<com.baestheorem.inbox.gmail.MailtoDraft?>(null)
     val authExpired: StateFlow<Boolean> = GmailClient.authExpired
 
     val pageSize = 50
@@ -716,14 +718,14 @@ class MailStore(app: Application) : AndroidViewModel(app) {
         ContactStore.noteSent(recipients.to + recipients.cc + recipients.bcc)
     }
 
-    suspend fun sendNew(to: String, subject: String, body: String) {
+    suspend fun sendNew(to: String, subject: String, body: String, cc: String = "", bcc: String = "") {
         val raw = buildRawMessage(
-            to = to, cc = null, subject = subject, body = body,
+            to = to, cc = cc.ifEmpty { null }, bcc = bcc.ifEmpty { null }, subject = subject, body = body,
             fromName = displayName.value, fromEmail = userEmail.value,
             inReplyTo = null, references = null,
         )
         GmailClient.send(raw, null)
-        ContactStore.noteSent(parseAddrList(to))
+        ContactStore.noteSent(parseAddrList(listOf(to, cc, bcc).filter { it.isNotEmpty() }.joinToString(", ")))
     }
 
     // MARK: Unsubscribe (RFC 2369 / RFC 8058, port of api_unsubscribe)

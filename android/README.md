@@ -126,6 +126,14 @@ Press **Publish app** on the console's Audience page and it stops happening.
 - `inboxclone://thread/<id>` opens that exact thread, so a shared link or a
   notification lands on the right mail
 
+## Default email app
+`MainActivity` takes `mailto:` VIEW and SENDTO intents, so Android shows Inbox
+in the "Open with" list for an email link. Pick Inbox and **Always** to make it
+the default. Compose opens filled with to, cc, bcc, subject and body from the
+link, plus any `EXTRA_EMAIL`, `EXTRA_CC`, `EXTRA_BCC`, `EXTRA_SUBJECT` and
+`EXTRA_TEXT` the sending app added. The parser is `gmail/Mailto.kt`, a port of
+`parse_mailto` in `app.py`, with the same test cases in `MailtoTest.kt`.
+
 ## Not ported
 
 Block sender, move-to-bundle filters, drafts, aliases, multi-select, undo send,

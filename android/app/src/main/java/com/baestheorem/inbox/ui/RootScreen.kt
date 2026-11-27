@@ -1,5 +1,7 @@
 package com.baestheorem.inbox.ui
 
+import com.baestheorem.inbox.gmail.MailtoDraft
+import androidx.compose.runtime.key
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
@@ -66,7 +68,7 @@ fun RootScreen(store: MailStore, onSignedOut: () -> Unit) {
     var searchOpen by remember { mutableStateOf(false) }
     var searchText by remember { mutableStateOf("") }
     var readerThreadId by remember { mutableStateOf<String?>(null) }
-    var composeOpen by remember { mutableStateOf(false) }
+    val composeDraft by store.composeDraft.collectAsState()
     var settingsOpen by remember { mutableStateOf(false) }
     var snoozeTarget by remember { mutableStateOf<ThreadSummary?>(null) }
     var unsubTarget by remember { mutableStateOf<ThreadSummary?>(null) }
@@ -125,7 +127,7 @@ fun RootScreen(store: MailStore, onSignedOut: () -> Unit) {
                 .size(56.dp)
                 .shadow(6.dp, CircleShape)
                 .background(Theme.fabRed, CircleShape)
-                .clickable { composeOpen = true },
+                .clickable { store.composeDraft.value = MailtoDraft() },
             contentAlignment = Alignment.Center,
         ) { MIcon("add", size = 26, color = Color.White) }
 
@@ -159,7 +161,7 @@ fun RootScreen(store: MailStore, onSignedOut: () -> Unit) {
             }
         }
 
-        if (composeOpen) ComposeScreen(store) { composeOpen = false }
+        composeDraft?.let { d -> key(d.id) { ComposeScreen(store, d) { store.composeDraft.value = null } } }
         if (settingsOpen) {
             SettingsScreen(
                 onClose = { settingsOpen = false },

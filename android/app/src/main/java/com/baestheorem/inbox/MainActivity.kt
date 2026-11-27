@@ -28,6 +28,9 @@ import com.baestheorem.inbox.auth.AuthStore
 import com.baestheorem.inbox.data.MailStore
 import com.baestheorem.inbox.data.Prefs
 import com.baestheorem.inbox.data.SnoozeStore
+import com.baestheorem.inbox.gmail.MailtoDraft
+import com.baestheorem.inbox.gmail.parseMailto
+import com.baestheorem.inbox.gmail.withExtras
 import com.baestheorem.inbox.ui.RootScreen
 import com.baestheorem.inbox.ui.SetupWizard
 import com.baestheorem.inbox.ui.Theme
@@ -36,6 +39,7 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private var pendingThreadId: String? = null
+    private var pendingDraft: MailtoDraft? = null
     private var store: MailStore? = null
 
     private val notificationPermission =
@@ -45,6 +49,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, true)
         pendingThreadId = threadIdFrom(intent)
+        pendingDraft = draftFrom(intent)
         setContent {
             MaterialTheme {
                 Box(Modifier.fillMaxSize().background(Theme.pageBg)) {
@@ -54,6 +59,10 @@ class MainActivity : ComponentActivity() {
                             pendingThreadId?.let {
                                 s.deepLinkThreadId.value = it
                                 pendingThreadId = null
+                            }
+                            pendingDraft?.let {
+                                s.composeDraft.value = it
+                                pendingDraft = null
                             }
                         },
                         onSignedIn = { askForNotifications() },
@@ -66,6 +75,11 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        draftFrom(intent)?.let { d ->
+            val s = store
+            if (s != null) s.composeDraft.value = d else pendingDraft = d
+            return
+        }
         val tid = threadIdFrom(intent) ?: return
         val s = store
         if (s != null) s.deepLinkThreadId.value = tid else pendingThreadId = tid
@@ -86,6 +100,19 @@ class MainActivity : ComponentActivity() {
         val data = intent?.data ?: return null
         if (data.scheme != "inboxclone" || data.host != "thread") return null
         return data.pathSegments.firstOrNull()?.takeIf { it.isNotEmpty() }
+    }
+
+    /** mailto: VIEW and SENDTO intents, with any EXTRA_* fields the sender added. */
+    private fun draftFrom(intent: Intent?): MailtoDraft? {
+        if (intent?.action != Intent.ACTION_VIEW && intent?.action != Intent.ACTION_SENDTO) return null
+        val draft = parseMailto(intent.dataString) ?: return null
+        return draft.withExtras(
+            intent.getStringArrayExtra(Intent.EXTRA_EMAIL),
+            intent.getStringArrayExtra(Intent.EXTRA_CC),
+            intent.getStringArrayExtra(Intent.EXTRA_BCC),
+            intent.getStringExtra(Intent.EXTRA_SUBJECT),
+            intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString(),
+        )
     }
 
     private fun askForNotifications() {

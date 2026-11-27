@@ -31,18 +31,23 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.baestheorem.inbox.data.ContactStore
 import com.baestheorem.inbox.data.MailStore
+import com.baestheorem.inbox.gmail.MailtoDraft
 import com.baestheorem.inbox.gmail.parseAddrList
 import kotlinx.coroutines.launch
 import java.io.IOException
 
 @Composable
-fun ComposeScreen(store: MailStore, onClose: () -> Unit) {
+fun ComposeScreen(store: MailStore, draft: MailtoDraft = MailtoDraft(), onClose: () -> Unit) {
     val scope = rememberCoroutineScope()
-    var to by remember { mutableStateOf("") }
-    var subject by remember { mutableStateOf("") }
-    var body by remember { mutableStateOf("") }
+    var to by remember { mutableStateOf(draft.to) }
+    var cc by remember { mutableStateOf(draft.cc) }
+    var bcc by remember { mutableStateOf(draft.bcc) }
+    var subject by remember { mutableStateOf(draft.subject) }
+    var body by remember { mutableStateOf(draft.body) }
     var sending by remember { mutableStateOf(false) }
-    val canSend = to.contains("@") && !sending
+    // Cc and Bcc rows show only when a mailto: link filled them
+    val showCopies = remember { draft.cc.isNotEmpty() || draft.bcc.isNotEmpty() }
+    val canSend = (to.contains("@") || cc.contains("@") || bcc.contains("@")) && !sending
     // Suggestions for the address being typed: people already in the field and the
     // account itself stay out.
     val contacts by ContactStore.contacts.collectAsState()
@@ -68,7 +73,7 @@ fun ComposeScreen(store: MailStore, onClose: () -> Unit) {
                     sending = true
                     scope.launch {
                         try {
-                            store.sendNew(to, subject, body)
+                            store.sendNew(to, subject, body, cc, bcc)
                             store.showSnack("Sent")
                             onClose()
                         } catch (e: IOException) {
@@ -86,6 +91,12 @@ fun ComposeScreen(store: MailStore, onClose: () -> Unit) {
         Divider()
         Field("To", to, { to = it; ContactStore.refreshIfStale() }, KeyboardType.Email)
         ContactSuggestions(suggestions) { to = replaceLastAddressToken(to, it.email) }
+        if (showCopies) {
+            Divider()
+            Field("Cc", cc, { cc = it }, KeyboardType.Email)
+            Divider()
+            Field("Bcc", bcc, { bcc = it }, KeyboardType.Email)
+        }
         Divider()
         Field("Subject", subject, { subject = it }, KeyboardType.Text)
         Divider()

@@ -39,6 +39,14 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="inboxclone" />
             </intent-filter>
+            <!-- Default mail app: mailto: links and "send email" intents open a filled compose -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <action android:name="android.intent.action.SENDTO" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="mailto" />
+            </intent-filter>
         </activity>
         <!-- Hands a downloaded attachment to whatever app opens that file type -->
         <provider
